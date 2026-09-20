@@ -3,6 +3,12 @@ class ConfigurationError(HueyException): pass
 class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 
+class SerializerError(HueyException): pass
+class InvalidEnvelopeError(SerializerError): pass
+class UnknownKeyIdError(SerializerError): pass
+class BadSignatureError(SerializerError): pass
+class PayloadTooLargeError(SerializerError): pass
+
 class CancelExecution(Exception):
     def __init__(self, retry=None, *args, **kwargs):
         self.retry = retry

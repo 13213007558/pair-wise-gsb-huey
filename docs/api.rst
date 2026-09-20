@@ -1415,6 +1415,55 @@ Serializer
         :param bytes data: serialized data.
         :returns: the deserialized object.
 
+.. py:class:: SignedEnvelopeSerializer(keys, key_id=None, secret=None, salt='huey', compression=False, compression_level=6, use_zlib=False, max_decompressed_size=None, allow_legacy=False, legacy_key_id=None)
+
+    :param dict keys: mapping of key id to secret. Every configured key id
+        may verify messages; the producer signs with a single current key
+        id.
+    :param str key_id: key id used to sign new messages. Defaults to the
+        only configured key id.
+    :param str secret: convenience alternative to \`\`keys\`\` for a single
+        key; requires \`\`key_id\`\`.
+    :param str salt: salt used to derive per-key HMAC keys.
+    :param bool compression: compress new messages with gzip.
+    :param int compression_level: 0 for least, 9 for most.
+    :param bool use_zlib: use zlib instead of gzip.
+    :param int max_decompressed_size: reject messages whose decompressed
+        payload exceeds this many bytes with
+        :py:class:\`PayloadTooLargeError\`. \`\`None\`\` disables the limit.
+    :param bool allow_legacy: also accept the legacy
+        \`\`SignedSerializer\`\` format. Disabled by default.
+    :param str legacy_key_id: configured key id that verifies legacy
+        messages (defaults to the signing key id).
+
+    Authenticated serializer using a versioned envelope::
+
+        HUEY:<version>:<key-id>:<encoding-flag>:<payload>:<signature>
+
+    The HMAC-SHA256 signature covers the version, key id, encoding flag
+    and the on-the-wire payload. Decompression and deserialization only
+    happen after the signature verifies, and the encoding flag selects
+    exactly one decoder -- the consumer never falls back to plain pickle
+    or tries multiple encodings.
+
+    Key rotation: add the new key id to consumers first, switch producers
+    to sign with it, then remove the old key id from consumers. Messages
+    signed with a removed key id are rejected with
+    :py:class:\`UnknownKeyIdError\`.
+
+    .. note::
+        The legacy \`\`SignedSerializer\`\` format compresses the *signed*
+        blob, so consumers must decompress before they can authenticate a
+        message. \`\`allow_legacy=True\`\` re-enables that behavior for old
+        messages only and should be turned off once the migration
+        completes. See \`\`examples/serializer_migration.py\`\`.
+
+    Failures raise distinguishable exceptions, all subclasses of
+    :py:class:\`SerializerError\`: :py:class:\`InvalidEnvelopeError\`,
+    :py:class:\`UnknownKeyIdError\`, :py:class:\`BadSignatureError\` and
+    :py:class:\`PayloadTooLargeError\`. Error messages and logs never
+    include key material or task content.
+
 .. _exceptions:
 
 Exceptions
@@ -1427,6 +1476,28 @@ Exceptions
 .. py:class:: ConfigurationError
 
     Raised when Huey encounters a configuration problem.
+
+.. py:class:: SerializerError
+
+    Base class for message authentication and decoding failures.
+
+.. py:class:: InvalidEnvelopeError
+
+    Raised when a message is not a well-formed versioned envelope (or is
+    a legacy message while legacy support is disabled).
+
+.. py:class:: UnknownKeyIdError
+
+    Raised when a message is signed with a key id the consumer is not
+    configured to trust, e.g. after a key has been retired.
+
+.. py:class:: BadSignatureError
+
+    Raised when a message's signature does not verify.
+
+.. py:class:: PayloadTooLargeError
+
+    Raised when a payload exceeds \`\`max_decompressed_size\`\`.
 
 .. py:class:: TaskLockedException
 
