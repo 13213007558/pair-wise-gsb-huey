@@ -6,6 +6,7 @@ import random
 import shutil
 import sqlite3
 import struct
+import tempfile
 import threading
 import time
 import unittest
@@ -34,6 +35,7 @@ from huey.api import SqliteHuey
 from huey.api import chord
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
+from huey.storage import MemoryStorage
 from huey.storage import FileStorage
 from huey.tests.base import BaseTestCase
 from huey.tests.base import CI
@@ -53,6 +55,71 @@ def get_redis_version():
 
 REDIS_VERSION = get_redis_version()
 requires_redis = unittest.skipIf(REDIS_VERSION == 0, 'requires redis server')
+
+
+def assert_threshold_chord_one_callback(producer, *workers):
+    barrier = threading.Barrier(2)
+
+    def member(n):
+        if n == 'c':
+            raise ValueError('c failed')
+        barrier.wait(5)
+        return n
+
+    def success_cb(values):
+        return sorted(values)
+
+    def failure_cb(errors, error):
+        raise AssertionError('failure callback should not run')
+
+    member_task = producer.task()(member)
+    success_task = producer.task()(success_cb)
+    failure_task = producer.task()(failure_cb)
+    for worker in workers:
+        if worker is not producer:
+            worker.task()(member)
+            worker.task()(success_cb)
+            worker.task()(failure_cb)
+
+    producer.enqueue(chord(
+        [member_task.s('a'), member_task.s('b'), member_task.s('c')],
+        success_task,
+        success_threshold=2,
+        failure_callback=failure_task))
+
+    deferred = None
+    member_tasks = []
+    for _ in range(3):
+        task = producer.dequeue()
+        if task.args == ('c',):
+            deferred = task
+        else:
+            member_tasks.append(task)
+    for task in member_tasks:
+        producer.storage.enqueue(bytes(producer.serialize_task(task)))
+
+    errors = []
+
+    def run(worker):
+        task = worker.dequeue()
+        try:
+            worker.execute(task)
+        except Exception as exc:
+            errors.append(exc)
+
+    threads = [threading.Thread(target=run, args=(worker,))
+               for worker in workers]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(10)
+
+    assert errors == [], errors
+    workers[0].execute(deferred)
+    assert producer.pending_count() == 1
+    callback = producer.dequeue()
+    assert producer.execute(callback) == ['a', 'b']
+    assert producer.pending_count() == 0
 
 
 class StorageTests(object):
@@ -285,6 +352,17 @@ class TestMemoryStorage(StorageTests, BaseTestCase):
 
         # Each key was acquired by exactly one thread.
         self.assertEqual(sorted(winners), list(range(nkeys)))
+
+    def test_threshold_chord_one_callback_under_contention(self):
+        shared = MemoryStorage('huey')
+        factory = lambda *args, **kwargs: shared
+        producer = Huey(name='huey', storage_class=factory, utc=False)
+        workers = [Huey(name='huey', storage_class=factory, utc=False)
+                   for _ in range(2)]
+        try:
+            assert_threshold_chord_one_callback(producer, *workers)
+        finally:
+            shared.flush_all()
 
 
 @requires_redis
@@ -610,9 +688,26 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
     def test_task_index(self):
         curs = self.s.conn.execute('select name from sqlite_master where '
                                    'type = ? and tbl_name = ?',
-                                   ('index', 'task'))
+                                    ('index', 'task'))
         self.assertEqual([r[0] for r in curs.fetchall()],
                          ['task_queue_priority_id'])
+
+    def test_threshold_chord_independent_workers(self):
+        directory = tempfile.mkdtemp(prefix='huey-threshold-')
+        filename = os.path.join(directory, 'huey.db')
+        try:
+            producer = SqliteHuey(filename=filename, timeout=5, utc=False)
+            workers = [SqliteHuey(filename=filename, timeout=5, utc=False)
+                       for _ in range(2)]
+            try:
+                assert_threshold_chord_one_callback(
+                    producer, workers[0], workers[1])
+            finally:
+                producer.storage.close()
+                for worker in workers:
+                    worker.storage.close()
+        finally:
+            shutil.rmtree(directory, ignore_errors=True)
 
 
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')

@@ -1706,7 +1706,7 @@ Huey object
                 .error(on_fetch_error)
                 .then(aggregate))
 
-.. py:class:: chord(tasks, callback)
+.. py:class:: chord(tasks, callback, success_threshold=None, failure_callback=None, k=None)
 
     A :py:class:`chord` consists of a group of tasks that execute in parallel
     and a callback task. When all sub-tasks have completed (or permanently
@@ -1718,6 +1718,11 @@ Huey object
     :param callback: a ``task()``-decorated function (:py:class:`TaskWrapper`),
         or a :py:class:`Task` instance. The callback receives the list of
         sub-task results as its first argument.
+    :param int success_threshold: number of distinct successful members
+        required to enqueue ``callback``. ``k`` is accepted as an alias.
+    :param failure_callback: task enqueued with the ordered failure values and
+        a :py:class:`~huey.exceptions.ChordThresholdError` when success becomes
+        impossible. Required when ``success_threshold`` is used.
 
     .. code-block:: python
 
@@ -1823,11 +1828,30 @@ Huey object
                 chord([fetch.s(u) for u in urls], aggregate.s())
                 .error(alert_admin))
 
-        This handles errors in the **callback**, not in the sub-tasks. To handle
-        errors in individual members, use :py:meth:`Task.error` on each member
-        or :py:meth:`group.error` before constructing the chord.
+    This handles errors in the **callback**, not in the sub-tasks. To handle
+    errors in individual members, use :py:meth:`Task.error` on each member
+    or :py:meth:`group.error` before constructing the chord.
 
-        Delegates to the callback's :py:meth:`Task.error`.
+    Delegates to the callback's :py:meth:`Task.error`.
+
+    .. py:method:: failure_error(task, *args, **kwargs)
+
+        Attach an error handler to a threshold chord's failure callback.
+        This handler runs if the failure callback itself raises; it does not
+        run merely because a chord member failed.
+
+    **Threshold chords:**
+
+    A threshold chord enqueues the success callback after ``success_threshold``
+    distinct members succeed, and enqueues ``failure_callback`` once too many
+    members have reached a permanent failure for success to be possible.
+    Duplicate notifications for one member contribute only one vote, and late
+    notifications after a terminal state are ignored.
+
+    Threshold chords are supported by :py:class:`MemoryHuey` and
+    :py:class:`SqliteHuey` only. Unsupported storages raise
+    :py:class:`~huey.exceptions.ConfigurationError` rather than enabling a
+    racy fallback.
 
     **Nested chords:**
 
@@ -1846,9 +1870,14 @@ Huey object
     list. See :ref:`groups-and-chords` in the guide for a detailed example.
 
 
-.. py:class:: ChordResult(results, callback_result, pipeline=None)
+.. py:class:: ChordResult(results, callback_result, pipeline=None, failure_result=None)
 
     Returned by :py:meth:`Huey.enqueue` when enqueueing a :py:class:`chord`.
+
+    .. py:attribute:: failure
+
+        :py:class:`Result` handle for the threshold-chord failure callback,
+        or ``None`` for ordinary all-members chords.
     Provides access to the individual member results, the callback result,
     and the results of any tasks chained after the callback.
 
@@ -2485,4 +2514,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

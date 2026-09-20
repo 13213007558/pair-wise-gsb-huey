@@ -43,6 +43,7 @@ class BaseStorage(object):
     """
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
+    supports_threshold_chords = False
 
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
@@ -264,6 +265,23 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def chord_member_event(self, chord_id, size, threshold, idx, success,
+                           value, success_callback, failure_callback,
+                           priority=None):
+        """
+        Record one terminal chord-member event and enqueue a terminal chord
+        callback atomically when the chord reaches either its success
+        threshold or can no longer succeed.
+
+        ``success_callback`` and ``failure_callback`` are called with ordered
+        ``(success_values, failure_values)`` lists and must return
+        ``(serialized_task, task_priority)``. They are invoked while the
+        storage holds the primitives needed to make the state transition and
+        callback enqueue atomic.
+        """
+        raise NotImplementedError('threshold chords require atomic chord '+
+                                  'state support from the storage backend.')
+
     def result_store_size(self):
         """
         :return: Number of key/value pairs in the result store.
@@ -295,6 +313,12 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def flush_chords(self):
+        """
+        Clear threshold-chord state.
+        """
+        pass
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -305,6 +329,7 @@ class BaseStorage(object):
         self.flush_schedule()
         self.flush_results()
         self.flush_counters()
+        self.flush_chords()
 
 
 class BlackHoleStorage(BaseStorage):
@@ -325,6 +350,7 @@ class BlackHoleStorage(BaseStorage):
     def put_if_empty(self, key, value, ttl=None): return True
     def incr(self, key, amount=1): return amount
     def delete_counter(self, key): pass
+    def flush_chords(self): pass
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
@@ -332,6 +358,8 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
+    supports_threshold_chords = True
+
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
@@ -340,6 +368,7 @@ class MemoryStorage(BaseStorage):
         self._expires = {}
         self._schedule = []
         self._counters = {}
+        self._chords = {}
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -449,6 +478,54 @@ class MemoryStorage(BaseStorage):
 
     def flush_counters(self):
         self._counters = {}
+
+    def chord_member_event(self, chord_id, size, threshold, idx, success,
+                           value, success_callback, failure_callback,
+                           priority=None):
+        if not 0 <= idx < size:
+            raise ValueError('chord member index out of range')
+
+        with self._lock:
+            state = self._chords.get(chord_id)
+            if state is None:
+                state = {
+                    'size': size,
+                    'threshold': threshold,
+                    'success': {},
+                    'failure': {},
+                    'state': None}
+                self._chords[chord_id] = state
+
+            if state['state'] is not None:
+                return state['state']
+
+            bucket_name = 'success' if success else 'failure'
+            if idx in state['success'] or idx in state['failure']:
+                return
+
+            state[bucket_name][idx] = value
+
+            terminal = None
+            callback = None
+            if len(state['success']) >= threshold:
+                terminal, callback = 'success', success_callback
+            elif len(state['failure']) > state['size'] - state['threshold']:
+                terminal, callback = 'failure', failure_callback
+
+            if terminal is None:
+                return
+
+            success_values = [v for _, v in sorted(state['success'].items())]
+            failure_values = [v for _, v in sorted(state['failure'].items())]
+            data, callback_priority = callback(
+                success_values, failure_values)
+            state['state'] = terminal
+            self.enqueue(data, callback_priority)
+            return terminal
+
+    def flush_chords(self):
+        with self._lock:
+            self._chords = {}
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -883,6 +960,7 @@ class BaseSqlStorage(BaseStorage):
 
 class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
+    supports_threshold_chords = True
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
     table_kv = ('create table if not exists kv ('
@@ -903,8 +981,18 @@ class SqliteStorage(BaseSqlStorage):
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
                      'primary key(queue, key))')
+    table_chord = ('create table if not exists chord ('
+                   'queue text not null, id text not null, '
+                   'size integer not null, threshold integer not null, '
+                   'state text, primary key(queue, id))')
+    table_chord_member = ('create table if not exists chord_member ('
+                          'queue text not null, chord_id text not null, '
+                          'idx integer not null, success integer not null, '
+                          'value blob not null, '
+                          'primary key(queue, chord_id, idx))')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
-           table_counter, drop_index_task]
+           table_counter, table_chord, table_chord_member,
+           drop_index_task]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -1100,6 +1188,69 @@ class SqliteStorage(BaseSqlStorage):
     def delete_counter(self, key):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
+
+    def chord_member_event(self, chord_id, size, threshold, idx, success,
+                           value, success_callback, failure_callback,
+                           priority=None):
+        if not 0 <= idx < size:
+            raise ValueError('chord member index out of range')
+
+        with self.db(commit=True) as curs:
+            curs.execute('insert or ignore into chord '
+                         '(queue, id, size, threshold, state) '
+                         'values (?, ?, ?, ?, null)',
+                         (self.name, chord_id, size, threshold))
+            curs.execute('select size, threshold, state from chord '
+                         'where queue = ? and id = ?',
+                         (self.name, chord_id))
+            state_size, state_threshold, state = curs.fetchone()
+            if (state_size, state_threshold) != (size, threshold):
+                raise ValueError('chord configuration mismatch')
+            if state is not None:
+                return state
+
+            curs.execute('select 1 from chord_member where queue = ? '
+                         'and chord_id = ? and idx = ?',
+                         (self.name, chord_id, idx))
+            if curs.fetchone() is not None:
+                return
+
+            curs.execute('insert into chord_member '
+                         '(queue, chord_id, idx, success, value) '
+                         'values (?, ?, ?, ?, ?)',
+                         (self.name, chord_id, idx, int(bool(success)),
+                          self.to_blob(value)))
+            curs.execute('select success, value from chord_member where '
+                         'queue = ? and chord_id = ? order by idx',
+                         (self.name, chord_id))
+            rows = curs.fetchall()
+            success_values = [v for ok, v in rows if ok]
+            failure_values = [v for ok, v in rows if not ok]
+
+            terminal = callback = None
+            if len(success_values) >= threshold:
+                terminal, callback = 'success', success_callback
+            elif len(failure_values) > size - threshold:
+                terminal, callback = 'failure', failure_callback
+
+            if terminal is None:
+                return
+
+            data, callback_priority = callback(success_values, failure_values)
+            curs.execute('update chord set state = ? where queue = ? and id = ?',
+                         (terminal, self.name, chord_id))
+            curs.execute('insert into task (queue, data, priority) '
+                         'values (?, ?, ?)',
+                         (self.name, self.to_blob(data),
+                          callback_priority if callback_priority is not None
+                          else 0))
+            return terminal
+
+    def flush_chords(self):
+        with self.db(commit=True) as curs:
+            curs.execute('delete from chord_member where queue = ?',
+                         (self.name,))
+            curs.execute('delete from chord where queue = ?', (self.name,))
 
     def result_store_size(self):
         return self.sql('select count(*) from kv where queue=?', (self.name,),

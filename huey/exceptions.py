@@ -28,3 +28,15 @@ class TaskException(Exception):
 
     def __str__(self):
         return self.metadata.get('error') or 'unknown error'
+
+
+class ChordThresholdError(Exception):
+    def __init__(self, size=None, threshold=None, success_count=None,
+                 failure_count=None, *args):
+        self.size = size
+        self.threshold = threshold
+        self.success_count = success_count
+        self.failure_count = failure_count
+        super(ChordThresholdError, self).__init__(
+            'chord threshold not reached: %s of %s members succeeded, '
+            '%s required' % (success_count, size, threshold), *args)

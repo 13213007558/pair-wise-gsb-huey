@@ -17,6 +17,7 @@ from huey import signals as S
 from huey.constants import EmptyData
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
+from huey.exceptions import ChordThresholdError
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import ResultTimeout
@@ -336,19 +337,44 @@ class Huey(object):
 
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
-        size = len(chord_obj.tasks)
+        tasks = list(chord_obj.tasks)
+        size = len(tasks)
+        threshold = chord_obj.success_threshold
+        threshold_mode = threshold is not None or \
+                chord_obj.failure_callback is not None
+        if threshold is None:
+            threshold = size
+        if size == 0:
+            raise ValueError('cannot enqueue a chord without members')
+        if not isinstance(threshold, int) or isinstance(threshold, bool) or \
+                not 1 <= threshold <= size:
+            raise ValueError('success_threshold must be an integer between '
+                             '1 and the number of chord members')
+        if threshold_mode and chord_obj.failure_callback is None:
+            raise ValueError('threshold chords require a failure callback')
+        if threshold_mode and not self.storage.supports_threshold_chords:
+            raise ConfigurationError(
+                '%s does not support threshold chords. Use MemoryStorage or '
+                'SqliteStorage, or enqueue an all-members chord.' %
+                type(self.storage).__name__)
+
         results = []
-        for i, task in enumerate(chord_obj.tasks):
+        for i, task in enumerate(tasks):
             if isinstance(task, group):
                 raise ValueError('cannot use `group` as a chord member - '
                                  'use .then() to convert to a `chord` first.')
 
-            config = ChordConfig(cid, size, i, chord_obj.callback)
+            config = ChordConfig(
+                cid, size, i, chord_obj.callback,
+                threshold if threshold_mode else None,
+                chord_obj.failure_callback)
             results.append(self._enqueue_chord_member(task, config))
 
         cb_result = Result(self, chord_obj.callback)
         pipeline = self._build_pipeline_results(chord_obj.callback, cb_result)
-        return ChordResult(results, cb_result, pipeline)
+        failure_result = (None if chord_obj.failure_callback is None else
+                          Result(self, chord_obj.failure_callback))
+        return ChordResult(results, cb_result, pipeline, failure_result)
 
     def _enqueue_chord_member(self, task, config):
         if isinstance(task, chord):
@@ -359,11 +385,15 @@ class Huey(object):
         tail = head
         while tail.on_complete is not None:
             tail = tail.on_complete
-        tail.chord_config = config
 
         if isinstance(task, chord):
+            tail.chord_config = config
+            if task.failure_callback is not None and \
+                    config.success_threshold is not None:
+                task.failure_callback.chord_config = config
             self._enqueue_chord(task)
         else:
+            tail.chord_config = config
             self.enqueue(head)
 
         return Result(self, tail)
@@ -580,6 +610,9 @@ class Huey(object):
             task = task.on_complete
 
     def _check_chord(self, cc, value):
+        if cc.success_threshold is not None:
+            return self._check_threshold_chord(cc, value)
+
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
         self.put_result(result_key, value)
@@ -598,6 +631,38 @@ class Huey(object):
             callback = cc.callback
             callback.extend_data((results,))
             self.enqueue(callback)
+
+    def _check_threshold_chord(self, cc, value):
+        success = value is not SKIPPED and not isinstance(value, Error)
+        serialized_value = self.serializer.serialize(value)
+
+        def make_success_callback(success_values, failure_values):
+            success_values = [self.serializer.deserialize(value)
+                             for value in success_values]
+            selected = copy.copy(cc.callback)
+            selected.extend_data((list(success_values),))
+            return self.serialize_task(selected), selected.priority
+
+        def make_failure_callback(success_values, failure_values):
+            failure_values = [self.serializer.deserialize(value)
+                             for value in failure_values]
+            error = ChordThresholdError(
+                cc.size, cc.success_threshold, len(success_values),
+                len(failure_values))
+            selected = copy.copy(cc.failure_callback)
+            selected.extend_data((list(failure_values), error))
+            return self.serialize_task(selected), selected.priority
+
+        terminal = self.storage.chord_member_event(
+            cc.cid, cc.size, cc.success_threshold, cc.idx, success,
+            serialized_value,
+            make_success_callback, make_failure_callback,
+            cc.callback.priority)
+
+        if terminal is not None and self._immediate:
+            callback_task = self.dequeue()
+            if callback_task is not None:
+                self.execute(callback_task)
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
         task.retries -= 1
@@ -1223,11 +1288,34 @@ class group(object):
 
 
 class chord(object):
-    def __init__(self, tasks, callback):
+    def __init__(self, tasks, callback, success_threshold=None,
+                 failure_callback=None, k=None):
+        tasks = list(tasks)
         if isinstance(callback, TaskWrapper):
             callback = callback.s()
+        if success_threshold is None and k is not None:
+            success_threshold = k
+        elif k is not None and success_threshold != k:
+            raise ValueError('success_threshold and k must have the same '
+                             'value')
+        if isinstance(failure_callback, TaskWrapper):
+            failure_callback = failure_callback.s()
+        if not tasks:
+            raise ValueError('cannot create a chord without members')
+        if success_threshold is not None and (
+                not isinstance(success_threshold, int) or
+                isinstance(success_threshold, bool) or
+                not 1 <= success_threshold <= len(tasks)):
+            raise ValueError('success_threshold must be an integer between '
+                             '1 and the number of chord members')
+        if success_threshold is not None and failure_callback is None:
+            raise ValueError('threshold chords require a failure callback')
+        if failure_callback is not None and success_threshold is None:
+            success_threshold = len(tasks)
         self.tasks = tasks
         self.callback = callback
+        self.success_threshold = success_threshold
+        self.failure_callback = failure_callback
 
     def then(self, task, *args, **kwargs):
         self.callback.then(task, *args, **kwargs)
@@ -1235,6 +1323,13 @@ class chord(object):
 
     def error(self, task, *args, **kwargs):
         self.callback.error(task, *args, **kwargs)
+        return self
+
+    def failure_error(self, task, *args, **kwargs):
+        if self.failure_callback is None:
+            raise ValueError('attach a failure callback before attaching an '
+                             'error handler to it')
+        self.failure_callback.error(task, *args, **kwargs)
         return self
 
 
@@ -1392,10 +1487,12 @@ class ResultGroup(object):
 
 
 class ChordResult(object):
-    def __init__(self, results, callback_result, pipeline=None):
+    def __init__(self, results, callback_result, pipeline=None,
+                 failure_result=None):
         self.results = ResultGroup(results)
         self.callback = callback_result
         self.pipeline_results = pipeline
+        self.failure = failure_result
 
     def get(self, *args, **kwargs):
         return self.callback.get(*args, **kwargs)
@@ -1403,6 +1500,8 @@ class ChordResult(object):
 
     def reset(self):
         self.callback.reset()
+        if self.failure is not None:
+            self.failure.reset()
 
 
 dash_re = re.compile(r'(\d+)-(\d+)(?:/(\d+))?')

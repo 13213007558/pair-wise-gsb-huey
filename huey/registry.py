@@ -75,7 +75,10 @@ class Registry(object):
                 task.chord_config.cid,
                 task.chord_config.size,
                 task.chord_config.idx,
-                self.create_message(task.chord_config.callback))
+                self.create_message(task.chord_config.callback),
+                task.chord_config.success_threshold,
+                (None if task.chord_config.failure_callback is None else
+                 self.create_message(task.chord_config.failure_callback)))
 
         return Message(
             task.id,
@@ -107,9 +110,16 @@ class Registry(object):
 
         chord_config = None
         if message.chord_config is not None:
-            cid, size, idx, cb_ser = message.chord_config
+            cid, size, idx, cb_ser = message.chord_config[:4]
+            threshold = (message.chord_config[4]
+                         if len(message.chord_config) > 4 else None)
+            failure_ser = (message.chord_config[5]
+                           if len(message.chord_config) > 5 else None)
             callback = self.create_task(cb_ser)
-            chord_config = ChordConfig(cid, size, idx, callback)
+            failure_callback = (None if failure_ser is None
+                                else self.create_task(failure_ser))
+            chord_config = ChordConfig(cid, size, idx, callback,
+                                       threshold, failure_callback)
 
         return TaskClass(
             message.args,

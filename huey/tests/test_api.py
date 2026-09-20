@@ -1,9 +1,11 @@
 import asyncio
 import datetime
 import inspect
+import threading
 import time
 
 from huey.api import ChordResult
+from huey.api import BlackHoleHuey
 from huey.api import MemoryHuey
 from huey.api import PeriodicTask
 from huey.api import Result
@@ -15,6 +17,7 @@ from huey.api import crontab
 from huey.api import group
 from huey.constants import EmptyData
 from huey.exceptions import CancelExecution
+from huey.exceptions import ChordThresholdError
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import ResultTimeout
 from huey.exceptions import ConfigurationError
@@ -24,6 +27,7 @@ from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
 from huey.tests.base import BaseTestCase
+from huey.registry import Message
 from huey.utils import Error
 from huey.utils import SKIPPED
 
@@ -1997,6 +2001,473 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(r(), 30)
         self.assertEqual(r.results(), [10, 20])
         self.assertEqual(attempts, {1: 2, 2: 2})
+
+    def test_threshold_chord_success(self):
+        @self.huey.task()
+        def member(n):
+            if n is None:
+                raise TestError('bad')
+            return n
+
+        @self.huey.task()
+        def success_cb(values):
+            return list(values)
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            raise AssertionError('failure callback should not run')
+
+        c = chord(
+            [member.s(1), member.s(None), member.s(3)],
+            success_cb,
+            success_threshold=2,
+            failure_callback=failure_cb)
+        r = self.huey.enqueue(c)
+        tasks = [self.huey.dequeue() for _ in range(3)]
+
+        self.huey.execute(tasks[0])
+        self.assertEqual(len(self.huey), 0)
+        self.huey.execute(tasks[1])  # Permanent failure.
+        self.assertEqual(len(self.huey), 0)  # One success is not enough.
+        self.huey.execute(tasks[2])
+
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), [1, 3])
+        self.assertEqual(r(), [1, 3])
+
+        # Late events and duplicate notifications cannot trigger again.
+        self.huey._check_chord(tasks[0].chord_config, 99)
+        self.huey._check_chord(tasks[1].chord_config, Error({}))
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_chord_failure_terminal(self):
+        @self.huey.task()
+        def member(n):
+            if n is None:
+                raise TestError('bad')
+            return n
+
+        @self.huey.task()
+        def success_cb(values):
+            raise AssertionError('success callback should not run')
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            return (len(errors), len([v for v in errors
+                                      if isinstance(v, Error)]),
+                    error.size, error.threshold,
+                    error.success_count, error.failure_count)
+
+        c = chord(
+            [member.s(1), member.s(None), member.s(None), member.s(4)],
+            success_cb,
+            k=3,
+            failure_callback=failure_cb)
+        r = self.huey.enqueue(c)
+        tasks = [self.huey.dequeue() for _ in range(4)]
+
+        self.huey.execute(tasks[0])  # One success.
+        self.huey.execute(tasks[1])  # First failure: still mathematically live.
+        self.assertEqual(len(self.huey), 0)
+        self.huey.execute(tasks[2])  # Second failure makes success impossible.
+
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), (2, 2, 4, 3, 1, 2))
+        self.assertEqual(r.failure(), (2, 2, 4, 3, 1, 2))
+
+        # Even the remaining member's successful completion arrives too late.
+        self.huey.execute(tasks[3])
+        self.huey._check_chord(tasks[3].chord_config, 4)
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_chord_duplicate_member_notification(self):
+        @self.huey.task()
+        def member(n):
+            return n
+
+        @self.huey.task()
+        def success_cb(values):
+            return values
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            raise AssertionError('failure callback should not run')
+
+        self.huey.enqueue(chord(
+            [member.s('a'), member.s('b')],
+            success_cb,
+            success_threshold=1,
+            failure_callback=failure_cb))
+        first, second = [self.huey.dequeue() for _ in range(2)]
+
+        self.huey.execute(first)  # Immediately claims threshold success.
+        self.assertEqual(len(self.huey), 1)
+        self.huey._check_chord(first.chord_config, 'duplicate')
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), ['a'])
+
+        self.huey.execute(second)
+        self.assertEqual(len(self.huey), 0)
+
+        self.huey._check_chord(first.chord_config, 'another duplicate')
+        self.huey._check_chord(second.chord_config, 'another duplicate')
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_chord_concurrent_success(self):
+        barrier = threading.Barrier(2)
+
+        @self.huey.task()
+        def member(n):
+            barrier.wait()
+            return n
+
+        @self.huey.task()
+        def success_cb(values):
+            return sorted(values)
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            raise AssertionError('failure callback should not run')
+
+        self.huey.enqueue(chord(
+            [member.s('a'), member.s('b')],
+            success_cb,
+            success_threshold=1,
+            failure_callback=failure_cb))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        errors = []
+
+        def run(task):
+            try:
+                self.huey.execute(task)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run, args=(task,))
+                   for task in tasks]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(self.huey), 1)
+        self.assertIn(self.execute_next(), (['a'], ['b']))
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_chord_retries_and_late_failure(self):
+        attempts = {'flaky': 0}
+
+        @self.huey.task(retries=1)
+        def flaky():
+            attempts['flaky'] += 1
+            raise TestError('retry later')
+
+        @self.huey.task()
+        def ok():
+            return 'ok'
+
+        @self.huey.task()
+        def success_cb(values):
+            return values
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            raise AssertionError('failure callback should not run')
+
+        self.huey.enqueue(chord(
+            [flaky.s(), ok.s()],
+            success_cb,
+            success_threshold=1,
+            failure_callback=failure_cb))
+        flaky_task, ok_task = [self.huey.dequeue() for _ in range(2)]
+
+        self.assertTrue(self.huey.execute(flaky_task) is None)
+        self.assertEqual(len(self.huey), 1)  # Retry, no chord failure yet.
+        retry = self.huey.dequeue()
+        self.huey.execute(ok_task)
+        self.assertEqual(self.execute_next(), ['ok'])
+
+        # The retry is exhausted after the terminal success was claimed.
+        self.assertTrue(self.huey.execute(retry) is None)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(attempts['flaky'], 2)
+
+    def test_threshold_chord_retry_exhaustion_failure(self):
+        attempts = {'flaky': 0}
+
+        @self.huey.task(retries=1)
+        def flaky():
+            attempts['flaky'] += 1
+            raise TestError('permanent after retry')
+
+        @self.huey.task()
+        def ok():
+            return 'ok'
+
+        @self.huey.task()
+        def success_cb(values):
+            raise AssertionError('success callback should not run')
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            return (error.success_count, error.failure_count,
+                    isinstance(errors[0], Error))
+
+        self.huey.enqueue(chord(
+            [flaky.s(), ok.s()],
+            success_cb,
+            success_threshold=2,
+            failure_callback=failure_cb))
+        flaky_task, ok_task = [self.huey.dequeue() for _ in range(2)]
+
+        self.assertTrue(self.huey.execute(flaky_task) is None)
+        self.assertEqual(len(self.huey), 1)  # First attempt is retried.
+        retry = self.huey.dequeue()
+        self.huey.execute(ok_task)
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(self.huey.execute(retry) is None)
+
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), (1, 1, True))
+        self.assertEqual(attempts['flaky'], 2)
+
+    def test_threshold_chord_skipped_member_is_failure(self):
+        @self.huey.task()
+        def ok():
+            return 'ok'
+
+        @self.huey.task()
+        def skipped_member():
+            return 'unexpected'
+
+        @self.huey.task()
+        def success_cb(values):
+            raise AssertionError('success callback should not run')
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            return (errors[0], error.failure_count)
+
+        self.huey.enqueue(chord(
+            [ok.s(), skipped_member.s()],
+            success_cb,
+            success_threshold=2,
+            failure_callback=failure_cb))
+        ok_task, skipped_task = [self.huey.dequeue() for _ in range(2)]
+        self.huey.revoke(skipped_task)
+        self.huey.execute(ok_task)
+        self.assertTrue(self.huey.execute(skipped_task) is None)
+
+        self.assertEqual(self.execute_next(), (SKIPPED, 1))
+
+    def test_nested_threshold_chord(self):
+        @self.huey.task()
+        def ident(value):
+            return value
+
+        @self.huey.task()
+        def inner_success(values):
+            return tuple(values)
+
+        @self.huey.task()
+        def inner_failure(errors, error):
+            raise AssertionError('inner failure should not run')
+
+        @self.huey.task()
+        def outer_success(values):
+            return list(values)
+
+        @self.huey.task()
+        def outer_failure(errors, error):
+            raise AssertionError('outer failure should not run')
+
+        inner = chord(
+            [ident.s('a'), ident.s('b'), ident.s('c')],
+            inner_success,
+            success_threshold=2,
+            failure_callback=inner_failure)
+        outer = chord(
+            [inner, ident.s('z')],
+            outer_success,
+            success_threshold=2,
+            failure_callback=outer_failure)
+        result = self.huey.enqueue(outer)
+
+        tasks = [self.huey.dequeue() for _ in range(4)]
+        self.huey.execute(tasks[0])  # Inner 'a' is one success.
+        self.assertEqual(len(self.huey), 0)
+        self.huey.execute(tasks[1])  # Inner 'b' claims inner success.
+        self.assertEqual(len(self.huey), 1)  # Inner callback.
+        self.huey.execute(tasks[3])  # Outer 'z' does not complete yet.
+        self.assertEqual(len(self.huey), 1)  # Inner callback remains.
+        self.huey.execute(tasks[1])  # Late inner vote, ignored.
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), ('a', 'b'))  # Inner callback.
+        self.assertEqual(len(self.huey), 1)  # Outer callback.
+        self.assertEqual(self.execute_next(), [('a', 'b'), 'z'])
+        self.huey.execute(tasks[2])  # Late inner vote, ignored.
+        self.assertEqual(result(), [('a', 'b'), 'z'])
+
+    def test_nested_threshold_chord_inner_failure(self):
+        @self.huey.task()
+        def ident(value):
+            if value is None:
+                raise TestError('bad')
+            return value
+
+        @self.huey.task()
+        def inner_success(values):
+            raise AssertionError('inner success should not run')
+
+        @self.huey.task()
+        def inner_failure(errors, error):
+            return ('inner', error.failure_count)
+
+        @self.huey.task()
+        def outer_success(values):
+            raise AssertionError('outer success should not run')
+
+        @self.huey.task()
+        def outer_failure(errors, error):
+            return ('outer', [v[0] for v in errors])
+
+        inner = chord(
+            [ident.s(1), ident.s(None)],
+            inner_success,
+            success_threshold=2,
+            failure_callback=inner_failure)
+        outer = chord(
+            [inner],
+            outer_success,
+            success_threshold=1,
+            failure_callback=outer_failure)
+        result = self.huey.enqueue(outer)
+
+        success_task, failed_task = [self.huey.dequeue() for _ in range(2)]
+        self.huey.execute(success_task)
+        self.assertTrue(self.huey.execute(failed_task) is None)
+        self.assertEqual(len(self.huey), 1)  # Inner failure callback.
+        self.assertEqual(self.execute_next(), ('inner', 1))
+        self.assertEqual(len(self.huey), 1)  # Outer failure callback.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_chord_callback_exceptions(self):
+        state = []
+
+        @self.huey.task()
+        def ok(n):
+            return n
+
+        @self.huey.task()
+        def bad_success(values):
+            raise ValueError('success failed')
+
+        @self.huey.task()
+        def bad_failure(errors, error):
+            raise ValueError('failure failed')
+
+        @self.huey.task()
+        def handle_success_error(exc):
+            state.append(('success', repr(exc)))
+
+        @self.huey.task()
+        def handle_failure_error(exc):
+            state.append(('failure', repr(exc)))
+
+        @self.huey.task()
+        def fail_member():
+            raise TestError('member failed')
+
+        self.huey.enqueue(chord(
+            [ok.s(1)],
+            bad_success,
+            success_threshold=1,
+            failure_callback=bad_failure).error(handle_success_error))
+        self.execute_next()  # Member.
+        self.assertTrue(self.execute_next() is None)  # Raising callback.
+        self.execute_next()  # Callback error handler.
+        self.assertEqual(state[0][0], 'success')
+
+        c = chord(
+            [fail_member.s()],
+            bad_success,
+            success_threshold=1,
+            failure_callback=bad_failure)
+        c.failure_error(handle_failure_error)
+        self.huey.enqueue(c)
+        self.assertTrue(self.execute_next() is None)  # Member failure.
+        self.assertTrue(self.execute_next() is None)  # Raising failure cb.
+        self.execute_next()  # Failure-callback error handler.
+        self.assertEqual(state[1][0], 'failure')
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_chord_validation(self):
+        @self.huey.task()
+        def noop(values=None):
+            return values
+
+        with self.assertRaises(ValueError):
+            self.huey.enqueue(chord(
+                [], noop, success_threshold=1,
+                failure_callback=noop))
+
+        for invalid in (0, -1, 4, True, 1.5):
+            with self.assertRaises(ValueError):
+                chord(
+                    [noop.s(), noop.s(), noop.s()],
+                    noop,
+                    success_threshold=invalid,
+                    failure_callback=noop)
+
+        with self.assertRaises(ValueError):
+            chord([noop.s(), noop.s()], noop, success_threshold=1,
+                  k=2, failure_callback=noop)
+        with self.assertRaises(ValueError):
+            chord([noop.s(), noop.s()], noop, success_threshold=1)
+
+        unsupported = BlackHoleHuey(utc=False)
+        with self.assertRaises(ConfigurationError):
+            unsupported.enqueue(chord(
+                [noop.s(), noop.s()],
+                noop,
+                success_threshold=1,
+                failure_callback=noop))
+
+    def test_threshold_chord_serialization(self):
+        @self.huey.task()
+        def member(n):
+            return n
+
+        @self.huey.task()
+        def success_cb(values):
+            return values
+
+        @self.huey.task()
+        def failure_cb(errors, error):
+            return error
+
+        failure_task = failure_cb.s()
+        self.huey.enqueue(chord(
+            [member.s(1), member.s(2)],
+            success_cb,
+            success_threshold=1,
+            failure_callback=failure_task))
+        task = self.huey.dequeue()
+        cc = task.chord_config
+        self.assertEqual(cc.success_threshold, 1)
+        self.assertEqual(cc.failure_callback.id, failure_task.id)
+
+        registry = self.huey._registry
+        cb_message = registry.create_message(success_cb.s())
+        message = Message(
+            id='t1', name=registry.task_to_string(type(task)),
+            args=(1,), kwargs={},
+            chord_config=(cc.cid, 2, 0, cb_message))
+        restored = registry.create_task(message)
+        self.assertIsNone(restored.chord_config.success_threshold)
+        self.assertIsNone(restored.chord_config.failure_callback)
 
     def test_chord_error_cb(self):
         prod, agg = self.funcs()

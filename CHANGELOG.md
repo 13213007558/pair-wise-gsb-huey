@@ -3,6 +3,13 @@ Changelog
 
 ## master
 
+* Add success-threshold chords. `chord(tasks, callback, success_threshold=k,
+  failure_callback=...)` enqueues the success callback once `k` distinct
+  members succeed, and enqueues a separate failure callback once success
+  becomes impossible. Duplicate terminal notifications and late completions
+  are ignored. Threshold chords are supported by `MemoryStorage` and
+  `SqliteStorage` only; other storages refuse to enable the mode rather than
+  silently using a racy fallback.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

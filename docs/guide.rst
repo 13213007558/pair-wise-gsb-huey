@@ -1337,6 +1337,76 @@ What happens when a :py:class:`chord` is enqueued?
    order. The final callback is then enqueued with the sub-task results.
 4. The callback is executed by a worker and the final result is made available.
 
+Success-threshold chords
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+A normal chord waits for **every** member to reach a terminal state. When some
+downstream members are known to be unstable, a threshold chord can continue as
+soon as enough distinct members succeed.
+
+.. code-block:: python
+
+    from huey import ChordThresholdError
+
+    @huey.task()
+    def merge_successes(results):
+        return list(results)
+
+    @huey.task()
+    def merge_failed(errors, error):
+        # ``errors`` contains Error/SKIPPED values in member order.
+        # ``error`` is a ChordThresholdError with size, threshold and counts.
+        logger.warning('%s', error)
+        return error.failure_count
+
+    c = chord(
+        [fetch.s(url) for url in urls],
+        merge_successes,
+        success_threshold=3,                 # ``k=3`` is also accepted.
+        failure_callback=merge_failed)
+
+The success callback receives only successful values, ordered by the original
+member position. Each member contributes at most one terminal vote: a task
+that still has retries left does not vote, while a permanently failed, revoked,
+expired or cancelled task votes as a failure. Duplicate delivery or duplicate
+completion notifications for the same member are ignored.
+
+When the success threshold is reached, exactly one worker atomically claims
+the terminal transition and enqueues the success callback. If success becomes
+mathematically impossible (too many terminal failures), the same mechanism
+enqueues the separate failure callback instead. After either terminal state,
+late successes, late failures and duplicate notifications cannot trigger
+another callback.
+
+Use :py:attr:`ChordResult.failure` to wait for the failure callback result.
+Use :py:meth:`chord.failure_error` to attach an error handler that runs if the
+failure callback itself raises. The existing :py:meth:`chord.error` method
+still applies to the success callback.
+
+Threshold chords require storage primitives that can update chord state and
+enqueue the terminal callback atomically. Huey implements this mode for
+:py:class:`MemoryHuey` and :py:class:`SqliteHuey` (including
+:py:class:`CySqliteHuey`). Other storages raise
+:py:class:`~huey.exceptions.ConfigurationError` instead of silently degrading
+to non-atomic counters.
+
+Fault semantics:
+
+* There is no externally visible gap between claiming a terminal callback and
+  inserting it in the queue. For SQLite the state update and task insertion
+  commit in one exclusive transaction; for the in-memory backend they occur
+  under one lock.
+* A failure while building/serializing the callback, or before the SQLite
+  transaction commits, leaves the chord non-terminal. A worker/process crash
+  after commit leaves the state terminal and the callback already in the
+  queue.
+* SQLite persistence covers the claim/enqueue step. The in-memory backend has
+  no durability across process termination.
+* This is not unconditional end-to-end exactly-once execution on every
+  backend. Once the callback message is dequeued, normal Huey delivery,
+  timeout, retry and worker-failure semantics apply, and Huey does not claim
+  exactly-once execution on arbitrary storage.
+
 .. note::
     A sub-task that is skipped without executing (because it was revoked,
     expired, or cancelled by a pre-execute hook) still counts towards chord
