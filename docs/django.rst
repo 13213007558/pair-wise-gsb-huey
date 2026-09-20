@@ -401,6 +401,111 @@ identifier names:
     If no transaction is active, task will be enqueued immediately.
 
 
+.. _django-outbox:
+
+Transactional Outbox (durable tasks)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:py:func:`on_commit_task` is convenient, but it has a durability gap: the
+post-commit callback enqueues the task *after* the database COMMIT succeeds.
+If the process is killed (power loss, OOM, deploy) in the tiny window between
+the commit and the enqueue call, the business transaction is durable but the
+task is lost silently.
+
+The ``huey.contrib.djhuey_outbox`` app implements the transactional outbox
+pattern (https://microservices.io/patterns/data/transactional-outbox.html)
+to close that gap. Calling an outbox task inserts a row containing the
+serialized task in the **same database transaction** as your business data.
+A separate, repeatedly-runnable dispatcher claims committed rows and forwards
+them to Huey. Nothing is enqueued when a transaction rolls back, and a row is
+only marked ``sent`` after the queue accepts it.
+
+Installation
+""""""""""""
+
+1. Add the app to ``INSTALLED_APPS`` and run the migrations:
+
+.. code-block:: python
+
+    INSTALLED_APPS = (
+        # ...
+        'huey.contrib.djhuey',
+        'huey.contrib.djhuey_outbox',
+    )
+
+::
+
+    python manage.py migrate djhuey_outbox
+
+2. Define tasks with ``outbox_task``:
+
+.. code-block:: python
+
+    from huey.contrib.djhuey_outbox.tasks import outbox_task
+
+    @outbox_task()
+    def send_welcome_email(user_id):
+        # Must be idempotent: delivery is at-least-once (see below).
+        ...
+
+    with transaction.atomic():
+        user = User.objects.create(...)
+        # Inserts an outbox row in THIS transaction; nothing is enqueued yet.
+        send_welcome_email(user.pk)
+
+The row is committed and rolled back together with the surrounding business
+data, including nested ``atomic()`` blocks and savepoints. A custom database
+alias can be selected with the ``using`` decorator parameter or the per-call
+``using`` keyword, e.g. ``send_welcome_email(user.pk, using='orders')``.
+
+3. Run the dispatcher. It is idempotent and safe to run concurrently from
+several processes:
+
+::
+
+    # One bounded batch (cron / a Kubernetes CronJob):
+    python manage.py dispatch_huey_outbox --once --batch-size 100
+
+    # Or as a long-running loop alongside run_huey:
+    python manage.py dispatch_huey_outbox --interval 5
+
+Options include ``--database`` (alias of the outbox table), ``--batch-size``,
+``--claim-timeout``, ``--max-attempts``, ``--base-delay`` and
+``--max-delay``. The dispatcher is also usable directly from Python:
+
+.. code-block:: python
+
+    from huey.contrib.djhuey_outbox.dispatcher import OutboxDispatcher
+
+    OutboxDispatcher(batch_size=100, claim_timeout=300).dispatch_once()
+
+Delivery guarantees
+"""""""""""""""""""
+
+The dispatcher follows a CLAIM, SEND, CONFIRM protocol:
+
+* **CLAIM** is one conditional UPDATE: rows that are ``pending`` and due, or
+  ``in_progress`` claims older than ``claim_timeout`` seconds, are atomically
+  owned by the dispatcher. Two dispatchers can never own the same live claim,
+  and a crashed dispatcher claim is recovered after the timeout.
+* **SEND** enqueues the serialized message, preserving the stable Huey task
+  id generated when the row was written.
+* **CONFIRM** marks the row ``sent``. If SEND raises, the exception text is
+  stored in ``last_error`` and the row returns to ``pending`` with an
+  exponential backoff (``base_delay * 2 ** (attempts - 1)``, capped at
+  ``max_delay``). After ``max_attempts`` failures the row moves to the
+  ``failed`` dead-letter status and is never dispatched again.
+
+**Delivery is at-least-once, never exactly-once.** If the process dies after
+a successful SEND but before CONFIRM, the claim times out and the same
+message, carrying the *same* Huey task id, is enqueued again. Consumers
+therefore MUST be idempotent. The stable id is exposed to help de-duplicate
+(persist the ids you have already handled). Huey cannot guarantee that your
+task function runs exactly once.
+
+The :py:func:`on_commit_task` helper and its default behavior are unchanged;
+the outbox is an opt-in alternative for callers that need crash durability.
+
 .. _django-admin-stats:
 
 Admin dashboard
