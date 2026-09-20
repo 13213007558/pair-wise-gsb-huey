@@ -354,7 +354,7 @@ Huey object
             # ... later ...
             consumer.stop(graceful=True)
 
-    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, version=None, aliases=None, **kwargs)
 
         :param int retries: number of times to retry the function if an
             unhandled exception occurs when it is executed.
@@ -385,6 +385,16 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param int version: version of the task's argument layout, a
+            non-negative integer (defaults to ``0``). Messages enqueued by
+            older versions of the task are upgraded by migrations
+            registered with :py:meth:`~Huey.migration`. See
+            :ref:`task-versioning`.
+        :param aliases: iterable of previous full task names (module path
+            plus function name) that should resolve to this task. Aliases
+            allow old messages to be processed after the task function is
+            renamed or moved. An alias that conflicts with another task's
+            name or alias raises ``ValueError`` at registration.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
@@ -444,7 +454,7 @@ Huey object
         revocation, etc.), see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
 
-    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, version=None, aliases=None, **kwargs)
 
         :param function validate_datetime: function which accepts a
             ``datetime`` instance and returns whether the task should be
@@ -474,6 +484,16 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param int version: version of the task's argument layout, a
+            non-negative integer (defaults to ``0``). Messages enqueued by
+            older versions of the task are upgraded by migrations
+            registered with :py:meth:`~Huey.migration`. See
+            :ref:`task-versioning`.
+        :param aliases: iterable of previous full task names (module path
+            plus function name) that should resolve to this task. Aliases
+            allow old messages to be processed after the task function is
+            renamed or moved. An alias that conflicts with another task's
+            name or alias raises ``ValueError`` at registration.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
@@ -529,6 +549,40 @@ Huey object
 
             * :py:meth:`Huey.put`
             * :py:meth:`Huey.get`
+
+    .. py:method:: migration(task, from_version)
+
+        :param task: a :py:class:`TaskWrapper`, a :py:class:`Task` class,
+            or a task name (canonical name or registered alias). The task
+            must already be registered.
+        :param int from_version: the message version the migration upgrades
+            from, a non-negative integer. The decorated function upgrades
+            messages from ``from_version`` to ``from_version + 1``.
+        :returns: a decorator that registers the migration function.
+
+        Register an explicit migration that converts the ``(args, kwargs)``
+        of an old task message into the layout expected by the next version.
+        The decorated function receives ``(args, kwargs)`` and must return a
+        new ``(args, kwargs)`` 2-tuple. Migrations are chained one version at
+        a time, so a message several versions behind passes through each
+        migration in order.
+
+        .. code-block:: python
+
+            @huey.task(version=1, aliases=['myapp.tasks.send_email'])
+            def send_templated_email(address, subject, template='default'):
+                ...
+
+            @huey.migration(send_templated_email, 0)
+            def migrate_send_email_0_1(args, kwargs):
+                return args, dict(kwargs, template='default')
+
+        Only explicitly-registered migrations are applied -- Huey never
+        imports anything dynamically or guesses how to convert old
+        arguments. Migration failures raise
+        :py:class:`huey.exceptions.TaskMigrationError` when the message is
+        deserialized, and the message is not executed with stale arguments.
+        See :ref:`task-versioning` for a complete example.
 
     .. py:method:: context_task(obj, as_argument=False, **kwargs)
 
@@ -2485,4 +2539,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

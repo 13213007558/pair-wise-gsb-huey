@@ -4,6 +4,21 @@ class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
 
+class TaskMigrationError(HueyException):
+    """
+    Raised when a task message cannot be migrated to the version of the
+    registered task. Carries the task name and the message/target versions
+    so the failure can be located in logs.
+    """
+    def __init__(self, task_name, msg_version, task_version, reason):
+        self.task_name = task_name
+        self.msg_version = msg_version
+        self.task_version = task_version
+        super(TaskMigrationError, self).__init__(
+            'Unable to migrate task "%s" message (message version %s, task '
+            'version %s): %s' % (task_name, msg_version, task_version,
+                                 reason))
+
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):
         self.key, self.delay, self.retry = key, delay, retry

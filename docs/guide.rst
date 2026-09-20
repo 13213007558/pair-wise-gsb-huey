@@ -395,6 +395,87 @@ For more information, see:
 * :py:class:`Result`
 * :py:class:`TaskException`
 
+.. _task-versioning:
+
+Task versioning and migrations
+------------------------------
+
+When a task function is renamed or its signature changes, messages enqueued
+by the older code may still be sitting in the queue (or the schedule) when
+the consumer is upgraded. Huey provides an explicit, opt-in mechanism for
+upgrading those old messages safely:
+
+* ``version=`` declares the current version of a task (defaults to ``0``).
+* ``aliases=`` maps the task's previous name(s) onto the renamed task.
+* :py:meth:`Huey.migration` registers a function that converts the
+  ``(args, kwargs)`` of an old message into the layout expected by the next
+  version.
+
+Messages written by older versions of Huey, which have no version at all,
+are treated as version ``0``.
+
+Suppose the original task looked like this:
+
+.. code-block:: python
+
+    # myapp/tasks.py (version 0)
+    @huey.task()
+    def send_email(address, subject):
+        ...
+
+After refactoring, the function is renamed and takes an additional
+parameter. Declare the new version, alias the old name, and register a
+migration from version 0 to version 1:
+
+.. code-block:: python
+
+    # myapp/tasks.py (version 1)
+    @huey.task(version=1, aliases=['myapp.tasks.send_email'])
+    def send_templated_email(address, subject, template='default'):
+        ...
+
+    @huey.migration(send_templated_email, 0)
+    def migrate_send_email_0_1(args, kwargs):
+        # Receives the old (args, kwargs) and returns the new ones.
+        return args, dict(kwargs, template='default')
+
+Aliases are the *full* task name (module path plus function name), as
+enqueued by the older code. When the consumer dequeues a message whose name
+is a registered alias, it is resolved to the current task automatically.
+
+Migrations are chained one version at a time. If the task is later bumped
+to ``version=2``, register an additional migration from version 1 and old
+messages will pass through both, in order:
+
+.. code-block:: python
+
+    @huey.migration(send_templated_email, 1)
+    def migrate_send_email_1_2(args, kwargs):
+        args, kwargs  # message at version 1
+        return new_args, new_kwargs  # message at version 2
+
+Things to be aware of:
+
+* A migration only ever rewrites ``args`` and ``kwargs``. The task's id,
+  ETA, retries, priority and expiration are carried over unchanged.
+* Nested messages -- ``on_complete`` and ``on_error`` handlers, and chord
+  callbacks -- are migrated independently, according to each task's own
+  version.
+* Migrations must be registered *after* the task they belong to, and only
+  explicitly-registered migrations are ever applied. Huey will never import
+  anything dynamically or guess how to convert old arguments.
+* If a message's version is newer than the registered task, if a link in
+  the migration chain is missing, or if a migration raises an exception,
+  deserializing the message fails with
+  :py:class:`huey.exceptions.TaskMigrationError`. The error names the task
+  and the versions involved, and the message is **not** executed with stale
+  arguments.
+* Registering two tasks (or aliases) that resolve to the same name raises
+  ``ValueError`` at import time, and aliases never cause a periodic task to
+  be scheduled twice.
+
+For more information, see :py:meth:`Huey.task` and :py:meth:`Huey.migration`.
+
 .. _immediate:
 
 Immediate mode

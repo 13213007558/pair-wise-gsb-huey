@@ -3,6 +3,16 @@ Changelog
 
 ## master
 
+* Add task message versioning and explicit migrations. Tasks accept
+  `version=` and `aliases=` (old task names that resolve to the renamed
+  task), and `Huey.migration(task, from_version)` registers a function that
+  upgrades an old message's `(args, kwargs)` one version at a time.
+  Unversioned messages are treated as version 0; unknown future versions,
+  broken migration chains and migration exceptions raise
+  `huey.exceptions.TaskMigrationError` without executing the message.
+  Migration preserves the task id, ETA, retries, priority and expiration,
+  and nested `on_complete` / `on_error` / chord callback messages are
+  migrated according to their own task's version.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

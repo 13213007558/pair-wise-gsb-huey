@@ -172,8 +172,13 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             context=False, name=None, expires=None, timeout=None,
+             version=None, aliases=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
+        if version is not None:
+            kwargs['version'] = version
+        if aliases is not None:
+            kwargs['aliases'] = tuple(aliases)
         def decorator(func):
             return TaskWrapper(
                 self,
@@ -191,8 +196,13 @@ class Huey(object):
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, version=None, aliases=None,
+                      **kwargs):
         TaskWrapper = self.task_wrapper_class
+        if version is not None:
+            kwargs['version'] = version
+        if aliases is not None:
+            kwargs['aliases'] = tuple(aliases)
         def decorator(func):
             def method_validate(self, timestamp):
                 return validate_datetime(timestamp)
@@ -212,6 +222,28 @@ class Huey(object):
                 task_base=PeriodicTask,
                 **kwargs)
 
+        return decorator
+
+    def migration(self, task, from_version):
+        """Register an explicit migration upgrading a task message's
+        (args, kwargs) from ``from_version`` to ``from_version + 1``.
+
+        :param task: a TaskWrapper, Task class, or task name (canonical
+            name or registered alias).
+        :param int from_version: the message version the migration upgrades
+            from. Multiple migrations are chained to reach the task's
+            current version.
+
+        The decorated function receives (args, kwargs) and must return a
+        new (args, kwargs) 2-tuple. Only explicitly-registered migrations
+        are applied -- Huey will never attempt to guess how to convert old
+        arguments.
+        """
+        if isinstance(task, TaskWrapper):
+            task = task.task_class
+        def decorator(fn):
+            self._registry.register_migration(task, from_version, fn)
+            return fn
         return decorator
 
     def context_task(self, obj, as_argument=False, **kwargs):
@@ -843,6 +875,8 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    version = 0
+    aliases = ()
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
