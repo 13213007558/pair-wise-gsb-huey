@@ -1,5 +1,10 @@
 class HueyException(Exception): pass
 class ConfigurationError(HueyException): pass
+class EnvelopeError(HueyException): pass
+class InvalidEnvelopeError(EnvelopeError): pass
+class UnknownKeyError(EnvelopeError): pass
+class SignatureMismatchError(EnvelopeError): pass
+class PayloadTooLargeError(EnvelopeError): pass
 class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 

@@ -1201,6 +1201,42 @@ inside of huey (provided it is available wherever the consumer is running):
     # result-store like any other task.
     path_task('foo.add_these', 1, 2)
 
+Signing and key rotation
+-------------------------
+
+To authenticate messages between producers and consumers, use
+``huey.serializer.SignedEnvelopeSerializer``. It signs a versioned envelope
+covering the format version, key id, encoding flag (none/gzip/zlib) and the
+on-the-wire payload, and only decompresses and deserializes the payload
+*after* the signature has been verified. A ``max_decompressed_size`` limit
+guards against decompression bombs.
+
+.. code-block:: python
+
+    from huey.serializer import SignedEnvelopeSerializer
+
+    # Producer signs with the current key id; consumers may be configured
+    # with any subset of allowed keys (current_key_id optional).
+    serializer = SignedEnvelopeSerializer(
+        keys={'v1': 'secret-v1', 'v2': 'secret-v2'},
+        current_key_id='v2',  # producers only
+        compression=True,
+        max_decompressed_size=1024 * 1024)
+    huey = RedisHuey('my-app', serializer=serializer)
+
+To rotate keys, add the new key to consumers, switch producers to the new
+key id, then remove the old key. Messages signed with a removed key are
+rejected with ``UnknownKeyError``; tampered envelopes raise
+``SignatureMismatchError``, malformed envelopes ``InvalidEnvelopeError``,
+and oversized payloads ``PayloadTooLargeError`` (all subclasses of
+``huey.exceptions.EnvelopeError``).
+
+The older ``SignedSerializer`` format is only accepted when
+``allow_legacy=True`` (with ``legacy_secret``) is set. Because the legacy
+format authenticates *after* decompression, this option should only be
+enabled during a migration window. See
+``examples/serializer_migration.py`` for a full migration walkthrough.
+
 Reading more
 ------------
 
