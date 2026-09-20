@@ -16,6 +16,8 @@ integration provides:
    6.0 and newer, or older Djangos using the django-tasks backport).
 6. Optional :ref:`Admin integration <django-admin-stats>` for visibility and
    managing your Huey queue.
+7. Optional :ref:`durable tasks <django-durable-outbox>` that survive a
+   process exit between transaction commit and enqueue.
 
 Supported Django versions are those officially supported at https://www.djangoproject.com/download/#supported-versions
 
@@ -290,6 +292,8 @@ The ``huey.contrib.djhuey`` module exposes a number of additional helpers:
 * :py:meth:`~Huey.post_execute`
 * :py:meth:`~Huey.signal` and :py:meth:`~Huey.disconnect_signal`
 * :py:func:`on_commit_task`, for enqueueing tasks after transaction commits.
+* :py:func:`outbox_task` (in ``huey.contrib.djhuey.outbox``), for durable,
+  at-least-once delivery after transaction commits.
 
 Tasks that execute queries
 ^^^^^^^^^^^^^^^^^^^^^^^^^^
@@ -399,6 +403,103 @@ identifier names:
 
     Enqueue the decorated function for execution after the transaction commits.
     If no transaction is active, task will be enqueued immediately.
+
+.. _django-durable-outbox:
+
+Durable tasks (transactional outbox)
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+:py:func:`on_commit_task` enqueues the task from a post-commit callback. If
+the process exits after the transaction commits but before that callback
+runs, the task is silently lost. The outbox app closes that gap: the task is
+first written to a database table *inside your transaction*, and a separate
+dispatcher moves pending rows into the Huey queue. Anything left behind by a
+crash is picked up the next time the dispatcher runs.
+
+Installation:
+
+.. code-block:: python
+
+    INSTALLED_APPS = [
+        # ...
+        `huey.contrib.djhuey`,
+        `huey.contrib.djhuey.outbox`,
+    ]
+
+Then create the table:
+
+.. code-block:: console
+
+    $ python manage.py migrate
+
+Decorate functions with :py:func:`outbox_task` (same calling conventions as
+:py:func:`on_commit_task`, which is unchanged and remains the default):
+
+.. code-block:: python
+
+    from huey.contrib.djhuey.outbox import outbox_task
+
+    @outbox_task()
+    def charge_card(order_id):
+        ...
+
+    @transaction.atomic
+    def checkout(request, ...):
+        order = Order.objects.create(...)
+        charge_card(order.id)  # Row written inside this transaction.
+
+The row commits or rolls back together with your business writes, including
+nested ``atomic()`` blocks and savepoints. After the commit, a best-effort
+callback dispatches immediately; if the process dies first, run the
+dispatcher to recover:
+
+.. code-block:: console
+
+    $ python manage.py dispatch_outbox  # one bounded batch, safe to re-run
+    $ python manage.py dispatch_outbox --loop --interval 1.0
+
+Schedule the one-shot form via cron (or run ``--loop`` under a process
+supervisor). Each run claims at most ``--batch-size`` rows (default 100).
+Claims are compare-and-set updates, so any number of concurrent dispatchers
+may run without double-claiming; a claim that is not completed within
+``--claim-timeout`` seconds (default 60) becomes recoverable by another
+dispatcher.
+
+Send failures are retried with a backoff of ``--retry-delay`` seconds
+(default 5) up to ``--max-attempts`` (default 8), after which the row is
+marked ``failed`` and left alone. The traceback of the last failure is kept
+in the row's ``last_error`` column.
+
+.. note::
+
+    Delivery is **at-least-once**, not exactly-once. If the process crashes
+    after Huey accepted the message but before the row was marked sent, the
+    row is reclaimed and the *same task id* is enqueued again. Consumers can
+    deduplicate on that stable id, but the task function itself may run more
+    than once and must be idempotent.
+
+For projects using multiple databases, the outbox row is written on the
+alias given by the decorator's ``using=`` parameter (or the per-call
+``_outbox_using=`` keyword argument), defaulting to ``default``. The row
+joins the transaction on that alias, and the dispatcher must be pointed at
+the same alias: ``python manage.py dispatch_outbox --using other``.
+
+.. py:function:: outbox_task(*args, **kwargs)
+
+    :param using: Database alias for the outbox row (default
+        ``default``); may be overridden per-call with ``_outbox_using=``.
+    :param args: See :py:meth:`~Huey.task` for supported parameters.
+    :param kwargs: See :py:meth:`~Huey.task` for supported parameters.
+
+    Record the decorated function durably in the current transaction and
+    enqueue it after commit, with at-least-once delivery.
+
+.. py:function:: dispatch_outbox(using=`default`, **kwargs)
+
+    Re-runnable recovery entry-point: dispatch one bounded batch of pending
+    rows from Python. Accepts the same options as the management command
+    (``batch_size``, ``claim_timeout``, ``max_attempts``, ``retry_delay``).
+
 
 
 .. _django-admin-stats:

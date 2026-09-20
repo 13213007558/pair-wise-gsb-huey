@@ -3,6 +3,16 @@ Changelog
 
 ## master
 
+* Add ``huey.contrib.djhuey.outbox``, a Django app implementing the
+  transactional outbox pattern for Huey tasks. Tasks decorated with
+  ``outbox_task`` are written to a database table inside the caller's
+  transaction and dispatched to Huey after commit, so a process exit
+  between commit and enqueue no longer drops the task. Includes a
+  re-runnable, bounded ``dispatch_outbox`` management command with
+  compare-and-set claiming (safe for concurrent dispatchers), claim
+  timeout recovery, and bounded retries with failure diagnostics.
+  Delivery is at-least-once with stable task ids; ``on_commit_task`` is
+  unchanged.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

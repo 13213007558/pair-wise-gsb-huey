@@ -14,14 +14,15 @@ if django_tasks_available:
 
     from huey import MemoryHuey
 
-    settings.configure(
-        USE_TZ=True,
-        DATABASES={'default': {
-            'ENGINE': 'django.db.backends.sqlite3',
-            'NAME': ':memory:'}},
-        TASKS={'default': {
-            'BACKEND': 'huey.contrib.djhuey.tasks_backend.HueyBackend'}},
-        HUEY=MemoryHuey('djtasks-test'))
+    if not settings.configured:
+        settings.configure(
+            USE_TZ=True,
+            DATABASES={'default': {
+                'ENGINE': 'django.db.backends.sqlite3',
+                'NAME': ':memory:'}},
+            TASKS={'default': {
+                'BACKEND': 'huey.contrib.djhuey.tasks_backend.HueyBackend'}},
+            HUEY=MemoryHuey('djtasks-test'))
     django.setup()
 
     from django.db import transaction
