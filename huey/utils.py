@@ -45,7 +45,11 @@ class _Skipped(object):
 
 SKIPPED = _Skipped()
 
-ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback'))
+ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback',
+                                         'threshold', 'error_callback'))
+# Threshold chords are opt-in; classic chords carry no threshold or
+# chord-level error callback.
+ChordConfig.__new__.__defaults__ = (None, None)
 
 
 def load_class(s):

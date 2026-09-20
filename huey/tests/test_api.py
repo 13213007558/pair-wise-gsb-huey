@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import inspect
+import threading
 import time
 
 from huey.api import ChordResult
@@ -2379,6 +2380,412 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(self.execute_next(), -1)
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(state, [99])
+
+
+class TestThresholdChord(BaseTestCase):
+    def funcs(self):
+        @self.huey.task()
+        def prod(n):
+            if n is None:
+                raise TestError('bad')
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return sum(n for n in ns if n is not SKIPPED)
+
+        return prod, agg
+
+    def test_threshold_basic(self):
+        prod, agg = self.funcs()
+
+        c = chord([prod.s(i) for i in range(5)], agg.s(), threshold=3)
+        r = self.huey.enqueue(c)
+        self.assertEqual(len(self.huey), 5)
+
+        self.assertEqual(self.execute_next(), 1)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(len(self.huey), 3)  # Threshold not yet reached.
+
+        self.assertEqual(self.execute_next(), 3)  # 3rd success: threshold.
+        self.assertEqual(len(self.huey), 3)  # 2 members + callback.
+
+        # Remaining members still run, but their votes are ignored and
+        # cannot trigger a second callback.
+        self.assertEqual(self.execute_next(), 4)
+        self.assertEqual(self.execute_next(), 5)
+        self.assertEqual(len(self.huey), 1)
+
+        # The callback received the results available at claim time; the
+        # two late members contribute SKIPPED placeholders.
+        self.assertEqual(self.execute_next(), 6)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(r(), 6)
+
+    def test_threshold_results_snapshot(self):
+        prod, _ = self.funcs()
+
+        @self.huey.task()
+        def collect(ns):
+            return ns
+
+        c = chord([prod.s(i) for i in range(4)], collect.s(), threshold=2)
+        r = self.huey.enqueue(c)
+        self.assertEqual(self.execute_next(), 1)
+        self.assertEqual(self.execute_next(), 2)  # Threshold reached.
+        self.assertEqual(self.execute_next(), 3)  # Ignored.
+        self.assertEqual(self.execute_next(), 4)  # Ignored.
+        self.assertEqual(self.execute_next(), [1, 2, SKIPPED, SKIPPED])
+        self.assertEqual(r(), [1, 2, SKIPPED, SKIPPED])
+
+    def test_threshold_error_terminal(self):
+        prod, agg = self.funcs()
+        state = []
+
+        @self.huey.task()
+        def on_chord_error(ns):
+            state.append(ns)
+            return 'chord-failed'
+
+        # Threshold 4 of 5 tolerates a single failure.
+        c = chord([prod.s(None), prod.s(1), prod.s(None), prod.s(3),
+                   prod.s(4)], agg.s(), threshold=4,
+                  error_callback=on_chord_error.s())
+        r = self.huey.enqueue(c)
+        self.assertEqual(len(self.huey), 5)
+
+        self.assertTrue(self.execute_next() is None)  # Failure 1.
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(len(self.huey), 3)  # Still reachable.
+
+        self.assertTrue(self.execute_next() is None)  # Failure 2: hopeless.
+        self.assertEqual(len(self.huey), 3)  # 2 members + error callback.
+
+        # Late successes are ignored and cannot fire the success callback.
+        self.assertEqual(self.execute_next(), 4)
+        self.assertEqual(self.execute_next(), 5)
+        self.assertEqual(len(self.huey), 1)
+
+        self.assertEqual(self.execute_next(), 'chord-failed')
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(r.error_callback(), 'chord-failed')
+
+        # The error callback received the snapshot at claim time.
+        ns, = state
+        self.assertEqual(len(ns), 5)
+        self.assertTrue(isinstance(ns[0], Error))
+        self.assertEqual(ns[1], 2)
+        self.assertTrue(isinstance(ns[2], Error))
+        self.assertTrue(ns[3] is SKIPPED)
+        self.assertTrue(ns[4] is SKIPPED)
+
+    def test_threshold_unreachable_boundary(self):
+        prod, agg = self.funcs()
+        state = []
+
+        @self.huey.task()
+        def on_chord_error(ns):
+            state.append(1)
+            return 'failed'
+
+        # Threshold 3 of 5 tolerates exactly two failures.
+        c = chord([prod.s(None), prod.s(None), prod.s(1), prod.s(None),
+                   prod.s(2)], agg.s(), threshold=3,
+                  error_callback=on_chord_error.s())
+        r = self.huey.enqueue(c)
+
+        self.assertTrue(self.execute_next() is None)  # Failure 1.
+        self.assertTrue(self.execute_next() is None)  # Failure 2.
+        self.assertEqual(len(self.huey), 3)  # No terminal state yet.
+        self.assertEqual(self.execute_next(), 2)
+        self.assertTrue(self.execute_next() is None)  # Failure 3: hopeless.
+        self.assertEqual(len(self.huey), 2)  # 1 member + error callback.
+        self.assertEqual(self.execute_next(), 3)  # Ignored.
+        self.assertEqual(self.execute_next(), 'failed')
+        self.assertEqual(state, [1])
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_duplicate_notification(self):
+        prod, agg = self.funcs()
+
+        c = chord([prod.s(1), prod.s(2)], agg.s(), threshold=2)
+        r = self.huey.enqueue(c)
+
+        task = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(task), 2)
+
+        # A duplicate completion notification for the same member must not
+        # contribute a second vote.
+        self.huey._check_threshold_chord(task.chord_config, 2)
+        self.assertEqual(len(self.huey), 1)  # Only the 2nd member remains.
+
+        self.assertEqual(self.execute_next(), 3)  # Threshold reached.
+        self.assertEqual(len(self.huey), 1)  # Callback.
+        self.assertEqual(self.execute_next(), 5)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(r(), 5)
+
+    def test_threshold_duplicate_delivery(self):
+        prod, agg = self.funcs()
+
+        c = chord([prod.s(1), prod.s(2)], agg.s(), threshold=2)
+        r = self.huey.enqueue(c)
+
+        # Simulate duplicate delivery of the first member's task.
+        task = self.huey.dequeue()
+        self.huey.enqueue(task)
+        self.assertEqual(self.huey.execute(task), 2)
+        self.assertEqual(len(self.huey), 2)  # Duplicate + member 2.
+
+        self.assertEqual(self.execute_next(), 3)  # Member 2: threshold.
+        self.assertEqual(len(self.huey), 2)  # Duplicate + callback.
+
+        # The redelivered copy executes but its vote is ignored and cannot
+        # trigger a second callback.
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), 5)
+        self.assertEqual(len(self.huey), 0)
+        self.assertEqual(r(), 5)
+
+    def test_threshold_retry_exhausted(self):
+        prod, agg = self.funcs()
+        attempts = []
+        state = []
+
+        @self.huey.task(retries=1)
+        def flaky(n):
+            attempts.append(n)
+            raise TestError('always')
+
+        @self.huey.task()
+        def on_chord_error(ns):
+            state.append(1)
+            return 'failed'
+
+        c = chord([flaky.s(1), prod.s(2)], agg.s(), threshold=2,
+                  error_callback=on_chord_error.s())
+        r = self.huey.enqueue(c)
+        self.assertEqual(len(self.huey), 2)
+
+        # The first failure does not vote while retries remain.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(len(self.huey), 2)  # Retry + member 2.
+        self.assertEqual(state, [])
+
+        self.assertEqual(self.execute_next(), 3)  # Member 2 succeeds.
+        self.assertEqual(len(self.huey), 1)  # Retry still pending.
+
+        # Retries exhausted: exactly one failure vote, making the threshold
+        # unreachable and claiming the error callback.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), 'failed')
+        self.assertEqual(state, [1])
+        self.assertEqual(attempts, [1, 1])
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_retry_then_success(self):
+        prod, agg = self.funcs()
+        attempts = []
+
+        @self.huey.task(retries=1)
+        def flaky(n):
+            attempts.append(n)
+            if len(attempts) == 1:
+                raise TestError('transient')
+            return n * 10
+
+        c = chord([flaky.s(1), prod.s(2)], agg.s(), threshold=2)
+        r = self.huey.enqueue(c)
+
+        self.assertTrue(self.execute_next() is None)  # Attempt 1 fails.
+        self.assertEqual(self.execute_next(), 3)  # prod(2).
+        self.assertEqual(len(self.huey), 1)  # Retry; no callback yet.
+        self.assertEqual(self.execute_next(), 10)  # Retry succeeds.
+        self.assertEqual(len(self.huey), 1)  # Callback.
+        self.assertEqual(self.execute_next(), 13)  # agg([10, 3]).
+        self.assertEqual(r(), 13)
+        self.assertEqual(attempts, [1, 1])
+
+    def test_threshold_concurrent_claim(self):
+        # Many workers completing members at the same time: exactly one
+        # callback is claimed and enqueued.
+        prod, agg = self.funcs()
+        nmembers, threshold = 10, 5
+
+        c = chord([prod.s(i) for i in range(nmembers)], agg.s(),
+                  threshold=threshold)
+        r = self.huey.enqueue(c)
+        tasks = [self.huey.dequeue() for _ in range(nmembers)]
+
+        barrier = threading.Barrier(nmembers)
+
+        def run(task):
+            barrier.wait()
+            self.huey.execute(task)
+
+        threads = [threading.Thread(target=run, args=(task,))
+                   for task in tasks]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Exactly one callback was enqueued despite the race.
+        self.assertEqual(len(self.huey), 1)
+        value = self.execute_next()
+        self.assertTrue(0 < value <= sum(range(1, nmembers + 1)))
+        self.assertEqual(len(self.huey), 0)
+
+    def test_threshold_invalid(self):
+        prod, agg = self.funcs()
+
+        # Empty group.
+        self.assertRaises(ValueError, chord, [], agg.s(), threshold=1)
+        # Threshold out of range.
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          threshold=0)
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          threshold=-1)
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          threshold=2)
+        # Non-integer thresholds.
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          threshold=1.5)
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          threshold=True)
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          threshold='1')
+        # error_callback only makes sense with a threshold.
+        self.assertRaises(ValueError, chord, [prod.s(1)], agg.s(),
+                          error_callback=agg.s())
+
+    def test_threshold_unsupported_storage(self):
+        from huey.api import BlackHoleHuey
+        huey = BlackHoleHuey(utc=False)
+
+        @huey.task()
+        def prod(n):
+            return n + 1
+
+        @huey.task()
+        def agg(ns):
+            return sum(ns)
+
+        # The backend cannot refuse silently: enabling the mode on a
+        # storage without atomic vote support raises immediately.
+        c = chord([prod.s(1)], agg.s(), threshold=1)
+        self.assertRaises(ConfigurationError, huey.enqueue, c)
+
+        # The classic chord remains usable on the same backend.
+        huey.enqueue(chord([prod.s(1)], agg.s()))
+
+    def test_threshold_unsupported_storage_backends(self):
+        # Backends without the atomic vote primitive refuse to enable the
+        # mode rather than silently degrading. Constructing these does not
+        # require a running server, and the refusal happens before any
+        # storage operation.
+        from huey.api import FileHuey
+        from huey.api import RedisHuey
+
+        import tempfile
+
+        for huey in (RedisHuey(utc=False),
+                     FileHuey(path=tempfile.mkdtemp(), utc=False)):
+
+            @huey.task()
+            def prod(n):
+                return n + 1
+
+            @huey.task()
+            def agg(ns):
+                return sum(ns)
+
+            c = chord([prod.s(1)], agg.s(), threshold=1)
+            self.assertRaises(ConfigurationError, huey.enqueue, c)
+
+    def test_threshold_callback_exception(self):
+        prod, agg = self.funcs()
+
+        @self.huey.task()
+        def bad_callback(ns):
+            raise TestError('callback boom')
+
+        c = chord([prod.s(1), prod.s(2)], bad_callback.s(), threshold=1)
+        r = self.huey.enqueue(c)
+
+        self.assertEqual(self.execute_next(), 2)  # Threshold reached.
+        self.assertEqual(len(self.huey), 2)  # Member 2 + callback.
+        self.assertEqual(self.execute_next(), 3)  # Ignored.
+
+        # The callback's own failure is ordinary task error handling; it
+        # does not re-trigger the chord.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(len(self.huey), 0)
+        with self.assertRaises(TaskException):
+            r()
+
+    def test_threshold_error_callback_exception(self):
+        prod, agg = self.funcs()
+
+        @self.huey.task()
+        def bad_error_callback(ns):
+            raise TestError('error callback boom')
+
+        c = chord([prod.s(None), prod.s(1)], agg.s(), threshold=2,
+                  error_callback=bad_error_callback.s())
+        r = self.huey.enqueue(c)
+
+        self.assertTrue(self.execute_next() is None)  # Hopeless already.
+        self.assertEqual(len(self.huey), 2)  # Member 2 + error callback.
+        self.assertEqual(self.execute_next(), 2)  # Ignored.
+
+        self.assertTrue(self.execute_next() is None)  # err cb raises.
+        self.assertEqual(len(self.huey), 0)
+        with self.assertRaises(TaskException):
+            r.error_callback()
+
+    def test_threshold_serialization(self):
+        prod, agg = self.funcs()
+
+        @self.huey.task()
+        def on_chord_error(ns):
+            return -1
+
+        c = chord([prod.s(1), prod.s(2)], agg.s(), threshold=2,
+                  error_callback=on_chord_error.s())
+        self.huey.enqueue(c)
+
+        # Round-trip through the serializer preserves the threshold config.
+        task = self.huey.dequeue()
+        cc = task.chord_config
+        self.assertEqual(cc.size, 2)
+        self.assertEqual(cc.idx, 0)
+        self.assertEqual(cc.threshold, 2)
+        self.assertTrue(cc.error_callback is not None)
+
+        # Messages written by older versions carry a 4-tuple chord_config
+        # without threshold fields; they must still deserialize.
+        message = self.huey._registry.create_message(task)
+        old_message = message._replace(chord_config=message.chord_config[:4])
+        data = self.huey.serializer.serialize(old_message)
+        old_task = self.huey.deserialize_task(data)
+        self.assertIsNone(old_task.chord_config.threshold)
+        self.assertIsNone(old_task.chord_config.error_callback)
+
+    def test_threshold_no_error_callback(self):
+        prod, agg = self.funcs()
+
+        # Without an error callback, a hopeless chord simply terminates.
+        c = chord([prod.s(None), prod.s(1)], agg.s(), threshold=2)
+        r = self.huey.enqueue(c)
+        self.assertTrue(r.error_callback is None)
+
+        self.assertTrue(self.execute_next() is None)  # Hopeless.
+        self.assertEqual(len(self.huey), 1)  # Member 2, no callback.
+        self.assertEqual(self.execute_next(), 2)  # Ignored.
+        self.assertEqual(len(self.huey), 0)
 
 
 class TestTaskChaining(BaseTestCase):

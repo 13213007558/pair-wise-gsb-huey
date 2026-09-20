@@ -14,6 +14,10 @@ from functools import partial
 from functools import wraps
 
 from huey import signals as S
+from huey.constants import CHORD_CALLBACK
+from huey.constants import CHORD_ERROR
+from huey.constants import CHORD_IGNORED
+from huey.constants import CHORD_LATE
 from huey.constants import EmptyData
 from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
@@ -335,6 +339,14 @@ class Huey(object):
             return Result(self, task)
 
     def _enqueue_chord(self, chord_obj):
+        if chord_obj.threshold is not None and \
+                not self.storage.supports_chord_threshold:
+            raise ConfigurationError(
+                'threshold chords require a storage backend with atomic '
+                'vote/claim support (MemoryStorage or SqliteStorage); '
+                '%s does not support them.' %
+                type(self.storage).__name__)
+
         cid = str(uuid.uuid4())
         size = len(chord_obj.tasks)
         results = []
@@ -343,12 +355,16 @@ class Huey(object):
                 raise ValueError('cannot use `group` as a chord member - '
                                  'use .then() to convert to a `chord` first.')
 
-            config = ChordConfig(cid, size, i, chord_obj.callback)
+            config = ChordConfig(cid, size, i, chord_obj.callback,
+                                 chord_obj.threshold, chord_obj.error_callback)
             results.append(self._enqueue_chord_member(task, config))
 
         cb_result = Result(self, chord_obj.callback)
         pipeline = self._build_pipeline_results(chord_obj.callback, cb_result)
-        return ChordResult(results, cb_result, pipeline)
+        err_result = None
+        if chord_obj.error_callback is not None:
+            err_result = Result(self, chord_obj.error_callback)
+        return ChordResult(results, cb_result, pipeline, err_result)
 
     def _enqueue_chord_member(self, task, config):
         if isinstance(task, chord):
@@ -580,6 +596,9 @@ class Huey(object):
             task = task.on_complete
 
     def _check_chord(self, cc, value):
+        if cc.threshold is not None:
+            return self._check_threshold_chord(cc, value)
+
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
         self.put_result(result_key, value)
@@ -596,6 +615,56 @@ class Huey(object):
                 self.delete(key)
 
             callback = cc.callback
+            callback.extend_data((results,))
+            self.enqueue(callback)
+
+    def _check_threshold_chord(self, cc, value):
+        # A member that was revoked, expired, cancelled, or that exhausted
+        # its retries contributes a failure vote; anything else is a success.
+        success = not (isinstance(value, Error) or value is SKIPPED)
+
+        chord_key = 'tchord:%s' % cc.cid
+        result_key = '%s:%s' % (chord_key, cc.idx)
+        self.put_result(result_key, value)
+
+        status = self.storage.chord_vote(
+            chord_key, cc.idx, success, cc.size, cc.threshold)
+
+        if status == CHORD_IGNORED:
+            # Duplicate notification for an already-counted member. The
+            # previously-stored result is identical, so keep it.
+            return
+        elif status == CHORD_LATE:
+            # The chord already reached a terminal state. Discard the
+            # result just written so late arrivals do not accumulate in
+            # the result store.
+            self.delete(result_key)
+            return
+        elif status not in (CHORD_CALLBACK, CHORD_ERROR):
+            return
+
+        # This worker claimed the terminal transition. Collect whatever
+        # member results are available (members that have not reported yet
+        # contribute SKIPPED) and enqueue the appropriate callback.
+        #
+        # Failure semantics: the claim and the enqueue are not transactional.
+        # If this process crashes between the two, the callback is lost and
+        # will not be re-claimed -- the claim is at-most-once. Conversely,
+        # if enqueue() succeeds, normal task-delivery semantics apply.
+        results = []
+        for idx in range(cc.size):
+            key = '%s:%s' % (chord_key, idx)
+            raw = self.get_raw(key, peek=True)
+            results.append(SKIPPED if raw is EmptyData
+                           else self.serializer.deserialize(raw))
+            self.delete(key)
+
+        if status == CHORD_CALLBACK:
+            callback = cc.callback
+        else:
+            callback = cc.error_callback
+
+        if callback is not None:
             callback.extend_data((results,))
             self.enqueue(callback)
 
@@ -1223,11 +1292,29 @@ class group(object):
 
 
 class chord(object):
-    def __init__(self, tasks, callback):
+    def __init__(self, tasks, callback, threshold=None, error_callback=None):
         if isinstance(callback, TaskWrapper):
             callback = callback.s()
+        if isinstance(error_callback, TaskWrapper):
+            error_callback = error_callback.s()
+
+        if threshold is not None:
+            if isinstance(threshold, bool) or not isinstance(threshold, int):
+                raise ValueError('threshold must be an integer')
+            if not tasks:
+                raise ValueError('a threshold chord requires at least one '
+                                 'member task')
+            if threshold < 1 or threshold > len(tasks):
+                raise ValueError('threshold must be between 1 and the '
+                                 'number of member tasks (%s)' % len(tasks))
+        elif error_callback is not None:
+            raise ValueError('error_callback requires a threshold; the '
+                             'classic chord always fires its callback.')
+
         self.tasks = tasks
         self.callback = callback
+        self.threshold = threshold
+        self.error_callback = error_callback
 
     def then(self, task, *args, **kwargs):
         self.callback.then(task, *args, **kwargs)
@@ -1392,10 +1479,12 @@ class ResultGroup(object):
 
 
 class ChordResult(object):
-    def __init__(self, results, callback_result, pipeline=None):
+    def __init__(self, results, callback_result, pipeline=None,
+                 error_callback=None):
         self.results = ResultGroup(results)
         self.callback = callback_result
         self.pipeline_results = pipeline
+        self.error_callback = error_callback
 
     def get(self, *args, **kwargs):
         return self.callback.get(*args, **kwargs)

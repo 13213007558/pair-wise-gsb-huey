@@ -71,11 +71,17 @@ class Registry(object):
 
         chord_config = None
         if task.chord_config is not None:
+            error_callback = None
+            if task.chord_config.error_callback is not None:
+                error_callback = self.create_message(
+                    task.chord_config.error_callback)
             chord_config = (
                 task.chord_config.cid,
                 task.chord_config.size,
                 task.chord_config.idx,
-                self.create_message(task.chord_config.callback))
+                self.create_message(task.chord_config.callback),
+                task.chord_config.threshold,
+                error_callback)
 
         return Message(
             task.id,
@@ -107,9 +113,16 @@ class Registry(object):
 
         chord_config = None
         if message.chord_config is not None:
-            cid, size, idx, cb_ser = message.chord_config
+            # Messages enqueued by older versions carry a 4-tuple without
+            # the threshold-chord fields; pad them with None defaults.
+            packed = tuple(message.chord_config) + (None, None)
+            cid, size, idx, cb_ser, threshold, err_ser = packed[:6]
             callback = self.create_task(cb_ser)
-            chord_config = ChordConfig(cid, size, idx, callback)
+            error_callback = None
+            if err_ser is not None:
+                error_callback = self.create_task(err_ser)
+            chord_config = ChordConfig(cid, size, idx, callback, threshold,
+                                       error_callback)
 
         return TaskClass(
             message.args,

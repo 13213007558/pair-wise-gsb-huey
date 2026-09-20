@@ -32,12 +32,18 @@ from huey.api import RedisExpireHuey
 from huey.api import RedisHuey
 from huey.api import SqliteHuey
 from huey.api import chord
+from huey.constants import CHORD_CALLBACK
+from huey.constants import CHORD_ERROR
+from huey.constants import CHORD_IGNORED
+from huey.constants import CHORD_LATE
+from huey.constants import CHORD_PENDING
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import FileStorage
 from huey.tests.base import BaseTestCase
 from huey.tests.base import CI
 from huey.tests.base import slow_test
+from huey.utils import SKIPPED
 
 
 def get_redis_version():
@@ -613,6 +619,194 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
                                    ('index', 'task'))
         self.assertEqual([r[0] for r in curs.fetchall()],
                          ['task_queue_priority_id'])
+
+
+class ChordVoteTests(object):
+    # Shared tests for storages implementing the atomic chord_vote()
+    # primitive. Expects self.s (the storage) to be set up by the TestCase.
+    def setUp(self):
+        super(ChordVoteTests, self).setUp()
+        self.s = self.huey.storage
+
+    def test_chord_vote_threshold(self):
+        s = self.s
+        self.assertEqual(s.chord_vote('c1', 0, True, 3, 2), CHORD_PENDING)
+        self.assertEqual(s.chord_vote('c1', 1, True, 3, 2), CHORD_CALLBACK)
+        # Late and duplicate notifications are ignored after the claim.
+        self.assertEqual(s.chord_vote('c1', 2, True, 3, 2), CHORD_LATE)
+        self.assertEqual(s.chord_vote('c1', 0, True, 3, 2), CHORD_LATE)
+        self.assertEqual(s.chord_vote('c1', 1, False, 3, 2), CHORD_LATE)
+
+    def test_chord_vote_duplicate(self):
+        s = self.s
+        self.assertEqual(s.chord_vote('c2', 0, True, 3, 2), CHORD_PENDING)
+        # A member cannot contribute two votes, whatever the outcome.
+        self.assertEqual(s.chord_vote('c2', 0, True, 3, 2), CHORD_IGNORED)
+        self.assertEqual(s.chord_vote('c2', 0, False, 3, 2), CHORD_IGNORED)
+        self.assertEqual(s.chord_vote('c2', 1, True, 3, 2), CHORD_CALLBACK)
+
+    def test_chord_vote_error_terminal(self):
+        s = self.s
+        # Size 4, threshold 3: tolerates exactly one failure.
+        self.assertEqual(s.chord_vote('c3', 0, False, 4, 3), CHORD_PENDING)
+        self.assertEqual(s.chord_vote('c3', 1, True, 4, 3), CHORD_PENDING)
+        self.assertEqual(s.chord_vote('c3', 2, False, 4, 3), CHORD_ERROR)
+        self.assertEqual(s.chord_vote('c3', 3, True, 4, 3), CHORD_LATE)
+        self.assertEqual(s.chord_vote('c3', 2, False, 4, 3), CHORD_LATE)
+
+    def test_chord_vote_error_boundary(self):
+        s = self.s
+        # Size 3, threshold 1: the third failure is terminal.
+        self.assertEqual(s.chord_vote('c4', 0, False, 3, 1), CHORD_PENDING)
+        self.assertEqual(s.chord_vote('c4', 1, False, 3, 1), CHORD_PENDING)
+        self.assertEqual(s.chord_vote('c4', 2, False, 3, 1), CHORD_ERROR)
+
+    def test_chord_vote_concurrent(self):
+        nthreads, n, k = 8, 24, 6
+        barrier = threading.Barrier(nthreads)
+        outcomes = []
+
+        def run(tid):
+            barrier.wait()
+            for i in range(tid, n, nthreads):
+                outcomes.append(self.s.chord_vote('c5', i, True, n, k))
+
+        threads = [threading.Thread(target=run, args=(i,))
+                   for i in range(nthreads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # Exactly one voter claimed the terminal transition.
+        self.assertEqual(outcomes.count(CHORD_CALLBACK), 1)
+        self.assertEqual(outcomes.count(CHORD_PENDING), k - 1)
+        self.assertEqual(outcomes.count(CHORD_LATE), n - k)
+
+
+class TestMemoryStorageChordVote(ChordVoteTests, BaseTestCase):
+    def get_huey(self):
+        return MemoryHuey(utc=False)
+
+    def test_chord_vote_state_compacted(self):
+        self.s.chord_vote('cx', 0, True, 2, 1)
+        # The terminal marker is retained (to ignore stragglers) but the
+        # per-member bookkeeping is discarded.
+        voted, _, _, terminal = self.s._chords['cx']
+        self.assertEqual(voted, set())
+        self.assertEqual(terminal, CHORD_CALLBACK)
+        self.assertEqual(self.s.chord_vote('cx', 1, True, 2, 1), CHORD_LATE)
+
+
+class TestSqliteStorageChordVote(ChordVoteTests, BaseTestCase):
+    def get_huey(self):
+        return SqliteHuey(filename='huey_storage.db', utc=False, timeout=3)
+
+    def tearDown(self):
+        super(TestSqliteStorageChordVote, self).tearDown()
+        for suffix in ('', '-wal', '-shm'):
+            path = 'huey_storage.db' + suffix
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_chord_vote_state_compacted(self):
+        self.s.chord_vote('cx', 0, True, 2, 1)
+        rows = self.s.sql('select key from counter where queue = ?',
+                          (self.s.name,), results=True)
+        # Only the terminal marker remains.
+        self.assertEqual([row[0] for row in rows], ['cx'])
+        self.assertEqual(self.s.chord_vote('cx', 1, True, 2, 1), CHORD_LATE)
+
+    def test_chord_vote_independent_instances(self):
+        # Two storage instances sharing one database file, as would be the
+        # case for independent worker processes.
+        other = SqliteHuey(filename='huey_storage.db', timeout=3).storage
+        try:
+            self.assertEqual(
+                self.s.chord_vote('c6', 0, True, 3, 2), CHORD_PENDING)
+            self.assertEqual(
+                other.chord_vote('c6', 1, True, 3, 2), CHORD_CALLBACK)
+            self.assertEqual(
+                self.s.chord_vote('c6', 2, True, 3, 2), CHORD_LATE)
+            self.assertEqual(
+                other.chord_vote('c6', 1, True, 3, 2), CHORD_LATE)
+        finally:
+            other.close()
+
+    def test_chord_vote_concurrent_shared_file(self):
+        other = SqliteHuey(filename='huey_storage.db', timeout=3).storage
+        stores = (self.s, other)
+        nthreads, n, k = 8, 16, 4
+        barrier = threading.Barrier(nthreads)
+        outcomes = []
+
+        def run(tid):
+            storage = stores[tid % 2]
+            barrier.wait()
+            for i in range(tid, n, nthreads):
+                outcomes.append(storage.chord_vote('c7', i, True, n, k))
+
+        threads = [threading.Thread(target=run, args=(i,))
+                   for i in range(nthreads)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        other.close()
+
+        # Exactly one voter across both instances claimed the callback.
+        self.assertEqual(outcomes.count(CHORD_CALLBACK), 1)
+        self.assertEqual(outcomes.count(CHORD_PENDING), k - 1)
+        self.assertEqual(outcomes.count(CHORD_LATE), n - k)
+
+
+class TestSqliteThresholdChord(BaseTestCase):
+    def get_huey(self):
+        return SqliteHuey(filename='huey_storage.db', utc=False, timeout=3)
+
+    def tearDown(self):
+        super(TestSqliteThresholdChord, self).tearDown()
+        for suffix in ('', '-wal', '-shm'):
+            path = 'huey_storage.db' + suffix
+            if os.path.exists(path):
+                os.unlink(path)
+
+    def test_shared_file_workers(self):
+        # Independent Huey instances (separate worker processes) sharing a
+        # single database file: the threshold callback is claimed and
+        # enqueued exactly once.
+        huey2 = SqliteHuey(filename='huey_storage.db', utc=False, timeout=3)
+
+        def prod(n):
+            if n is None:
+                raise ValueError('bad')
+            return n + 1
+
+        def agg(ns):
+            return sum(n for n in ns if n is not SKIPPED)
+
+        prod1 = self.huey.task()(prod)
+        agg1 = self.huey.task()(agg)
+        huey2.task()(prod)
+        huey2.task()(agg)
+
+        c = chord([prod1.s(i) for i in range(6)], agg1.s(), threshold=4)
+        r = self.huey.enqueue(c)
+        self.assertEqual(self.huey.storage.queue_size(), 6)
+
+        # Workers on the two instances alternate executing members.
+        for huey in (self.huey, huey2) * 3:
+            task = huey.dequeue()
+            self.assertTrue(task is not None)
+            huey.execute(task)
+
+        # Exactly one callback was enqueued; either instance can run it.
+        self.assertEqual(self.huey.storage.queue_size(), 1)
+        task = huey2.dequeue()
+        self.assertEqual(huey2.execute(task), 10)  # 1 + 2 + 3 + 4.
+        self.assertEqual(self.huey.storage.queue_size(), 0)
+        self.assertEqual(r(), 10)
+        huey2.storage.close()
 
 
 @unittest.skipIf(cysqlite is None, 'requires cysqlite')

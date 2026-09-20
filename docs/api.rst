@@ -1706,7 +1706,7 @@ Huey object
                 .error(on_fetch_error)
                 .then(aggregate))
 
-.. py:class:: chord(tasks, callback)
+.. py:class:: chord(tasks, callback, threshold=None, error_callback=None)
 
     A :py:class:`chord` consists of a group of tasks that execute in parallel
     and a callback task. When all sub-tasks have completed (or permanently
@@ -1718,6 +1718,19 @@ Huey object
     :param callback: a ``task()``-decorated function (:py:class:`TaskWrapper`),
         or a :py:class:`Task` instance. The callback receives the list of
         sub-task results as its first argument.
+    :param int threshold: optional success threshold. When given, the
+        callback is enqueued as soon as ``threshold`` members have
+        succeeded, without waiting for the rest. Must be an integer between
+        1 and the number of member tasks. Requires a storage backend with
+        atomic vote support (currently ``MemoryStorage`` and
+        ``SqliteStorage``); other backends raise
+        :py:class:`~huey.exceptions.ConfigurationError` when the chord is
+        enqueued.
+    :param error_callback: optional task that is enqueued when the success
+        ``threshold`` can no longer be reached, i.e. more than
+        ``len(tasks) - threshold`` members have failed permanently. Only
+        valid together with ``threshold``. Like the callback, it receives
+        the member results collected at that point as its first argument.
 
     .. code-block:: python
 
@@ -1846,7 +1859,7 @@ Huey object
     list. See :ref:`groups-and-chords` in the guide for a detailed example.
 
 
-.. py:class:: ChordResult(results, callback_result, pipeline=None)
+.. py:class:: ChordResult(results, callback_result, pipeline=None, error_callback=None)
 
     Returned by :py:meth:`Huey.enqueue` when enqueueing a :py:class:`chord`.
     Provides access to the individual member results, the callback result,
@@ -1880,6 +1893,14 @@ Huey object
             result.pipeline_results[0]()  # combine result
             result.pipeline_results[1]()  # report result
             result.pipeline_results[2]()  # archive result
+
+    .. py:attribute:: error_callback
+
+        A :py:class:`Result` handle for the chord-level error callback
+        task. Only set when the chord was created with both ``threshold``
+        and ``error_callback``; otherwise ``None``. The error
+        callback is enqueued when the success threshold becomes
+        unreachable.
 
     .. py:method:: get(*args, **kwargs)
 
@@ -2485,4 +2506,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

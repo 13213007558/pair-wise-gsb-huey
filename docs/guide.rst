@@ -1361,6 +1361,96 @@ tasks chained to the final callback.
     result.pipeline_results  # ResultGroup for [index_pages, send_report]
 
 
+chords with a success threshold
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+An ordinary :py:class:``chord`` waits for *every* member before firing its
+callback. When a chord has many members and some of the downstream systems
+they depend on are unreliable, waiting for stragglers may be pointless: you
+may prefer to continue as soon as *enough* members have succeeded. Pass
+``threshold=k`` to continue once ``k`` of the ``n`` members have succeeded,
+and ``error_callback=...`` to be notified when the threshold can no longer
+be reached:
+
+.. code-block:: python
+
+    from huey import chord
+
+    @huey.task()
+    def fetch(url):
+        return requests.get(url, timeout=5).text
+
+    @huey.task()
+    def index_pages(results):
+        # results contains one entry per member, in member order. Members
+        # that had not finished when the threshold was reached contribute
+        # huey.SKIPPED; permanently-failed members contribute an Error.
+        pages = [r for r in results if r is not huey.SKIPPED]
+        search.index_many(pages)
+        return len(pages)
+
+    @huey.task()
+    def too_many_failures(results):
+        alert_admin('fetch chord could not reach its success threshold')
+
+    c = chord(
+        [fetch.s(url) for url in urls],
+        index_pages,
+        threshold=8,  # Proceed once 8 members have succeeded.
+        error_callback=too_many_failures)
+
+    result = huey.enqueue(c)
+    result()  # Result of index_pages, if the threshold was reached.
+    result.error_callback  # Result handle for too_many_failures (or None).
+
+How a threshold chord proceeds:
+
+1. Each member contributes **exactly one vote**: a success vote when it
+   finishes, or a failure vote when it fails permanently (retries
+   exhausted), is revoked, expires, or is cancelled. Intermediate failures
+   of a task that still has retries remaining do not vote. Duplicate
+   deliveries and duplicate completion notifications for the same member
+   are detected and ignored -- a member can never vote twice.
+2. The first worker to observe the ``k``-th success **claims** the success
+   transition and enqueues the callback. The claim is atomic, so exactly
+   one worker enqueues the callback even if several members finish
+   simultaneously on different workers. Successes, failures and duplicate
+   notifications that arrive afterwards are ignored.
+3. If the failures exceed ``n - k`` -- i.e. the remaining members could not
+   reach the threshold even if they all succeeded -- the chord enters a
+   separate failure terminal state. The worker observing this claims the
+   failure transition and enqueues the ``error_callback`` (if one was
+   given). The success callback will never fire, and vice versa.
+4. The callback (or error callback) receives the member results collected
+   at claim time, as a list aligned with the original member order.
+   Members that had not reported yet contribute ``huey.SKIPPED``.
+
+.. note::
+    **Storage support.** Threshold chords require an atomic vote-and-claim
+    primitive in the storage layer. They are fully supported by
+    ``MemoryStorage`` and ``SqliteStorage`` (including ``CySqliteStorage``).
+    Other backends do not currently provide the required atomicity, and
+    enqueueing a threshold chord with them raises
+    :py:exc:`~huey.exceptions.ConfigurationError` immediately -- the mode
+    is never silently degraded.
+
+.. note::
+    **Claim versus enqueue.** The terminal transition is claimed
+    atomically, but enqueuing the corresponding callback is a separate,
+    non-transactional step. If a worker crashes after claiming the
+    transition but before the callback is enqueued, that callback is lost
+    and will not be re-claimed by another worker. In other words the claim
+    is *at-most-once*, and Huey does not provide unconditional exactly-once
+    delivery of the chord callback on any storage backend. Once the
+    callback is enqueued, normal task delivery semantics apply.
+
+.. note::
+    To recognize late and duplicate notifications, the storage keeps a
+    small terminal marker for each completed threshold chord (in the same
+    namespace as Huey's counters). The marker is removed by
+    ``flush_counters()`` / ``Huey.flush()``.
+
+
 Composing groups and chords
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^
 

@@ -32,6 +32,11 @@ try:
 except ImportError:
     psycopg = None
 
+from huey.constants import CHORD_CALLBACK
+from huey.constants import CHORD_ERROR
+from huey.constants import CHORD_IGNORED
+from huey.constants import CHORD_LATE
+from huey.constants import CHORD_PENDING
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
@@ -43,6 +48,13 @@ class BaseStorage(object):
     """
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
+
+    # Does the storage provide the atomic chord_vote() primitive required to
+    # enable threshold chords? Backends that cannot atomically record a vote
+    # and claim the terminal transition must leave this False, in which case
+    # attempting to enqueue a threshold chord raises a ConfigurationError
+    # rather than silently degrading to unsafe behavior.
+    supports_chord_threshold = False
 
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
@@ -264,6 +276,40 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def chord_vote(self, key, member, success, size, threshold):
+        """
+        Atomically record a single member's outcome for a threshold chord and
+        determine whether the chord reached a terminal state.
+
+        :param str key: Unique key identifying the chord.
+        :param member: Hashable uniquely identifying the member within the
+            chord (typically its index). A given member may contribute at
+            most one vote; repeat calls for the same member are ignored.
+        :param bool success: True if the member succeeded, False otherwise.
+        :param int size: Total number of members in the chord.
+        :param int threshold: Number of successes required to fire the
+            chord callback.
+        :return: One of the CHORD_* constants:
+
+            * CHORD_PENDING - vote recorded, no terminal state reached.
+            * CHORD_CALLBACK - this vote reached the success threshold; the
+              caller has claimed the right to enqueue the callback.
+            * CHORD_ERROR - this vote made the threshold unreachable
+              (failures > size - threshold); the caller has claimed the
+              right to enqueue the error callback.
+            * CHORD_IGNORED - duplicate vote for a member that already
+              voted; the previously-stored result is still valid.
+            * CHORD_LATE - the chord already reached a terminal state.
+              Late and duplicate notifications must not trigger anything.
+
+        Exactly one caller across all workers will receive CHORD_CALLBACK or
+        CHORD_ERROR for a given chord key. Once a terminal state is claimed,
+        the storage may discard the per-member bookkeeping but must continue
+        to return CHORD_LATE for any further votes on the key.
+        """
+        raise NotImplementedError(
+            'threshold chords are not supported by this storage backend.')
+
     def result_store_size(self):
         """
         :return: Number of key/value pairs in the result store.
@@ -332,6 +378,8 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
+    supports_chord_threshold = True
+
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
@@ -340,6 +388,7 @@ class MemoryStorage(BaseStorage):
         self._expires = {}
         self._schedule = []
         self._counters = {}
+        self._chords = {}
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -438,6 +487,41 @@ class MemoryStorage(BaseStorage):
         with self._lock:
             self._counters.pop(key, None)
 
+    def chord_vote(self, key, member, success, size, threshold):
+        with self._lock:
+            state = self._chords.get(key)
+            if state is None:
+                # [voted members, successes, failures, terminal status].
+                state = self._chords[key] = [set(), 0, 0, None]
+
+            voted, successes, failures, terminal = state
+            if terminal is not None:
+                return CHORD_LATE
+            if member in voted:
+                return CHORD_IGNORED
+
+            voted.add(member)
+            if success:
+                successes += 1
+            else:
+                failures += 1
+            state[1], state[2] = successes, failures
+
+            if successes >= threshold:
+                terminal = CHORD_CALLBACK
+            elif failures > size - threshold:
+                terminal = CHORD_ERROR
+
+            if terminal is not None:
+                # Terminal state claimed by this call. The member set can be
+                # discarded -- the terminal marker alone is sufficient to
+                # ignore any late or duplicate notifications.
+                state[0] = set()
+                state[3] = terminal
+                return terminal
+
+            return CHORD_PENDING
+
     def result_store_size(self):
         return len(self._results)
 
@@ -449,6 +533,7 @@ class MemoryStorage(BaseStorage):
 
     def flush_counters(self):
         self._counters = {}
+        self._chords = {}
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -883,6 +968,7 @@ class BaseSqlStorage(BaseStorage):
 
 class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
+    supports_chord_threshold = True
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
     table_kv = ('create table if not exists kv ('
@@ -1100,6 +1186,81 @@ class SqliteStorage(BaseSqlStorage):
     def delete_counter(self, key):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
+
+    def chord_vote(self, key, member, success, size, threshold):
+        # The chord state is stored in the "counter" table using keys derived
+        # from the chord key:
+        #
+        # * "<key>"       - terminal marker, set when a worker claims the
+        #                   callback (1) or error callback (2) transition.
+        # * "<key>:m:<i>" - per-member vote, prevents double-counting.
+        # * "<key>:s" / "<key>:f" - success and failure tallies.
+        #
+        # All reads and writes happen inside a single "begin exclusive"
+        # transaction, so concurrent voters (threads or processes sharing
+        # the database file) are serialized and exactly one caller can
+        # observe the terminal transition.
+        member_key = '%s:m:%s' % (key, member)
+        tally_key = '%s:%s' % (key, 's' if success else 'f')
+
+        with self.db(commit=True) as curs:
+            curs.execute('select value from counter where queue = ? and '
+                         'key = ?', (self.name, key))
+            if curs.fetchone() is not None:
+                return CHORD_LATE  # Terminal state already claimed.
+
+            curs.execute('insert or ignore into counter (queue, key, value) '
+                         'values (?, ?, 1)', (self.name, member_key))
+            if curs.rowcount == 0:
+                return CHORD_IGNORED  # Duplicate notification for member.
+
+            # Select-then-write is safe (and atomic) because the enclosing
+            # transaction is exclusive; this also avoids relying on the
+            # SQLite 3.24+ upsert syntax.
+            curs.execute('select value from counter where queue = ? and '
+                         'key = ?', (self.name, tally_key))
+            row = curs.fetchone()
+            if row is None:
+                curs.execute('insert into counter (queue, key, value) '
+                             'values (?, ?, 1)', (self.name, tally_key))
+                tally = 1
+            else:
+                tally = row[0] + 1
+                curs.execute('update counter set value = ? where queue = ? '
+                             'and key = ?', (tally, self.name, tally_key))
+
+            # Votes are serialized by the exclusive transaction, and the
+            # terminal marker is written in the same transaction that first
+            # observes a terminal condition. So if no marker exists, the
+            # opposite tally cannot already be in a terminal state.
+            terminal = None
+            if success:
+                if tally >= threshold:
+                    terminal = CHORD_CALLBACK
+                else:
+                    curs.execute('select value from counter where queue = ? '
+                                 'and key = ?', (self.name, '%s:f' % key))
+                    row = curs.fetchone()
+                    failures = row[0] if row is not None else 0
+                    if failures > size - threshold:
+                        terminal = CHORD_ERROR
+            elif tally > size - threshold:
+                terminal = CHORD_ERROR
+
+            if terminal is None:
+                return CHORD_PENDING
+
+            # Claim the terminal transition, then discard the per-member
+            # bookkeeping. The marker alone causes any late or duplicate
+            # notification to be ignored.
+            curs.execute('insert into counter (queue, key, value) '
+                         'values (?, ?, ?)',
+                         (self.name, key,
+                          1 if terminal == CHORD_CALLBACK else 2))
+            curs.execute('delete from counter where queue = ? and '
+                         'substr(key, 1, ?) = ?',
+                         (self.name, len(key) + 1, '%s:' % key))
+            return terminal
 
     def result_store_size(self):
         return self.sql('select count(*) from kv where queue=?', (self.name,),
