@@ -172,7 +172,8 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             context=False, name=None, expires=None, timeout=None,
+             version=0, aliases=None, migrations=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -180,6 +181,9 @@ class Huey(object):
                 func.func if isinstance(func, TaskWrapper) else func,
                 context=context,
                 name=name,
+                version=version,
+                aliases=aliases,
+                migrations=migrations,
                 default_retries=retries,
                 default_retry_delay=retry_delay,
                 default_retry_backoff=retry_backoff,
@@ -191,7 +195,8 @@ class Huey(object):
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, version=0, aliases=None,
+                      migrations=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -202,6 +207,9 @@ class Huey(object):
                 func.func if isinstance(func, TaskWrapper) else func,
                 context=context,
                 name=name,
+                version=version,
+                aliases=aliases,
+                migrations=migrations,
                 default_retries=retries,
                 default_retry_delay=retry_delay,
                 default_retry_backoff=retry_backoff,
@@ -843,6 +851,7 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    version = 0
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
@@ -983,19 +992,25 @@ class TaskWrapper(object):
     task_base = Task
 
     def __init__(self, huey, func, context=False, name=None, task_base=None,
-                 **settings):
+                 version=0, aliases=None, migrations=None, **settings):
         self.__doc__ = getattr(func, '__doc__', None)
         self.huey = huey
         self.func = func
         self.context = context
         self.name = name
+        self.version = version
+        self.aliases = tuple(aliases or ())
+        self.migrations = dict(migrations or {})
         self.settings = settings
         if task_base is not None:
             self.task_base = task_base
 
         # Dynamically create task class and register with Huey instance.
-        self.task_class = self.create_task(func, context, name, **settings)
-        self.huey._registry.register(self.task_class)
+        self.task_class = self.create_task(func, context, name, version=version,
+                                          **settings)
+        self.huey._registry.register(self.task_class, version=version,
+                                     aliases=self.aliases,
+                                     migrations=self.migrations)
 
     @property
     def retries(self):
@@ -1008,7 +1023,8 @@ class TaskWrapper(object):
     def unregister(self):
         return self.huey._registry.unregister(self.task_class)
 
-    def create_task(self, func, context=False, name=None, **settings):
+    def create_task(self, func, context=False, name=None, version=0,
+                    **settings):
         if inspect.iscoroutinefunction(func):
             raise ConfigurationError(
                 'huey does not support async functions. Wrap the coroutine '
@@ -1026,6 +1042,7 @@ class TaskWrapper(object):
         attrs = {
             'context': context,
             'execute': execute,
+            'version': version,
             '__module__': func.__module__,
             '__doc__': func.__doc__}
         attrs.update(settings)

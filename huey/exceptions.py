@@ -1,5 +1,6 @@
 class HueyException(Exception): pass
 class ConfigurationError(HueyException): pass
+class TaskMigrationError(HueyException): pass
 class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass

@@ -354,7 +354,7 @@ Huey object
             # ... later ...
             consumer.stop(graceful=True)
 
-    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, version=0, aliases=None, migrations=None, **kwargs)
 
         :param int retries: number of times to retry the function if an
             unhandled exception occurs when it is executed.
@@ -385,6 +385,21 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param int version: message version produced by this task. Defaults to
+            ``0``. Bump this when you rename the task or change its argument
+            layout and register ``migrations`` so old queued messages can be
+            upgraded. See :ref:`Task versions and migrations
+            <task-versions>`.
+        :param aliases: old/alternative task names that messages may carry
+            (e.g. after a rename). Must be unique across task names and
+            aliases.
+        :type aliases: tuple or list of str
+        :param dict migrations: maps a source version number to a callable
+            ``fn(args, kwargs) -> (args, kwargs)`` that upgrades messages from
+            that version to the next one. Every version from ``0`` up to
+            ``version`` requires an explicit entry. Only callables registered
+            here are ever used -- Huey does not import or discover migrations
+            dynamically.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
@@ -444,7 +459,7 @@ Huey object
         revocation, etc.), see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
 
-    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, version=0, aliases=None, migrations=None, **kwargs)
 
         :param function validate_datetime: function which accepts a
             ``datetime`` instance and returns whether the task should be
@@ -474,6 +489,14 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param int version: message version produced by this task. See
+            :py:meth:`~Huey.task` and :ref:`task-versions`.
+        :param aliases: old/alternative task names this task may be dequeued
+            under. Only the current task is scheduled periodically, so an
+            alias never causes duplicate scheduling.
+        :type aliases: tuple or list of str
+        :param dict migrations: explicit per-version transforms, see
+            :py:meth:`~Huey.task` and :ref:`task-versions`.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
@@ -2485,4 +2508,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

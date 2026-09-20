@@ -390,7 +390,10 @@ def scheduled_tasks(huey, limit=50):
 
 def known_tasks(huey):
     out = []
-    for full, task_class in sorted(huey._registry._registry.items()):
+    registry = huey._registry
+    for task_class in sorted(registry.task_classes(),
+                             key=registry.task_to_string):
+        full = registry.task_to_string(task_class)
         try:
             revoked = huey.is_revoked(task_class)
         except Exception:

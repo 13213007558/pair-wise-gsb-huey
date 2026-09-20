@@ -277,6 +277,110 @@ For more information, see the following API documentation:
 * :py:class:`RetryTask`
 
 
+.. _task-versions:
+
+Task versions and migrations
+----------------------------
+
+After a deployment there may still be messages waiting in the queue that were
+produced by an older release: they reference an old task name and use an old
+argument layout. Huey lets the worker migrate those messages **explicitly and
+safely** when they are dequeued.
+
+Every task carries an integer ``version`` (the default is ``0``). Messages
+enqueued before this feature existed have no version field and are treated as
+version ``0``. When you change a task's name or its arguments, declare the new
+version, the old name(s) it replaces, and one explicit transform per version
+step:
+
+.. code-block:: python
+
+    # Version 0 (running on the old producer):
+    #
+    #   @huey.task()
+    #   def add(a, b):
+    #       return a + b
+
+    def migrate_add_0(args, kwargs):
+        # add(a, b) -> add(values=[a, b])
+        a, b = args
+        return (), {'values': [a, b]}
+
+    @huey.task(version=1,
+               aliases=('myapp.tasks.add',),  # old/renamed task
+               migrations={0: migrate_add_0})
+    def add(values):
+        return sum(values)
+
+The migration callable receives the old ``(args, kwargs)`` (copies, so it
+cannot corrupt the queued message) and **must return** a new
+``(args, kwargs)`` tuple for the next version. Only the payload is migrated;
+the message id, ETA, retries, retry delay, retry backoff, priority and
+expiration are carried over unchanged.
+
+When the dequeued message is older than the registered task, Huey applies the
+registered transforms in order until the current version is reached. Names are
+resolved through ``aliases`` first, so a message enqueued under an old name is
+handed to the current task class and then migrated according to its *own*
+version.
+
+Two consecutive upgrades
+^^^^^^^^^^^^^^^^^^^^^^^^
+
+Each bump requires its own transform. Huey walks the whole chain in one pass,
+so a very old message is upgraded through every intermediate version:
+
+.. code-block:: python
+
+    def migrate_add_0(args, kwargs):
+        a, b = args
+        return (), {'values': [a, b]}
+
+    def migrate_add_1(args, kwargs):
+        # add(values=[...]) -> add(values=[...], tag='sum')
+        kwargs['tag'] = 'sum'
+        return args, kwargs
+
+    @huey.task(version=2,
+               aliases=('myapp.tasks.add',),
+               migrations={0: migrate_add_0, 1: migrate_add_1})
+    def add(values, tag=None):
+        return sum(values) if tag == 'sum' else 0
+
+The chain must be complete: declaring ``version=2`` without both a ``0`` and a
+``1`` transform raises :py:class:`ConfigurationError` at registration time, so
+a broken chain fails fast instead of stranding old messages.
+
+Safety and errors
+^^^^^^^^^^^^^^^^^
+
+Huey never imports code or guesses signatures on your behalf -- only the
+callables you register are run. Errors are reported with a
+:py:class:`TaskMigrationError` that identifies the task name and versions
+involved:
+
+* A message whose version is **newer** than the registered task (an unknown
+  future version) raises ``TaskMigrationError``; upgrade the worker.
+* A missing transform for a version step raises ``TaskMigrationError``.
+* A transform that raises an exception is wrapped in ``TaskMigrationError``.
+  The message is not executed and its original payload is left intact, so the
+  task is never run with half-migrated arguments.
+
+Aliases and task names share one namespace and must be unique. Registering a
+second task or alias under an already claimed name raises ``ValueError`` -- two
+tasks can never silently compete for the same name. Aliases never cause a
+periodic task to be scheduled twice: only the current task class is registered
+with the scheduler.
+
+Pipelines and chords
+^^^^^^^^^^^^^^^^^^^^
+
+Each message in a pipeline carries its own version. Nested ``on_complete`` and
+``on_error`` tasks, as well as chord callbacks, are resolved and migrated
+independently using their own task name and version, so a pipeline can mix
+tasks at different versions safely.
+
+
 Error handling
 --------------
 
