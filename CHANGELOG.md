@@ -5,6 +5,16 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/2.5.3...HEAD)
 
+* Add optional **priority aging** to `MemoryHuey`, `SqliteHuey` and the
+  Redis backends (`RedisHuey` and `PriorityRedisHuey`). Enabling
+  `aging_step` causes waiting tasks to gain effective priority based on their
+  enqueue time so that a flood of high-priority tasks cannot starve
+  lower-priority work forever. Effective priority is derived at dequeue time
+  (never written back), FIFO and queue-name isolation are preserved, and the
+  default behavior remains a pure priority queue. Redis aging is implemented
+  with atomic Lua scripts anchored to the server clock; Sqlite persists the
+  enqueue timestamp and migrates older databases automatically.
+
 ## 2.5.3
 
 This release adds the oft-requested `SIGNAL_ENQUEUED`. This signal, of

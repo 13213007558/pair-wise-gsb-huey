@@ -345,6 +345,66 @@ For more information:
   enabled have full support for task priorities.
 * :py:meth:`~Huey.task` and :py:meth:`~Huey.periodic_task`
 
+Priority aging
+--------------
+
+A continuous stream of high-priority tasks can starve lower-priority work
+forever. *Priority aging* addresses this by increasing a task's **effective**
+priority the longer it waits, while leaving its declared priority untouched.
+
+Aging is **opt-in and off by default**. Enable it by passing ``aging_step``
+(seconds per gained priority level) to the Huey constructor:
+
+.. code-block:: python
+
+    # A waiting task gains one priority level every 30 seconds.
+    huey = MemoryHuey('my-app', aging_step=30)
+    huey = SqliteHuey('my-app', aging_step=30, filename='huey.db')
+    huey = PriorityRedisHuey('my-app', aging_step=30)
+
+The effective priority is derived at dequeue time:
+
+.. code-block:: text
+
+    wait      = now - enqueue_time - aging_threshold
+    boost     = min(aging_max_boost, floor(max(0, wait) / aging_step))
+    effective = declared_priority + boost
+
+* ``aging_threshold`` (default ``0``) is the grace period in seconds before a
+  task begins aging. Use this to protect genuinely fresh, urgent work.
+* ``aging_max_boost`` (default ``1000``) caps the boost, so effective
+  priority always stays bounded, even for very long waits.
+* Negative priorities are supported. ``nan``/infinity and non-numeric
+  priorities are rejected when aging is enabled.
+
+Important properties:
+
+* **Derived, never rewritten.** Effective priority is computed from the fixed
+  enqueue timestamp and the current broker time on each dequeue. It is never
+  written back to the queue, so scanning the queue repeatedly cannot cause
+  ordering drift for the items left behind.
+* **FIFO within the same effective priority.** Tasks that tie on effective
+  priority run in the order they were enqueued. With the Redis backend, the
+  monotonic tie-breaker is a server-side counter; with Sqlite it is the
+  persistent row id; the in-memory backend uses an in-process counter.
+* **Queue isolation.** Aging is always scoped to the Huey/queue name.
+* **Restarts are explainable.** The Sqlite backend persists the enqueue
+  timestamp, so a task's wait survives worker restarts; old databases are
+  migrated automatically. The Redis backend anchors all times to the Redis
+  server clock (``TIME`` inside an atomic Lua script).
+* **Retry and ETA reset the wait.** A task retried without delay is a fresh
+  enqueue, so its aging clock starts over. A task with an ETA ages only while
+  it sits in the runnable queue -- time spent in the schedule does not count.
+* **Backwards clocks cannot demote.** A clock that jumps backwards produces a
+  non-positive wait, yielding zero boost -- a task never drops below its
+  declared priority.
+
+With the Redis backend, enabling aging transparently switches the queue from a
+list to a sorted-set and all ordering runs atomically in Lua (Redis 5.0+);
+concurrent consumers can never receive the same task twice. Plain
+:py:class:`RedisHuey` also accepts aging, in which case its queue becomes a
+sorted set and priorities are honored while aging is active.
+
 Canceling or pausing tasks
 --------------------------
 

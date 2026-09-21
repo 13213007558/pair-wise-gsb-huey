@@ -42,8 +42,95 @@ class BaseStorage(object):
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
 
-    def __init__(self, name='huey', **storage_kwargs):
+    # Default upper bound on how many effective-priority levels a waiting
+    # task can gain through aging. Guarantees that effective priority stays
+    # bounded even for tasks that have waited a very long time.
+    aging_max_priority_boost = 1000
+
+    def __init__(self, name='huey', aging_step=None, aging_threshold=0,
+                 aging_max_boost=None, **storage_kwargs):
         self.name = name
+
+        # Optional priority aging. When disabled (the default), ordering is
+        # purely by the static task priority. When enabled, tasks gain
+        # effective priority the longer they wait:
+        #
+        #   boost = min(aging_max_boost,
+        #               floor(max(0, wait - aging_threshold) / aging_step))
+        #   effective_priority = static_priority + boost
+        #
+        # Effective priority is always derived from the fixed enqueue time
+        # and the current time -- it is never written back to the queue, so
+        # a task that is not selected does not cause the ordering of other
+        # tasks to change as it grows older (other than the intended aging).
+        self.aging_step = None if aging_step is None else float(aging_step)
+        self.aging_threshold = float(aging_threshold)
+        if aging_max_boost is None:
+            aging_max_boost = self.aging_max_priority_boost
+        self.aging_max_boost = int(aging_max_boost)
+        self._validate_aging_config()
+
+    @property
+    def aging(self):
+        return self.aging_step is not None
+
+    def _validate_aging_config(self):
+        if self.aging_step is not None and self.aging_step <= 0:
+            raise ValueError('aging_step must be a positive number of '
+                             'seconds, got %r' % self.aging_step)
+        if self.aging_threshold < 0:
+            raise ValueError('aging_threshold must not be negative, got %r'
+                             % self.aging_threshold)
+        if self.aging_max_boost < 0:
+            raise ValueError('aging_max_boost must not be negative, got %r'
+                             % self.aging_max_boost)
+
+    def now(self):
+        """Current wall-clock time as epoch seconds.
+
+        Backends use this to derive effective priority at dequeue time. It
+        can be overridden (e.g. in tests) to inject a controlled clock.
+        """
+        return time.time()
+
+    def _validate_priority(self, priority):
+        """Validate a user-provided priority value.
+
+        Negative priorities are allowed (they sort below the default of 0),
+        but booleans, NaN and infinity are rejected when priority aging is
+        enabled -- otherwise they could corrupt the ordering arithmetic.
+        """
+        if priority is None:
+            return
+        if isinstance(priority, bool) or not isinstance(priority,
+                                                        (int, float)):
+            raise TypeError('priority must be a number, got %r' %
+                            type(priority).__name__)
+        if self.aging and (priority != priority or priority in
+                           (float('inf'), float('-inf'))):
+            raise ValueError('priority must be finite, got %r' % priority)
+
+    def aged_priority(self, priority, enqueue_ts, now=None):
+        """Derive the effective priority from wait time.
+
+        Returns the effective priority as a float. Callers are expected to
+        break ties with a stable FIFO value (enqueue sequence or the
+        persisted enqueue timestamp), never with derived effective priority
+        that gets written back.
+        """
+        if now is None:
+            now = self.now()
+        if self.aging_step is None:
+            return float(priority or 0)
+        # Clamp the wait at zero so a backwards clock jump can never demote a
+        # task below its static priority, and cap the boost so very long
+        # waits cannot produce unbounded effective priorities.
+        wait = now - enqueue_ts - self.aging_threshold
+        if wait < 0:
+            boost = 0
+        else:
+            boost = min(self.aging_max_boost, int(wait / self.aging_step))
+        return float(priority or 0) + boost
 
     def close(self):
         """
@@ -265,30 +352,62 @@ class MemoryStorage(BaseStorage):
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
+        # Without aging the queue is a heap keyed by static priority. With
+        # aging enabled, effective priority is a function of time so each
+        # dequeue derives ordering by scanning items stored as
+        # (priority, enqueue_ts, seq, data). No effective priority is ever
+        # written back.
         self._queue = []
         self._results = {}
         self._schedule = []
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
+        self._validate_priority(priority)
         with self._lock:
             self._c += 1
-            priority = 0 if priority is None else -priority
-            heapq.heappush(self._queue, (priority, self._c, data))
+            if self.aging:
+                self._queue.append((float(priority or 0), self.now(),
+                                    self._c, data))
+            else:
+                priority = 0 if priority is None else -priority
+                heapq.heappush(self._queue, (priority, self._c, data))
 
     def dequeue(self):
-        try:
-            _, _, data = heapq.heappop(self._queue)
-        except IndexError:
-            pass
-        else:
-            return data
+        with self._lock:
+            if not self._queue:
+                return
+            if self.aging:
+                now = self.now()
+                # Derive ordering from wait time -- never from list position.
+                # Equal effective priority falls back to FIFO by sequence.
+                idx = min(range(len(self._queue)),
+                          key=lambda i: (-self.aged_priority(
+                                             self._queue[i][0],
+                                             self._queue[i][1], now),
+                                         self._queue[i][2]))
+                _, _, _, data = self._queue.pop(idx)
+                return data
+            try:
+                _, _, data = heapq.heappop(self._queue)
+            except IndexError:
+                pass
+            else:
+                return data
 
     def queue_size(self):
         return len(self._queue)
 
     def enqueued_items(self, limit=None):
-        items = [data for _, _, data in sorted(self._queue)]
+        if self.aging:
+            now = self.now()
+            ordered = sorted(
+                self._queue,
+                key=lambda item: (-self.aged_priority(item[0], item[1], now),
+                                  item[2]))
+            items = [item[3] for item in ordered]
+        else:
+            items = [data for _, _, data in sorted(self._queue)]
         if limit:
             items = items[:limit]
         return items
@@ -356,6 +475,113 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+# Priority-aging queue, backed by a sorted-set. The member carries the
+# enqueue time (epoch seconds from the Redis server clock), a monotonic FIFO
+# sequence number and the static priority; the score only acts as a hint for
+# BZPOPMIN readiness notifications. All aging arithmetic happens server-side
+# at dequeue time and is never written back to the queue.
+#
+# KEYS[1] = queue sorted-set, KEYS[2] = monotonic FIFO sequence counter.
+# ARGV[1] = task data, ARGV[2] = static priority, ARGV[3] = score hint.
+Z_ENQUEUE_LUA = """\
+local now = redis.call('TIME')
+local enq = tonumber(now[1])
+local seq = redis.call('INCR', KEYS[2])
+local member = string.format('%012d:%020d:%s:%s', enq, seq, ARGV[2], ARGV[1])
+redis.call('ZADD', KEYS[1], tonumber(ARGV[3]), member)
+return 1"""
+
+# Derive the effective-priority winner from wait time. Effective priority is
+# computed on every call; nothing is persisted, so repeated dequeue attempts
+# cannot cause ordering drift for the remaining items. Equal effective
+# priority falls back to the monotonic sequence (FIFO).
+# ARGV: step, threshold, max-boost, mode (remove|pop), popped member, popped
+# member score. In "pop" mode a BZPOPMIN hint member was already removed by
+# the caller: the script first restores it atomically, then scans and removes
+# the actual winner, so concurrent consumers can each receive a different
+# task exactly once even when the hint was the only remaining member.
+Z_DEQUEUE_LUA = """\
+local queue = KEYS[1]
+local nowt = redis.call('TIME')
+local now = tonumber(nowt[1]) + tonumber(nowt[2]) / 1000000.0
+local step = tonumber(ARGV[1])
+local threshold = tonumber(ARGV[2])
+local maxboost = tonumber(ARGV[3])
+local mode = ARGV[4]
+if mode == 'pop' then
+    local popped = ARGV[5]
+    if #popped > 0 then
+        redis.call('ZADD', queue, tonumber(ARGV[6]), popped)
+    end
+end
+local members = redis.call('ZRANGE', queue, 0, -1)
+local candidate = false
+local candeff = nil
+local candseq = nil
+for i = 1, #members do
+    local member = members[i]
+    local first = string.find(member, ':', 1, true)
+    local second = string.find(member, ':', first + 1, true)
+    local third = string.find(member, ':', second + 1, true)
+    local ts = tonumber(string.sub(member, 1, first - 1))
+    local seq = tonumber(string.sub(member, first + 1, second - 1))
+    local pri = tonumber(string.sub(member, second + 1, third - 1))
+    local wait = now - ts - threshold
+    local boost = 0
+    if wait > 0 then
+        boost = math.floor(wait / step)
+        if boost > maxboost then boost = maxboost end
+    end
+    local eff = pri + boost
+    if (not candidate) or eff > candeff or (eff == candeff and seq < candseq) then
+        candidate = member
+        candeff = eff
+        candseq = seq
+    end
+end
+if not candidate then return false end
+redis.call('ZREM', queue, candidate)
+return candidate"""
+
+# Non-destructively read tasks in effective-priority order.
+# ARGV: step, threshold, max-boost, limit (-1 for all).
+Z_PEEK_LUA = """\
+local queue = KEYS[1]
+local nowt = redis.call('TIME')
+local now = tonumber(nowt[1]) + tonumber(nowt[2]) / 1000000.0
+local step = tonumber(ARGV[1])
+local threshold = tonumber(ARGV[2])
+local maxboost = tonumber(ARGV[3])
+local limit = tonumber(ARGV[4])
+local members = redis.call('ZRANGE', queue, 0, -1)
+local ranked = {}
+for i = 1, #members do
+    local member = members[i]
+    local first = string.find(member, ':', 1, true)
+    local second = string.find(member, ':', first + 1, true)
+    local third = string.find(member, ':', second + 1, true)
+    local ts = tonumber(string.sub(member, 1, first - 1))
+    local seq = tonumber(string.sub(member, first + 1, second - 1))
+    local pri = tonumber(string.sub(member, second + 1, third - 1))
+    local wait = now - ts - threshold
+    local boost = 0
+    if wait > 0 then
+        boost = math.floor(wait / step)
+        if boost > maxboost then boost = maxboost end
+    end
+    ranked[#ranked + 1] = {member, pri + boost, seq}
+end
+table.sort(ranked, function(a, b)
+    if a[2] ~= b[2] then return a[2] > b[2] end
+    return a[3] < b[3]
+end)
+local res = {}
+for i = 1, #ranked do
+    if limit >= 0 and i > limit then break end
+    res[#res + 1] = ranked[i][1]
+end
+return res"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
@@ -363,6 +589,7 @@ class RedisStorage(BaseStorage):
 
     def __init__(self, name='huey', blocking=True, read_timeout=1,
                  connection_pool=None, url=None, client_name=None,
+                 aging_step=None, aging_threshold=0, aging_max_boost=None,
                  **connection_params):
 
         if Redis is None:
@@ -393,6 +620,7 @@ class RedisStorage(BaseStorage):
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
+        self.queue_seq_key = 'huey.redis.%s.seq' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
@@ -403,19 +631,87 @@ class RedisStorage(BaseStorage):
         self.blocking = blocking
         self.read_timeout = read_timeout
 
+        # Configure optional priority aging. When enabled the queue is stored
+        # in a sorted-set instead of a list and all ordering is derived
+        # server-side from the Redis clock (see the Lua scripts above).
+        super(RedisStorage, self).__init__(
+            self.name, aging_step=aging_step,
+            aging_threshold=aging_threshold,
+            aging_max_boost=aging_max_boost)
+        if self.aging:
+            self._z_enqueue = self.conn.register_script(Z_ENQUEUE_LUA)
+            self._z_dequeue = self.conn.register_script(Z_DEQUEUE_LUA)
+            self._z_peek = self.conn.register_script(Z_PEEK_LUA)
+
     def clean_name(self, name):
         return re.sub('[^a-z0-9]', '', name)
+
+    def _aging_args(self):
+        return (self.aging_step, self.aging_threshold, self.aging_max_boost)
+
+    @staticmethod
+    def _unprefix_aging_member(member):
+        # Member layout: enqueued_ts:seq:priority:data. Find the third colon
+        # so that data bytes following the prefix are returned untouched.
+        first = member.index(b':')
+        second = member.index(b':', first + 1)
+        third = member.index(b':', second + 1)
+        return member[third + 1:]
 
     def convert_ts(self, ts):
         return time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
 
     def enqueue(self, data, priority=None):
+        if self.aging:
+            self._validate_priority(priority)
+            # Score is only a readiness hint (smallest score pops first):
+            # real ordering is derived from wait time inside the script.
+            score = 0 if priority is None else -float(priority)
+            self._z_enqueue(
+                keys=[self.queue_key, self.queue_seq_key],
+                args=[data, priority or 0, score])
+            return
         if priority:
             raise NotImplementedError('Task priorities are not supported by '
                                       'this storage.')
         self.conn.lpush(self.queue_key, data)
 
     def dequeue(self):
+        if self.aging:
+            if self.blocking:
+                while True:
+                    args = list(self._aging_args())
+                    try:
+                        # Use BZPOPMIN purely to sleep until data may be
+                        # available; the script re-checks state atomically and
+                        # restores the hint member when aging selects another
+                        # task, so concurrent consumers never duplicate or
+                        # lose tasks.
+                        hint = self.conn.bzpopmin(
+                            self.queue_key, timeout=self.read_timeout)
+                    except (ConnectionError, TimeoutError, TypeError,
+                            IndexError):
+                        return
+                    if not hint:
+                        return
+                    _, member, score = hint
+                    args.extend(['pop', member, score])
+                    try:
+                        winner = self._z_dequeue(keys=[self.queue_key],
+                                                args=args)
+                    except (ConnectionError, TimeoutError):
+                        return
+                    if winner is not False and winner is not None:
+                        return self._unprefix_aging_member(winner)
+                    # Race: another consumer drained the queue between
+                    # BZPOPMIN and the script. Wait for new data.
+            else:
+                args = list(self._aging_args())
+                args.extend(['remove', b'', 0.0])
+                winner = self._z_dequeue(keys=[self.queue_key], args=args)
+                if winner is False or winner is None:
+                    return
+                return self._unprefix_aging_member(winner)
         if self.blocking:
             try:
                 return self.conn.brpop(
@@ -429,9 +725,16 @@ class RedisStorage(BaseStorage):
             return self.conn.rpop(self.queue_key)
 
     def queue_size(self):
+        if self.aging:
+            return self.conn.zcard(self.queue_key)
         return self.conn.llen(self.queue_key)
 
     def enqueued_items(self, limit=None):
+        if self.aging:
+            args = list(self._aging_args()) + [(limit if limit is not None
+                                               else -1)]
+            items = self._z_peek(keys=[self.queue_key], args=args)
+            return [self._unprefix_aging_member(item) for item in items]
         limit = limit or -1
         return self.conn.lrange(self.queue_key, 0, limit)[::-1]
 
@@ -559,6 +862,8 @@ class RedisPriorityQueue(object):
     priority = True
 
     def enqueue(self, data, priority=None):
+        if self.aging:
+            return RedisStorage.enqueue(self, data, priority)
         priority = 0 if priority is None else -priority
         # Prefix the message with an encoded timestamp to ensure that messages
         # created with the same priority are stored in the correct order. Since
@@ -569,6 +874,8 @@ class RedisPriorityQueue(object):
         self.conn.zadd(self.queue_key, {prefix + data: priority})
 
     def dequeue(self):
+        if self.aging:
+            return RedisStorage.dequeue(self)
         if self.blocking:
             try:
                 # BZPOPMIN returns (key, data, score).
@@ -588,9 +895,13 @@ class RedisPriorityQueue(object):
                 return items[0][0][8:]  # [(prefix+data, score)].
 
     def queue_size(self):
+        if self.aging:
+            return RedisStorage.queue_size(self)
         return self.conn.zcard(self.queue_key)
 
     def enqueued_items(self, limit=None):
+        if self.aging:
+            return RedisStorage.enqueued_items(self, limit)
         items = self.conn.zrange(self.queue_key, 0, limit or -1)
         return [item[8:] for item in items]  # Unprefix the data.
 
@@ -684,13 +995,15 @@ class SqliteStorage(BaseSqlStorage):
                    'on schedule (queue, timestamp)')
     table_task = ('create table if not exists task ('
                   'id integer not null primary key, queue text not null, '
-                  'data blob not null, priority real not null default 0.0)')
+                  'data blob not null, priority real not null default 0.0, '
+                  'enqueued_ts real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
+                 aging_step=None, aging_threshold=0, aging_max_boost=None,
                  **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
@@ -710,7 +1023,20 @@ class SqliteStorage(BaseSqlStorage):
                 'primary key',
                 'primary key autoincrement')
 
-        super(SqliteStorage, self).__init__(name)
+        super(SqliteStorage, self).__init__(
+            name, aging_step=aging_step,
+            aging_threshold=aging_threshold,
+            aging_max_boost=aging_max_boost)
+
+        # Migrate databases created before priority aging was introduced:
+        # add the persisted enqueue timestamp column. Existing rows receive a
+        # timestamp of zero, so they are treated as having waited forever and
+        # are eligible for aging immediately; a clock jump can never demote
+        # them below their static priority.
+        columns = self.sql('pragma table_info(task)', results=True)
+        if columns and not any(col[1] == 'enqueued_ts' for col in columns):
+            self.sql('alter table task add column enqueued_ts real not null '
+                     'default 0.0', commit=True)
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -723,10 +1049,43 @@ class SqliteStorage(BaseSqlStorage):
         return conn
 
     def enqueue(self, data, priority=None):
-        self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
-                 (self.name, to_blob(data), priority or 0), commit=True)
+        self._validate_priority(priority)
+        if self.aging:
+            self.sql('insert into task (queue, data, priority, enqueued_ts) '
+                     'values (?, ?, ?, ?)',
+                     (self.name, to_blob(data), priority or 0, self.now()),
+                     commit=True)
+        else:
+            self.sql('insert into task (queue, data, priority) values '
+                     '(?, ?, ?)', (self.name, to_blob(data), priority or 0),
+                     commit=True)
+
+    def _aged_ordering(self, now):
+        # Effective priority is derived purely from the persisted enqueue
+        # time and the current time -- nothing is rewritten on dequeue. Tasks
+        # at equal effective priority retain FIFO by id.
+        # The 1.0 factor forces floating-point division (SQLite truncates
+        # integer/integer).
+        boost = ('min(%s, cast(max(0, cast((%s - enqueued_ts - %s) * 1.0 / %s '
+                 'as integer)) as real))' % (
+                     self.aging_max_boost, now, self.aging_threshold,
+                     self.aging_step))
+        return 'priority + ' + boost
 
     def dequeue(self):
+        if self.aging:
+            with self.db(commit=True) as curs:
+                ordering = self._aged_ordering('?')
+                curs.execute('select id, data from task where queue = ? '
+                             'order by (%s) desc, id limit 1' % ordering,
+                             (self.name, self.now()))
+                result = curs.fetchone()
+                if result is not None:
+                    tid, data = result
+                    curs.execute('delete from task where id = ?', (tid,))
+                    if curs.rowcount == 1:
+                        return to_bytes(data)
+            return
         with self.db(commit=True) as curs:
             curs.execute('select id, data from task where queue = ? '
                          'order by priority desc, id limit 1', (self.name,))
@@ -742,11 +1101,17 @@ class SqliteStorage(BaseSqlStorage):
                         (self.name,), results=True)[0][0]
 
     def enqueued_items(self, limit=None):
-        sql = 'select data from task where queue=? order by priority desc, id'
-        params = (self.name,)
+        if self.aging:
+            sql = ('select data from task where queue=? order by (%s) desc, '
+                   'id' % self._aged_ordering('?'))
+            params = (self.name, self.now())
+        else:
+            sql = ('select data from task where queue=? order by priority '
+                   'desc, id')
+            params = (self.name,)
         if limit is not None:
             sql += ' limit ?'
-            params = (self.name, limit)
+            params = params + (limit,)
 
         return [to_bytes(i) for i, in self.sql(sql, params, results=True)]
 
@@ -846,6 +1211,8 @@ class FileStorage(BaseStorage):
     exclusive locks around all file-system operations. This is done to prevent
     race-conditions when reading from the file-system.
     """
+    aging = False  # File-based queue does not support priority aging.
+
     MAX_PRIORITY = 0xffff
 
     def __init__(self, name, path, levels=2, use_thread_lock=False,

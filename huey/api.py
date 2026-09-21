@@ -64,6 +64,12 @@ class Huey(object):
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend when immediate-mode is enabled.
+    :param float aging_step: enable priority aging: number of seconds of queue
+        wait time per gained effective-priority level. Disabled by default,
+        which preserves pure-priority ordering.
+    :param float aging_threshold: seconds a task must wait before aging begins.
+    :param int aging_max_boost: maximum effective-priority levels a waiting
+        task can gain; keeps effective priority bounded for very long waits.
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -89,7 +95,8 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, always_eager=None,
-                 storage_class=None, **storage_kwargs):
+                 storage_class=None, aging_step=None, aging_threshold=0,
+                 aging_max_boost=None, **storage_kwargs):
         if always_eager is not None:
             warnings.warn('"always_eager" parameter is deprecated, use '
                           '"immediate" instead', DeprecationWarning)
@@ -114,9 +121,27 @@ class Huey(object):
 
         # Initialize storage.
         self.storage_kwargs = storage_kwargs
+        # Optional priority aging: when aging_step is given (seconds per
+        # gained priority level), a task's effective priority increases with
+        # the time it spends waiting. By default aging is disabled and the
+        # queue behaves as a pure priority queue. See BaseStorage for the
+        # exact formula. aging_threshold is the number of seconds a task must
+        # wait before aging begins; aging_max_boost caps the total boost so
+        # that effective priority remains bounded.
+        if aging_step is not None:
+            self.storage_kwargs.update({
+                'aging_step': aging_step,
+                'aging_threshold': aging_threshold,
+                'aging_max_boost': aging_max_boost})
         if storage_class is not None:
             self.storage_class = storage_class
         self.storage = self.create_storage()
+        if aging_step is not None and not getattr(self.storage, 'aging',
+                                                 False):
+            raise ConfigurationError(
+                'priority aging (aging_step=%r) is not supported by the %s '
+                'storage backend.' % (aging_step,
+                                      type(self.storage).__name__))
 
         # Allow overriding the default TaskWrapper implementation.
         self.task_wrapper_class = self.get_task_wrapper_class()
@@ -144,7 +169,7 @@ class Huey(object):
         return self.get_storage(**self.storage_kwargs)
 
     def get_immediate_storage(self):
-        return MemoryStorage(self.name)
+        return MemoryStorage(self.name, **self.storage_kwargs)
 
     def get_storage(self, **kwargs):
         if self.storage_class is None:
