@@ -119,8 +119,9 @@ Huey types
 
 .. py:class:: SqliteHuey
 
-    :py:class:`Huey` that utilizes sqlite3 for queue and result storage. Only
-    requirement is the standard library ``sqlite3`` module.
+    :py:class:`Huey` that utilizes sqlite3 for queue and result storage. It
+    requires the standard library ``sqlite3`` module linked against SQLite
+    3.35.0 or newer.
 
     Commonly-used keyword arguments:
 
@@ -2393,6 +2394,9 @@ Huey comes with several built-in storage implementations:
     :param kwargs: Additional keyword arguments passed to the ``sqlite3``
         connection constructor.
 
+    Atomic scheduled-task handoff requires SQLite's ``DELETE ... RETURNING``
+    clause, so SQLite 3.35.0 or newer is required.
+
 
 .. py:class:: CySqliteStorage(name='huey', filename='huey.db', pragmas=None, timeout=5, strict_fifo=False, create_tables=True, **kwargs)
 
@@ -2485,4 +2489,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

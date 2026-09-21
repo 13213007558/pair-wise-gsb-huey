@@ -8,6 +8,8 @@ import sqlite3
 import struct
 import threading
 import time
+import multiprocessing
+import tempfile
 import unittest
 import uuid
 from queue import Queue
@@ -31,10 +33,13 @@ from huey.api import PriorityRedisHuey
 from huey.api import RedisExpireHuey
 from huey.api import RedisHuey
 from huey.api import SqliteHuey
+from huey.api import crontab
 from huey.api import chord
+from huey.consumer import Scheduler
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import FileStorage
+from huey.storage import SqliteStorage
 from huey.tests.base import BaseTestCase
 from huey.tests.base import CI
 from huey.tests.base import slow_test
@@ -53,6 +58,21 @@ def get_redis_version():
 
 REDIS_VERSION = get_redis_version()
 requires_redis = unittest.skipIf(REDIS_VERSION == 0, 'requires redis server')
+
+
+def _crash_after_schedule_insert(filename, queue_name):
+    from huey.storage import SqliteStorage
+
+    storage = SqliteStorage(queue_name, filename=filename, timeout=1)
+    insert_task = storage._insert_task
+
+    def insert_and_exit(cursor, data, priority=None):
+        insert_task(cursor, data, priority)
+        os._exit(17)
+
+    storage._insert_task = insert_and_exit
+    storage.enqueue_schedule(
+        datetime.datetime(2000, 1, 1), lambda data: (data, 0))
 
 
 class StorageTests(object):
@@ -561,6 +581,309 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
         sched = self.s.read_schedule(base + datetime.timedelta(seconds=n))
         self.assertEqual(sched, [b'%d' % i for i in range(n)])
         self.assertEqual(self.s.schedule_size(), 0)
+
+    def _due_schedule_storage(self, other=None, **kwargs):
+        kwargs.setdefault('filename', self.s.filename)
+        kwargs.setdefault('timeout', 3)
+        return SqliteStorage(other or self.s.name, **kwargs)
+
+    def test_enqueue_schedule_same_eta_two_connections(self):
+        due = datetime.datetime(2000, 1, 1)
+        count = 100
+        for i in range(count):
+            self.s.add_to_schedule(b'%03d' % i, due)
+
+        first = self._due_schedule_storage()
+        second = self._due_schedule_storage()
+        barrier = sqlite3.connect(self.s.filename, timeout=3)
+        barrier.execute('begin immediate')
+        errors = []
+
+        results = {}
+
+        def move(storage, label, started_event=None):
+            try:
+                storage.schedule_batch_size = 1
+                if started_event is not None:
+                    started_event.set()
+                moved = storage.enqueue_schedule(due, lambda data: (data, 0))
+            except Exception as exc:
+                errors.append(exc)
+            else:
+                results[label] = moved
+
+        first_started = threading.Event()
+        second_started = threading.Event()
+        thread = threading.Thread(target=move, args=(first, 'first',
+                                                     first_started))
+        thread.start()
+        first_started.wait(timeout=3)
+        time.sleep(0.1)
+        second_thread = threading.Thread(target=move,
+                                         args=(second, 'second',
+                                              second_started))
+        second_thread.start()
+        second_started.wait(timeout=3)
+        time.sleep(0.1)
+        barrier.commit()
+        thread.join(timeout=3)
+        second_thread.join(timeout=3)
+        barrier.close()
+
+        self.assertFalse(errors)
+        self.assertIn(results['first'], range(count + 1))
+        self.assertIn(results['second'], range(count + 1))
+        self.assertEqual(results['first'] + results['second'], count)
+        self.assertEqual(first.queue_size(), count)
+        self.assertEqual(second.queue_size(), count)
+        self.assertEqual(first.schedule_size(), 0)
+        self.assertEqual(second.schedule_size(), 0)
+        self.assertEqual(first.enqueue_schedule(due, lambda data: (data, 0)),
+                         0)
+        self.assertEqual(second.enqueue_schedule(due, lambda data: (data, 0)),
+                         0)
+        queued = set(self.s.enqueued_items())
+        self.assertEqual(len(queued), count)
+        self.assertEqual(queued, {b'%03d' % i for i in range(count)})
+        first.close()
+        second.close()
+
+    def test_enqueue_schedule_rolls_back_deserialize_enqueue_commit(self):
+        due = datetime.datetime(2000, 1, 1)
+        for i in range(4):
+            self.s.add_to_schedule(b'good-%d' % i, due)
+        self.s.add_to_schedule(b'broken', due)
+        other = self._due_schedule_storage()
+        try:
+            def deserialize(data):
+                if data == b'broken':
+                    raise ValueError('bad payload')
+                return data, 0
+
+            with self.assertRaises(ValueError):
+                other.enqueue_schedule(due, deserialize)
+            self.assertEqual(other.queue_size(), 0)
+            self.assertEqual(other.schedule_size(), 5)
+
+            original_insert = other._insert_task
+
+            def fail_enqueue(cursor, data, priority=None):
+                if fail_enqueue.failed:
+                    return original_insert(cursor, data, priority)
+                fail_enqueue.failed = True
+                raise sqlite3.OperationalError('injected enqueue failure')
+
+            fail_enqueue.failed = False
+            other._insert_task = fail_enqueue
+            with self.assertRaises(sqlite3.OperationalError):
+                other.enqueue_schedule(due, lambda data: (data, 0))
+            self.assertEqual(other.queue_size(), 0)
+            self.assertEqual(other.schedule_size(), 5)
+
+            def fail_commit(conn):
+                conn.rollback()
+                raise sqlite3.OperationalError('injected commit failure')
+
+            original_commit = other._commit_connection
+            other._commit_connection = fail_commit
+            with self.assertRaises(sqlite3.OperationalError):
+                other.enqueue_schedule(due, lambda data: (data, 0))
+            other._commit_connection = original_commit
+            self.assertEqual(other.queue_size(), 0)
+            self.assertEqual(other.schedule_size(), 5)
+
+            self.assertEqual(other.enqueue_schedule(due,
+                                                     lambda data: (data, 0)),
+                             5)
+            self.assertEqual(other.schedule_size(), 0)
+            self.assertEqual(sorted(other.enqueued_items()), [
+                b'broken', b'good-0', b'good-1', b'good-2', b'good-3'])
+        finally:
+            other.close()
+
+    def test_enqueue_schedule_huey_deserialize_rollback_recovery(self):
+        other = SqliteHuey(name=self.s.name, filename=self.s.filename,
+                           timeout=3, utc=False)
+        try:
+            @other.task()
+            def scheduled_task(value):
+                return value
+
+            due = datetime.datetime(2000, 1, 1)
+            task = scheduled_task.s(42)
+            message = other.serialize_task(task)
+            self.s.add_to_schedule(message, due)
+
+            original_deserialize = other.deserialize_task
+
+            def fail_once(payload):
+                if not fail_once.failed:
+                    fail_once.failed = True
+                    raise ValueError('injected deserialize failure')
+                return original_deserialize(payload)
+
+            fail_once.failed = False
+            other.deserialize_task = fail_once
+
+            with self.assertRaises(ValueError):
+                other.enqueue_schedule(due)
+            self.assertEqual(other.pending_count(), 0)
+            self.assertEqual(other.scheduled_count(), 1)
+
+            other.deserialize_task = original_deserialize
+            recovered, = other.enqueue_schedule(due)
+            self.assertEqual(recovered.id, task.id)
+            self.assertEqual(other.scheduled_count(), 0)
+            self.assertEqual(other.pending_count(), 1)
+        finally:
+            other.storage.close()
+
+    def test_enqueue_schedule_immediate_huey(self):
+        executed = []
+        huey = SqliteHuey(filename=self.s.filename, timeout=3, utc=False,
+                          immediate=True, immediate_use_memory=False)
+        try:
+            @huey.task()
+            def scheduled_task(value):
+                executed.append(value)
+
+            due = datetime.datetime(2000, 1, 1)
+            huey.storage.add_to_schedule(huey.serialize_task(
+                scheduled_task.s(7)), due)
+            task, = huey.enqueue_schedule(due)
+            self.assertEqual([value for value in executed], [7])
+            self.assertEqual(huey.scheduled_count(), 0)
+            self.assertEqual(huey.pending_count(), 1)
+            self.assertEqual(task.args, (7,))
+        finally:
+            huey.storage.close()
+
+    def test_scheduler_handles_due_and_periodic_sqlite_tasks(self):
+        @self.huey.periodic_task(crontab(minute='*'))
+        def periodic_task():
+            return 'periodic'
+
+        @self.huey.task()
+        def regular_task(value):
+            return value
+
+        due = datetime.datetime(2000, 1, 1)
+        self.huey.storage.add_to_schedule(
+            self.huey.serialize_task(regular_task.s(3)), due)
+
+        class NoSleepScheduler(Scheduler):
+            def sleep_for_interval(self, current, interval):
+                pass
+
+        scheduler = NoSleepScheduler(self.huey, threading.Event(),
+                                    interval=1, periodic=True)
+        scheduler._next_loop = time.monotonic() + 60
+        scheduler._next_periodic = time.monotonic() - 60
+        scheduler.loop(due)
+
+        self.assertEqual(self.huey.scheduled_count(), 0)
+        self.assertEqual(self.huey.pending_count(), 2)
+        queued = self.huey.pending()
+        self.assertEqual({type(task).__name__ for task in queued},
+                         {'periodic_task', 'regular_task'})
+
+    def test_enqueue_schedule_process_crash_recovery(self):
+        fd, filename = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        os.unlink(filename)
+        queue = 'crash-test'
+        try:
+            setup = self._due_schedule_storage(queue, filename=filename)
+            due = datetime.datetime(2000, 1, 1)
+            setup.add_to_schedule(b'stays-scheduled', due)
+            setup.close()
+
+            ctx = multiprocessing.get_context('spawn')
+            proc = ctx.Process(target=_crash_after_schedule_insert,
+                               args=(filename, queue))
+            proc.start()
+            proc.join(timeout=5)
+            self.assertEqual(proc.exitcode, 17)
+
+            recovered = self._due_schedule_storage(queue, filename=filename)
+            self.assertEqual(recovered.queue_size(), 0)
+            self.assertEqual(recovered.schedule_size(), 1)
+            self.assertEqual(recovered.scheduled_items(), [b'stays-scheduled'])
+            self.assertEqual(
+                recovered.enqueue_schedule(due, lambda data: (data, 0)), 1)
+            self.assertEqual(recovered.enqueued_items(), [b'stays-scheduled'])
+            self.assertEqual(recovered.schedule_size(), 0)
+            recovered.close()
+        finally:
+            for suffix in ('', '-wal', '-shm'):
+                path = filename + suffix
+                if os.path.exists(path):
+                    os.unlink(path)
+
+    def test_enqueue_schedule_clock_rollback(self):
+        eta1 = datetime.datetime(2000, 1, 1, 0, 0, 10)
+        eta2 = datetime.datetime(2000, 1, 1, 0, 0, 2)
+        eta3 = datetime.datetime(2000, 1, 1, 0, 0, 5)
+        self.s.add_to_schedule(b'late', eta1)
+        self.s.add_to_schedule(b'earliest', eta2)
+        self.s.add_to_schedule(b'middle', eta3)
+
+        now = datetime.datetime(2000, 1, 1, 0, 0, 4)
+        self.assertEqual(self.s.enqueue_schedule(now, lambda data: (data, 0)),
+                         1)
+        self.assertEqual(self.s.enqueued_items(), [b'earliest'])
+
+        earlier = datetime.datetime(2000, 1, 1, 0, 0, 3)
+        self.assertEqual(self.s.enqueue_schedule(earlier,
+                                                 lambda data: (data, 0)), 0)
+        self.assertEqual(self.s.enqueued_items(), [b'earliest'])
+        self.assertEqual(self.s.scheduled_items(), [b'middle', b'late'])
+
+        due_all = datetime.datetime(2000, 1, 2)
+        self.assertEqual(self.s.enqueue_schedule(due_all,
+                                                 lambda data: (data, 0)), 2)
+        self.assertEqual(self.s.enqueued_items(), [
+            b'earliest', b'middle', b'late'])
+
+    def test_enqueue_schedule_large_paginated_batch(self):
+        n = 5000
+        base = datetime.datetime(2000, 1, 1)
+        for i in range(n):
+            self.s.add_to_schedule(b'%05d' % i, base)
+
+        self.s.schedule_batch_size = 123
+        self.assertEqual(self.s.enqueue_schedule(base,
+                                                 lambda data: (data, 0)), n)
+        self.assertEqual(self.s.schedule_size(), 0)
+        self.assertEqual(self.s.queue_size(), n)
+        self.assertEqual(self.s.enqueued_items(3), [
+            b'00000', b'00001', b'00002'])
+
+    def test_enqueue_schedule_isolation_levels(self):
+        due = datetime.datetime(2000, 1, 1)
+        for isolation_level in (None, '', 'DEFERRED', 'IMMEDIATE',
+                                'EXCLUSIVE'):
+            fd, filename = tempfile.mkstemp(suffix='.db')
+            os.close(fd)
+            storage = SqliteStorage('isolation', filename=filename,
+                                    timeout=0.25,
+                                    isolation_level=isolation_level)
+            try:
+                self.assertEqual(storage.conn.isolation_level,
+                                 isolation_level)
+                self.assertEqual(
+                    storage.conn.execute('pragma busy_timeout').fetchone()[0],
+                    250)
+                storage.add_to_schedule(b'due', due)
+                self.assertEqual(storage.enqueue_schedule(
+                    due, lambda data: (data, 0)), 1)
+                self.assertEqual(storage.enqueued_items(), [b'due'])
+                self.assertEqual(storage.schedule_size(), 0)
+            finally:
+                storage.close()
+                for suffix in ('', '-wal', '-shm'):
+                    if os.path.exists(filename + suffix):
+                        os.unlink(filename + suffix)
 
     def test_shared_file_queues(self):
         other = SqliteHuey(name='other', filename='huey_storage.db',

@@ -9,6 +9,10 @@ Changelog
   no longer sort its way in.
 * Renew the `lock_task_semaphore` slot while the task runs, and drop the
   holder timeout from 24 hours to 5 minutes.
+* Make SQLite scheduled-task handoff atomic. The scheduler now claims, removes
+  and enqueues each due batch in one transaction using `DELETE ... RETURNING`
+  (SQLite 3.35+), preserving tasks when deserialization, enqueue, commit, or
+  process termination fails.
 
 [View commits](https://github.com/coleifer/huey/compare/3.4.0...master)
 

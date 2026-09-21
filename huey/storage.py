@@ -127,6 +127,24 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def enqueue_schedule(self, timestamp, prepare, committed=None):
+        """
+        Move due scheduled tasks into the queue atomically when supported.
+
+        ``prepare`` receives one raw task message and returns a
+        ``(message, priority)`` tuple. Backends without an atomic move use
+        the destructive read followed by enqueue behavior.
+        """
+        messages = self.read_schedule(timestamp)
+        count = 0
+        for message in messages:
+            message, priority = prepare(message)
+            self.enqueue(message, priority)
+            count += 1
+        if count and committed is not None:
+            committed()
+        return count
+
     def schedule_size(self):
         """
         :return: The number of tasks currently in the schedule.
@@ -850,24 +868,38 @@ class BaseSqlStorage(BaseStorage):
     def _create_connection(self):
         raise NotImplementedError
 
+    def _commit_connection(self, conn):
+        conn.commit()
+
     @contextlib.contextmanager
-    def db(self, commit=False, close=False):
+    def db(self, commit=False, close=False, begin_sql=None,
+           after_commit=None):
         with self.lock:
             conn = self.conn
             cursor = conn.cursor()
             try:
-                if commit: cursor.execute(self.begin_sql)
-                yield cursor
-            except Exception:
-                if commit: conn.rollback()
-                raise
-            else:
-                if commit: conn.commit()
+                if commit:
+                    if getattr(conn, 'isolation_level', None) is not None and \
+                            getattr(conn, 'in_transaction', False):
+                        conn.commit()
+                    cursor.execute(begin_sql or self.begin_sql)
+                try:
+                    yield cursor
+                except Exception:
+                    if commit:
+                        conn.rollback()
+                    raise
+                else:
+                    if commit:
+                        self._commit_connection(conn)
             finally:
                 cursor.close()
                 if close:
                     conn.close()
                     self._conn = None
+
+        if after_commit is not None:
+            after_commit()
 
     def initialize_schema(self):
         with self.db(commit=True, close=True) as curs:
@@ -883,6 +915,8 @@ class BaseSqlStorage(BaseStorage):
 
 class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
+    schedule_begin_sql = 'begin immediate'
+    schedule_batch_size = 500
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
     table_kv = ('create table if not exists kv ('
@@ -914,6 +948,7 @@ class SqliteStorage(BaseSqlStorage):
         self._fsync = fsync
         self._journal_mode = journal_mode
         self._timeout = timeout  # Busy timeout in seconds, default is 5.
+        self._isolation_level = kwargs.pop('isolation_level', None)
         self._conn_kwargs = kwargs
 
         # By default Sqlite may reuse rowids when rows are removed. This means
@@ -931,23 +966,41 @@ class SqliteStorage(BaseSqlStorage):
 
         self.to_blob = memoryview
 
+        if self.sqlite_version_info < (3, 35, 0):
+            raise ConfigurationError('Atomic SQLite schedule transfers '
+                                     'require SQLite 3.35.0 or newer.')
+
         super(SqliteStorage, self).__init__(name, create_tables=create_tables)
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
                                check_same_thread=False,
                                **self._conn_kwargs)
-        conn.isolation_level = None  # Autocommit mode.
-        conn.execute('pragma journal_mode="%s"' % self._journal_mode)
-        if self._cache_mb:
-            conn.execute('pragma cache_size=%s' % (-1000 * self._cache_mb))
-        if self._fsync is not None:
-            conn.execute('pragma synchronous=%s' % (2 if self._fsync else 0))
+        try:
+            conn.isolation_level = self._isolation_level
+            conn.execute('pragma journal_mode="%s"' % self._journal_mode)
+            conn.execute('pragma busy_timeout=%s' % (self._timeout * 1000))
+            if self._cache_mb:
+                conn.execute('pragma cache_size=%s' %
+                             (-1000 * self._cache_mb))
+            if self._fsync is not None:
+                conn.execute('pragma synchronous=%s' %
+                             (2 if self._fsync else 0))
+            if conn.in_transaction:
+                conn.commit()
+        except Exception:
+            conn.close()
+            raise
         return conn
 
+    def _insert_task(self, curs, data, priority=None):
+        curs.execute('insert into task (queue, data, priority) '
+                     'values (?, ?, ?)',
+                     (self.name, self.to_blob(data), priority or 0))
+
     def enqueue(self, data, priority=None):
-        self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
-                 (self.name, self.to_blob(data), priority or 0), commit=True)
+        with self.db(commit=True) as curs:
+            self._insert_task(curs, data, priority)
 
     def dequeue(self):
         # Quick check without the full exclusive lock.
@@ -987,20 +1040,37 @@ class SqliteStorage(BaseSqlStorage):
                  'values (?, ?, ?)', params, commit=True)
 
     def read_schedule(self, ts):
+        data = []
         with self.db(commit=True) as curs:
-            params = (self.name, ts.timestamp())
-            curs.execute('select id, data from schedule where '
-                         'queue = ? and timestamp <= ? order by timestamp, id',
-                         params)
-            id_list, data = [], []
-            for task_id, task_data in curs.fetchall():
-                id_list.append(task_id)
-                data.append(task_data)
-            for i in range(0, len(id_list), 500):
-                chunk = id_list[i:i + 500]
-                curs.execute('delete from schedule where id in (%s)' %
-                             ','.join('?' * len(chunk)), chunk)
-            return data
+            while True:
+                batch = self._select_schedule_batch(curs, ts)
+                if not batch:
+                    break
+                data.extend(row[2] for row in batch)
+        return data
+
+    def _select_schedule_batch(self, curs, ts):
+        curs.execute('delete from schedule where id in ('
+                     'select id from schedule where queue = ? and '
+                     'timestamp <= ? order by timestamp, id limit ?) '
+                     'returning timestamp, id, data',
+                     (self.name, ts.timestamp(), self.schedule_batch_size))
+        return sorted(curs.fetchall(), key=lambda row: row[:2])
+
+    def enqueue_schedule(self, timestamp, prepare, committed=None):
+        count = 0
+        while True:
+            with self.db(commit=True,
+                         begin_sql=self.schedule_begin_sql,
+                         after_commit=committed) as curs:
+                batch = self._select_schedule_batch(curs, timestamp)
+                if not batch:
+                    return count
+
+                for _, _, message in batch:
+                    message, priority = prepare(message)
+                    self._insert_task(curs, message, priority)
+                count += len(batch)
 
     def schedule_size(self):
         return self.sql('select count(id) from schedule where queue=?',

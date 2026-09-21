@@ -751,6 +751,32 @@ class Huey(object):
             timestamp = self._get_timestamp()
         return self._deserialize_all(self.storage.read_schedule(timestamp))
 
+    def enqueue_schedule(self, timestamp=None):
+        if timestamp is None:
+            timestamp = self._get_timestamp()
+
+        prepared = []
+        enqueued = []
+
+        def prepare(message):
+            task = self.deserialize_task(message)
+            if task.expires:
+                task.resolve_expires(self.utc)
+            prepared.append(task)
+            return self.serialize_task(task), task.priority
+
+        def committed():
+            while prepared:
+                task = prepared.pop(0)
+                enqueued.append(task)
+                if self._immediate:
+                    self.execute(task)
+                else:
+                    self._emit(S.SIGNAL_ENQUEUED, task)
+
+        self.storage.enqueue_schedule(timestamp, prepare, committed)
+        return enqueued
+
     def _deserialize_all(self, messages):
         accum = []
         for msg in messages:

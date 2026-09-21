@@ -174,16 +174,12 @@ class Scheduler(BaseProcess):
             return
 
         try:
-            task_list = self.huey.read_schedule(now)
+            task_list = self.huey.enqueue_schedule(now)
         except Exception:
             self._logger.exception('Error reading schedule.')
         else:
             for task in task_list:
                 self._logger.debug('Enqueueing %s', task)
-                try:
-                    self.huey.enqueue(task)
-                except Exception:
-                    self._logger.exception('Error enqueueing %s.', task)
 
         if self.periodic and self._next_periodic <= time.monotonic():
             # If the scheduler stalled (e.g. suspend/resume), skip past any
