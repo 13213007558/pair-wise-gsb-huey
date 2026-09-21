@@ -3,6 +3,18 @@ Changelog
 
 ## master
 
+* Add an optional time-to-live for task results. Configure a default with
+  `result_ttl=` on the Huey/storage, or override per task using
+  `@huey.task(result_ttl=...)` / `task.s(result_ttl=...)`. Expired results
+  are reported as unavailable by normal gets, `preserve=True` reads, batch
+  reads and blocking waits, and reads never renew the TTL. `MemoryStorage`
+  and `SqliteStorage` support the TTL plus a bounded active cleanup via
+  `Huey.cleanup_results(limit=...)`; unsupported storages raise a clear
+  configuration error. Revocation markers, locks and chord coordination data
+  are unaffected. SQLite databases are migrated automatically and old rows
+  without an expiration remain readable. `result_ttl=None` disables
+  expiration, `0` expires results immediately, and negative values are
+  rejected.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

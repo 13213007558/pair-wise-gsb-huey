@@ -18,7 +18,8 @@ class BytesBlobField(BlobField):
 class SqlStorage(BaseStorage):
     def __init__(self, name='huey', database=None, create_tables=True,
                  **kwargs):
-        super(SqlStorage, self).__init__(name)
+        result_ttl = kwargs.pop('result_ttl', None)
+        super(SqlStorage, self).__init__(name, result_ttl=result_ttl)
 
         if database is None:
             raise ConfigurationError('Use of SqlStorage requires a '
@@ -198,7 +199,10 @@ class SqlStorage(BaseStorage):
          .where(self.Schedule.queue == self.name)
          .execute())
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError(
+                'per-result TTL is not supported by this storage.')
         self.check_conn()
         if isinstance(self.database, PostgresqlDatabase):
             (self.KV

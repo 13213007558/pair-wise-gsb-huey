@@ -226,11 +226,22 @@ Huey types
 Huey object
 -----------
 
-.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, store_intermediate_errors=True, storage_kwargs)
+.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, store_intermediate_errors=True, result_ttl=None, storage_kwargs)
 
     :param str name: the name of the task queue, e.g. your application's name.
     :param bool results: whether to store task results.
     :param bool store_none: whether to store ``None`` in the result store.
+    :param result_ttl: default time-to-live for stored task results, in
+        seconds. ``None`` (the default) retains results until they are
+        consumed or flushed; a positive number expires results that many
+        seconds after they are stored; ``0`` causes stored results to expire
+        immediately. Negative values raise ``ValueError``. Reading a result
+        (normal get, ``preserve=True``, batch reads or a blocking wait) never
+        extends the lifetime. Revocation keys, locks and chord coordination
+        data are not affected. Supported by the memory and SQLite storages;
+        storages without TTL support raise a configuration error when a TTL
+        is requested. A per-task override is available via
+        ``@huey.task(result_ttl=...)``.
     :param bool store_intermediate_errors: when a task fails but has retries
         remaining, store the intermediate exception in the result store and run
         any ``on_error`` handler. When ``False``, the error is withheld until the
@@ -1132,6 +1143,15 @@ Huey object
     .. py:method:: result_count()
 
         :returns: the number of key/value pairs in the result store.
+
+    .. py:method:: cleanup_results(limit=None)
+
+        Actively remove task results whose time-to-live has elapsed.
+        Revocation keys, locks and chord coordination data are unaffected.
+
+        :param int limit: optional maximum number of expired results to
+            remove in this call.
+        :returns: the number of expired results removed.
 
     .. py:method:: flush()
 
@@ -2371,7 +2391,7 @@ Huey comes with several built-in storage implementations:
     automatically cleaned-up.
 
 
-.. py:class:: SqliteStorage(name='huey', filename='huey.db', cache_mb=8, fsync=None, journal_mode='wal', timeout=5, strict_fifo=False, create_tables=True, **kwargs)
+.. py:class:: SqliteStorage(name='huey', filename='huey.db', cache_mb=8, fsync=None, journal_mode='wal', timeout=5, strict_fifo=False, create_tables=True, result_ttl=None, **kwargs)
 
     :param str name: namespace for storage.
     :param str filename: sqlite database filename.
@@ -2390,6 +2410,11 @@ Huey comes with several built-in storage implementations:
         cause tasks to be run in a different order than the order in which they
         were enqueued.
     :param bool create_tables: create tables if they do not exist.
+    :param result_ttl: default time-to-live for stored task results, in
+        seconds (``None`` disables expiration). Expiration is stored in the
+        database as an absolute timestamp and works across multiple storage
+        instances sharing the file; databases created by older releases are
+        migrated automatically and their rows never expire.
     :param kwargs: Additional keyword arguments passed to the ``sqlite3``
         connection constructor.
 
@@ -2474,7 +2499,9 @@ Huey comes with several built-in storage implementations:
 .. py:class:: MemoryStorage()
 
     In-memory storage engine for use when testing or developing. Designed for
-    use with :ref:`immediate mode <immediate>`.
+    use with :ref:`immediate mode <immediate>`. Supports a ``result_ttl``
+    keyword argument giving stored task results a time-to-live in seconds
+    (``None`` disables expiration).
 
 
 .. py:class:: BlackHoleStorage()
@@ -2485,4 +2512,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

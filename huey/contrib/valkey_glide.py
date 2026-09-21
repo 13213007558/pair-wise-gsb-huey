@@ -17,7 +17,9 @@ from huey.storage import SCHEDULE_POP_LUA
 class ValkeyGlideStorage(RedisStorage):
     def __init__(self, name='huey', blocking=False, read_timeout=1,
                  client=None, client_config=None, host=None, port=None,
-                 client_name=None, **client_config_params):
+                 client_name=None, result_ttl=None, **client_config_params):
+        super(ValkeyGlideStorage, self).__init__(
+            name, result_ttl=result_ttl)
         if sum(1 for p in (client, client_config, host) if p) > 1:
             raise ConfigurationError('Specify only one of the following: '
                                      '"client", "client_config" or "host"')
@@ -81,7 +83,10 @@ class ValkeyGlideStorage(RedisStorage):
         tasks = self.conn.zrange(self.schedule_key, RangeByIndex(0, stop))
         return [base64.b64decode(t) for t in tasks]
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError(
+                'per-result TTL is not supported by this storage.')
         self.conn.hset(self.result_key, {key: value})
 
     def peek_data(self, key):

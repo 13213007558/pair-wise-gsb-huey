@@ -94,12 +94,18 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, storage_class=None,
-                 store_intermediate_errors=True, **storage_kwargs):
+                 store_intermediate_errors=True, result_ttl=None,
+                 **storage_kwargs):
 
         self.name = name
         self.results = results
         self.store_none = store_none
         self.store_intermediate_errors = store_intermediate_errors
+        # Default time-to-live for stored task results, in seconds. None
+        # means results are retained indefinitely; 0 makes stored results
+        # expire immediately. Revocation keys, locks and chord coordination
+        # data are never affected by this value.
+        self.result_ttl = result_ttl
         self.utc = utc
         self._immediate = immediate
         self.immediate_use_memory = immediate_use_memory
@@ -112,6 +118,11 @@ class Huey(object):
         if storage_class is not None:
             self.storage_class = storage_class
         self.storage = self.create_storage()
+        # A Huey-level result_ttl overrides any default configured on the
+        # storage; when it is None the storage's own default is preserved.
+        # Unsupported storages fail loudly when a TTL is requested.
+        if result_ttl is not None:
+            self.storage.configure_result_ttl(result_ttl)
 
         # Allow overriding the default TaskWrapper implementation.
         self.task_wrapper_class = self.get_task_wrapper_class()
@@ -144,7 +155,7 @@ class Huey(object):
         return self.get_storage(**self.storage_kwargs)
 
     def get_immediate_storage(self):
-        return MemoryStorage(self.name)
+        return MemoryStorage(self.name, result_ttl=self.result_ttl)
 
     def get_storage(self, **kwargs):
         if self.storage_class is None:
@@ -172,7 +183,8 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             context=False, name=None, expires=None, timeout=None,
+             result_ttl=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -186,12 +198,13 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_result_ttl=result_ttl,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, result_ttl=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -208,6 +221,7 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_result_ttl=result_ttl,
                 validate_datetime=method_validate,
                 task_base=PeriodicTask,
                 **kwargs)
@@ -388,9 +402,18 @@ class Huey(object):
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
 
-    def put_result(self, key, data):
+    def _resolve_ttl(self, ttl):
+        if ttl is None:
+            return self.result_ttl
+        if ttl < 0:
+            raise ValueError('result ttl must be a non-negative number or '
+                             'None, got %r.' % ttl)
+        return ttl
+
+    def put_result(self, key, data, ttl=None):
+        ttl = self._resolve_ttl(ttl)
         return self.storage.put_data(key, self.serializer.serialize(data),
-                                     is_result=True)
+                                     is_result=True, ttl=ttl)
 
     def put_if_empty(self, key, data, ttl=None):
         return self.storage.put_if_empty(key, self.serializer.serialize(data),
@@ -526,16 +549,20 @@ class Huey(object):
                          (self.store_intermediate_errors or not task.retries))
 
         if self.results and not isinstance(task, PeriodicTask):
+            ttl = self._resolve_ttl(getattr(task, 'result_ttl', None))
             if surface_error:
                 error_data = self.build_error_result(task, exception)
-                self.put_result(task.id, Error(error_data))
+                self.put_result(task.id, Error(error_data), ttl=ttl)
                 next_task = task.on_complete if not task.retries else None
                 while next_task is not None:
-                    self.put_result(next_task.id, Error(error_data))
+                    next_ttl = self._resolve_ttl(
+                        getattr(next_task, 'result_ttl', None))
+                    self.put_result(next_task.id, Error(error_data),
+                                    ttl=next_ttl)
                     next_task = next_task.on_complete
             elif exception is None and (task_value is not None or
                                         self.store_none):
-                self.put_result(task.id, task_value)
+                self.put_result(task.id, task_value, ttl=ttl)
 
         if self._post_execute:
             self._run_post_execute(task, task_value, exception)
@@ -582,7 +609,10 @@ class Huey(object):
     def _check_chord(self, cc, value):
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
-        self.put_result(result_key, value)
+        # Chord member results and the completion counter are internal
+        # coordination data, not user-facing task results, so they must not
+        # be reclaimed by the result TTL.
+        self.put(result_key, value)
 
         if self.storage.incr(chord_key) == cc.size:
             self.storage.delete_counter(chord_key)
@@ -789,6 +819,17 @@ class Huey(object):
     def result_count(self):
         return self.storage.result_store_size()
 
+    def cleanup_results(self, limit=None):
+        """
+        Actively remove stored task results whose TTL has elapsed. Revocation
+        markers, locks and chord coordination data are not affected.
+
+        :param int limit: optional maximum number of expired items to remove
+            in this call.
+        :return: number of expired results removed.
+        """
+        return self.storage.cleanup_results(limit)
+
     def __bool__(self):
         return True
 
@@ -843,11 +884,13 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    default_result_ttl = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 result_ttl=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -866,6 +909,10 @@ class Task(object):
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
         self._deadline = None
+        # Per-task override of the Huey-level result TTL. None inherits the
+        # Huey default; 0 makes the stored result expire immediately.
+        self.result_ttl = (result_ttl if result_ttl is not None else
+                           self.default_result_ttl)
 
         self.on_complete = on_complete
         self.on_error = on_error
@@ -1046,7 +1093,11 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 result_ttl=None):
+        if result_ttl is not None and result_ttl < 0:
+            raise ValueError('result_ttl must be a non-negative number or '
+                             'None, got %r.' % result_ttl)
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1072,7 +1123,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            result_ttl=result_ttl)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1096,6 +1148,10 @@ class TaskWrapper(object):
             delay = delay.total_seconds()
         if eta is not None or delay is not None:
             eta = normalize_time(eta, delay, self.huey.utc)
+        result_ttl = kwargs.pop('result_ttl', None)
+        if result_ttl is not None and result_ttl < 0:
+            raise ValueError('result_ttl must be a non-negative number or '
+                             'None, got %r.' % result_ttl)
 
         return self.task_class(args, kwargs,
                                id=kwargs.pop('id', None),
@@ -1105,7 +1161,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               result_ttl=result_ttl)
 
 
 class TaskLock(object):
@@ -1355,6 +1412,7 @@ class Result(object):
             expires=expires if expires is not None else self.task.expires,
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
+            result_ttl=self.task.result_ttl,
             on_complete=on_complete,
             on_error=on_error)
         return self.huey.enqueue(task)

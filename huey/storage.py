@@ -43,9 +43,38 @@ class BaseStorage(object):
     """
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
+    # Whether this storage supports applying a TTL (time-to-live) to task
+    # result data. Storages that do not support this raise a clear error when
+    # a result TTL is configured.
+    supports_result_ttl = False
 
-    def __init__(self, name='huey', **storage_kwargs):
+    def __init__(self, name='huey', result_ttl=None, **storage_kwargs):
         self.name = name
+        self.configure_result_ttl(result_ttl)
+
+    def configure_result_ttl(self, result_ttl=None):
+        """
+        Configure the default time-to-live (in seconds) for task result data.
+
+        A value of ``None`` disables expiration (results are retained until
+        explicitly consumed or flushed). A positive number marks task results
+        with that lifetime. A value of ``0`` causes results to expire
+        immediately. Negative values are not valid.
+
+        Metadata like revocation keys, locks and chord coordination data is
+        never expired by this setting.
+        """
+        if result_ttl is not None:
+            if not self.supports_result_ttl:
+                raise ConfigurationError(
+                    '%s does not support a task result TTL. Use a storage '
+                    'that supports result expiration (e.g. MemoryStorage or '
+                    'SqliteStorage), or leave result_ttl unset.' %
+                    type(self).__name__)
+            if result_ttl < 0:
+                raise ValueError('result_ttl must be a non-negative number '
+                                 'or None, got %r.' % result_ttl)
+        self.result_ttl = result_ttl
 
     def close(self):
         """
@@ -151,7 +180,7 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
         """
         Store an arbitrary key/value pair, overwrites any existing value.
 
@@ -159,8 +188,13 @@ class BaseStorage(object):
         :param bytes value: value
         :param bool is_result: indicate if we are storing a (volatile) task
             result versus metadata like a task revocation key or lock.
+        :param float ttl: when storing a task result, an optional per-result
+            time-to-live in seconds, overriding any storage default.
         :return: No return value.
         """
+        if ttl is not None and not self.supports_result_ttl:
+            raise NotImplementedError(
+                'per-result TTL is not supported by this storage.')
         raise NotImplementedError
 
     def peek_data(self, key):
@@ -287,6 +321,19 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def cleanup_results(self, limit=None):
+        """
+        Actively remove task results whose time-to-live has elapsed. Only
+        result data is affected: revocation keys, locks and chord
+        coordination data are stored without a TTL and are left untouched.
+
+        :param int limit: optional bound on the maximum number of expired
+            rows/keys removed by this call.
+        :return: The number of expired items that were removed. Storages that
+            do not support a result TTL return 0.
+        """
+        return 0
+
     def flush_counters(self):
         """
         Clear all counters.
@@ -318,7 +365,7 @@ class BlackHoleStorage(BaseStorage):
     def schedule_size(self): return 0
     def scheduled_items(self, limit=None): return []
     def flush_schedule(self): pass
-    def put_data(self, key, value, is_result=False): pass
+    def put_data(self, key, value, is_result=False, ttl=None): pass
     def peek_data(self, key): return EmptyData
     def pop_data(self, key): return EmptyData
     def has_data_for_key(self, key): return False
@@ -332,12 +379,19 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
-    def __init__(self, *args, **kwargs):
-        super(MemoryStorage, self).__init__(*args, **kwargs)
+    supports_result_ttl = True
+
+    def __init__(self, name='huey', result_ttl=None, time_function=None,
+                 **kwargs):
+        super(MemoryStorage, self).__init__(name, result_ttl, **kwargs)
+        # ``time_function`` defaults to time.monotonic() and may be overridden
+        # to enable deterministic, controlled-clock testing of TTL behavior.
+        self.time = time_function or time.monotonic
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
-        self._results = {}
-        self._expires = {}
+        self._results = {}  # key -> value (both results and metadata).
+        self._result_keys = set()  # Keys stored as (volatile) task results.
+        self._expires = {}  # key -> absolute expiry timestamp (results only).
         self._schedule = []
         self._counters = {}
         self._lock = threading.RLock()
@@ -398,36 +452,85 @@ class MemoryStorage(BaseStorage):
     def flush_schedule(self):
         self._schedule = []
 
+    def _is_expired(self, key, now=None):
+        expires = self._expires.get(key)
+        return expires is not None and expires <= (now or self.time())
+
     def _expire(self, key):
-        if self._expires.get(key, float('inf')) <= time.monotonic():
-            del self._expires[key]
+        # Lazily remove the key if its result TTL has elapsed. Reading data
+        # never extends the lifetime of a stored result.
+        if self._is_expired(key):
+            self._expires.pop(key, None)
+            self._result_keys.discard(key)
             self._results.pop(key, None)
 
-    def put_data(self, key, value, is_result=False):
+    def _put(self, key, value, expires=None):
         self._results[key] = value
-        self._expires.pop(key, None)
+        if expires is None:
+            self._expires.pop(key, None)
+            self._result_keys.discard(key)
+        else:
+            self._expires[key] = expires
+            self._result_keys.add(key)
+
+    def put_data(self, key, value, is_result=False, ttl=None):
+        with self._lock:
+            if is_result and ttl is None:
+                ttl = self.result_ttl
+            expires = None
+            if is_result and ttl is not None:
+                expires = self.time() + ttl
+            self._put(key, value, expires)
 
     def peek_data(self, key):
-        self._expire(key)
-        return self._results.get(key, EmptyData)
+        with self._lock:
+            self._expire(key)
+            return self._results.get(key, EmptyData)
 
     def pop_data(self, key):
-        self._expire(key)
-        return self._results.pop(key, EmptyData)
+        with self._lock:
+            self._expire(key)
+            if key in self._results:
+                self._expires.pop(key, None)
+                self._result_keys.discard(key)
+                return self._results.pop(key)
+            return EmptyData
 
     def has_data_for_key(self, key):
-        self._expire(key)
-        return key in self._results
+        with self._lock:
+            self._expire(key)
+            return key in self._results
 
     def put_if_empty(self, key, value, ttl=None):
         with self._lock:
             self._expire(key)
             if key in self._results:
                 return False
-            self.put_data(key, value)
-            if ttl is not None:
-                self._expires[key] = time.monotonic() + ttl
+            # Conditional writes are used for locks: a ttl here is the lock's
+            # own lease, not a result TTL, so the key is not tracked as a
+            # result and is never removed by cleanup_results().
+            self._results[key] = value
+            if ttl is None:
+                self._expires.pop(key, None)
+            else:
+                self._expires[key] = self.time() + ttl
+            self._result_keys.discard(key)
             return True
+
+    def cleanup_results(self, limit=None):
+        removed = 0
+        with self._lock:
+            now = self.time()
+            expired = [key for key in self._result_keys
+                       if self._expires.get(key, float('inf')) <= now]
+            for key in expired:
+                if limit is not None and removed >= limit:
+                    break
+                self._results.pop(key, None)
+                self._expires.pop(key, None)
+                self._result_keys.discard(key)
+                removed += 1
+        return removed
 
     def incr(self, key, amount=1):
         with self._lock:
@@ -439,13 +542,22 @@ class MemoryStorage(BaseStorage):
             self._counters.pop(key, None)
 
     def result_store_size(self):
-        return len(self._results)
+        with self._lock:
+            self.cleanup_results()
+            return len(self._results)
 
     def result_items(self):
-        return dict(self._results)
+        with self._lock:
+            self.cleanup_results()
+            return dict(self._results)
 
     def flush_results(self):
-        self._results = {}
+        # All key/value data (task results, revocation keys and locks) shares
+        # the kv namespace, so flushing clears everything, as before.
+        with self._lock:
+            self._results = {}
+            self._expires = {}
+            self._result_keys = set()
 
     def flush_counters(self):
         self._counters = {}
@@ -467,9 +579,9 @@ class RedisStorage(BaseStorage):
     redis_client = Redis
 
     def __init__(self, name='huey', blocking=True, read_timeout=1,
-                 connection_pool=None, url=None, client_name=None,
-                 notify_result=False, notify_result_ttl=60,
-                 clean_name=True, **connection_params):
+                connection_pool=None, url=None, client_name=None,
+                notify_result=False, notify_result_ttl=60,
+                clean_name=True, result_ttl=None, **connection_params):
 
         if Redis is None:
             raise ConfigurationError('"redis" python module not found, cannot '
@@ -511,6 +623,7 @@ class RedisStorage(BaseStorage):
 
         self.blocking = blocking
         self.read_timeout = read_timeout
+        self.configure_result_ttl(result_ttl)
 
     @cached_property
     def redis_version(self):
@@ -608,7 +721,10 @@ class RedisStorage(BaseStorage):
         pipe.expire(nkey, self.notify_result_ttl)
         pipe.execute()
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError(
+                'per-result TTL is not supported by this storage.')
         self.conn.hset(self.result_key, key, value)
         if is_result and self.notify_result:
             self._notify(key)
@@ -690,10 +806,17 @@ class RedisExpireStorage(RedisStorage):
     # Redis storage subclass that adds expiration to task result values. Since
     # the Redis server handles deleting our results after the expiration time,
     # this storage layer will not delete the results when they are read.
-    def __init__(self, name='huey', expire_time=86400, *args, **kwargs):
-        super(RedisExpireStorage, self).__init__(name, *args, **kwargs)
+    supports_result_ttl = True
 
-        self._expire_time = expire_time
+    def __init__(self, name='huey', expire_time=86400, result_ttl=None,
+                 *args, **kwargs):
+        super(RedisExpireStorage, self).__init__(
+            name, result_ttl=result_ttl, *args, **kwargs)
+
+        # The legacy expire_time parameter is the default TTL for results; an
+        # explicit result_ttl takes precedence.
+        self._expire_time = self.result_ttl if result_ttl is not None \
+            else expire_time
 
         self.result_prefix = rp = b'huey.r.%s.' % self.name.encode('utf8')
         self.counter_prefix = cp = b'huey.c.%s.' % self.name.encode('utf8')
@@ -702,11 +825,12 @@ class RedisExpireStorage(RedisStorage):
         self.result_key = lambda k: rp + encode(k)
         self.counter_key = lambda k: cp + encode(k)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
         if is_result:
             # We only want to expire task result data. If we are storing an
             # important metadata like a revocation key, we need to preserve it.
-            self.conn.set(self.result_key(key), value, ex=self._expire_time)
+            ex = ttl if ttl is not None else self._expire_time
+            self.conn.set(self.result_key(key), value, ex=ex)
             if self.notify_result:
                 self._notify(key)
         else:
@@ -732,8 +856,10 @@ class RedisExpireStorage(RedisStorage):
         return self.conn.exists(self.result_key(key)) != 0
 
     def put_if_empty(self, key, value, ttl=None):
-        return bool(self.conn.set(self.result_key(key), value, nx=True,
-                                  ex=ttl))
+        kwargs = {'nx': True}
+        if ttl is not None:
+            kwargs['ex'] = ttl
+        return bool(self.conn.set(self.result_key(key), value, **kwargs))
 
     def incr(self, key, amount=1):
         pipe = self.conn.pipeline()
@@ -885,9 +1011,20 @@ class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
+    supports_result_ttl = True
     table_kv = ('create table if not exists kv ('
                 'queue text not null, key text not null, value blob not null, '
+                'expires real, is_result integer not null default 0, '
                 'primary key(queue, key))')
+    # Databases created before result TTL support lack the kv.expires column.
+    # Rows present after the migration have expires=NULL and are treated as
+    # having no expiration, i.e. old result data remains readable.
+    table_kv_migrate = 'alter table kv add column expires real'
+    # Rows written by the first TTL-enabled release lacked the is_result
+    # marker. After adding the column they default to 0 (metadata), which is
+    # the safe choice: such rows are never reclaimed by result cleanup.
+    table_kv_migrate_result_flag = 'alter table kv add column is_result '
+    'integer not null default 0'
     table_sched = ('create table if not exists schedule ('
                    'id integer not null primary key, queue text not null, '
                    'data blob not null, timestamp real not null)')
@@ -908,13 +1045,18 @@ class SqliteStorage(BaseSqlStorage):
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
-                 create_tables=True, **kwargs):
+                 create_tables=True, result_ttl=None, time_function=None,
+                 **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
         self._fsync = fsync
         self._journal_mode = journal_mode
         self._timeout = timeout  # Busy timeout in seconds, default is 5.
         self._conn_kwargs = kwargs
+        # Absolute wall-clock timestamps are stored so that TTLs work across
+        # multiple storage instances sharing a database file. The clock may be
+        # overridden for deterministic, controlled-clock testing.
+        self.time = time_function or time.time
 
         # By default Sqlite may reuse rowids when rows are removed. This means
         # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
@@ -931,7 +1073,21 @@ class SqliteStorage(BaseSqlStorage):
 
         self.to_blob = memoryview
 
-        super(SqliteStorage, self).__init__(name, create_tables=create_tables)
+        super(SqliteStorage, self).__init__(
+            name, result_ttl=result_ttl, create_tables=create_tables)
+
+    def initialize_schema(self):
+        with self.db(commit=True, close=True) as curs:
+            for sql in self.ddl:
+                curs.execute(sql)
+            # Migrate kv tables created by older huey releases that do not
+            # have the expires column. Existing rows keep NULL expiration.
+            curs.execute('pragma table_info(kv)')
+            columns = [row[1] for row in curs.fetchall()]
+            if columns and 'expires' not in columns:
+                curs.execute(self.table_kv_migrate)
+            if columns and 'is_result' not in columns:
+                curs.execute(self.table_kv_migrate_result_flag)
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -1018,57 +1174,96 @@ class SqliteStorage(BaseSqlStorage):
     def flush_schedule(self):
         self.sql('delete from schedule where queue = ?', (self.name,), True)
 
-    def put_data(self, key, value, is_result=False):
-        self.sql('insert or replace into kv (queue, key, value) '
-                 'values (?, ?, ?)',
-                 (self.name, key, self.to_blob(value)), True)
+    def _expiry(self, is_result, ttl):
+        if is_result and ttl is None:
+            ttl = self.result_ttl
+        if not is_result or ttl is None:
+            return None
+        return self.time() + ttl
+
+    def put_data(self, key, value, is_result=False, ttl=None):
+        expires = self._expiry(is_result, ttl)
+        self.sql('insert or replace into kv (queue, key, value, expires, '
+                 'is_result) values (?, ?, ?, ?, ?)',
+                 (self.name, key, self.to_blob(value), expires,
+                  1 if is_result else 0), True)
 
     def peek_data(self, key):
-        res = self.sql('select value from kv where queue = ? and key = ?',
-                       (self.name, key), results=True)
-        return res[0][0] if res else EmptyData
+        res = self.sql('select value, expires from kv where queue = ? and '
+                       'key = ?', (self.name, key), results=True)
+        if not res:
+            return EmptyData
+        value, expires = res[0]
+        if expires is not None and expires <= self.time():
+            # Expired results are unavailable and reading them must not
+            # renew their TTL, so remove the row.
+            self.sql('delete from kv where queue = ? and key = ?',
+                     (self.name, key), True)
+            return EmptyData
+        return value
 
     def peek_many(self, keys):
         accum = {}
+        now = self.time()
         for i in range(0, len(keys), 500):
             chunk = keys[i:i + 500]
-            accum.update(self.sql(
-                'select key, value from kv where queue = ? and key in (%s)' %
-                ','.join('?' * len(chunk)), (self.name,) + tuple(chunk),
-                results=True))
+            rows = self.sql(
+                'select key, value, expires from kv where queue = ? and '
+                'key in (%s)' % ','.join('?' * len(chunk)),
+                (self.name,) + tuple(chunk), results=True)
+            for key, value, expires in rows:
+                if expires is not None and expires <= now:
+                    continue
+                accum[key] = value
         return accum
 
     def pop_data(self, key):
         with self.db(commit=True) as curs:
+            now = self.time()
             if self.sqlite_version_info >= (3, 35, 0):
-                curs.execute('delete from kv where queue = ? and key = ? '
-                             'returning value', (self.name, key))
+                curs.execute('delete from kv where queue = ? and key = ? and '
+                             '(expires is null or expires > ?) returning '
+                             'value', (self.name, key, now))
                 result = curs.fetchone()
                 if result is not None:
                     return result[0]
-            else:
-                curs.execute('select value from kv where queue = ? and key = ?',
+                # Remove the expired row if it exists.
+                curs.execute('delete from kv where queue = ? and key = ?',
                              (self.name, key))
+            else:
+                curs.execute('select value, expires from kv where '
+                             'queue = ? and key = ?', (self.name, key))
                 result = curs.fetchone()
                 if result is not None:
+                    value, expires = result
+                    if expires is not None and expires <= now:
+                        curs.execute('delete from kv where queue=? and key=?',
+                                     (self.name, key))
+                        return EmptyData
                     curs.execute('delete from kv where queue=? and key=?',
                                  (self.name, key))
                     if curs.rowcount == 1:
-                        return result[0]
+                        return value
             return EmptyData
 
     def has_data_for_key(self, key):
-        return bool(self.sql('select 1 from kv where queue=? and key=?',
-                             (self.name, key), results=True))
+        return bool(self.sql('select 1 from kv where queue=? and key=? and '
+                             '(expires is null or expires > ?)',
+                             (self.name, key, self.time()), results=True))
 
     def put_if_empty(self, key, value, ttl=None):
-        if ttl is not None:
-            raise NotImplementedError('ttl is not supported by this storage.')
+        expires = None if ttl is None else self.time() + ttl
         try:
             with self.db(commit=True) as curs:
+                # An expired row (e.g. an expired lock) must not block the
+                # conditional insert.
+                curs.execute('delete from kv where queue = ? and key = ? and '
+                             'expires is not null and expires <= ?',
+                             (self.name, key, self.time()))
                 curs.execute('insert or abort into kv '
-                             '(queue, key, value) values (?, ?, ?)',
-                             (self.name, key, self.to_blob(value)))
+                             '(queue, key, value, expires, is_result) values'
+                             ' (?, ?, ?, ?, 0)',
+                             (self.name, key, self.to_blob(value), expires))
         except self.integrity_error:
             return False
         else:
@@ -1102,13 +1297,50 @@ class SqliteStorage(BaseSqlStorage):
                  (self.name, key), commit=True)
 
     def result_store_size(self):
+        self.cleanup_results()
         return self.sql('select count(*) from kv where queue=?', (self.name,),
                         results=True)[0][0]
 
     def result_items(self):
+        self.cleanup_results()
         res = self.sql('select key, value from kv where queue=?', (self.name,),
                        results=True)
         return dict((k, v) for k, v in res)
+
+    def cleanup_results(self, limit=None):
+        # Expiration is tracked in the kv table and applies only to task
+        # results; revocation keys, locks and chord data are written with a
+        # NULL expires and are unaffected.
+        now = self.time()
+        if self.sqlite_version_info >= (3, 35, 0):
+            with self.db(commit=True) as curs:
+                if limit is None:
+                    curs.execute('delete from kv where queue = ? and expires '
+                                 'is not null and expires <= ? and is_result '
+                                 '= 1 returning 1',
+                                 (self.name, now))
+                else:
+                    curs.execute('delete from kv where rowid in (select '
+                                 'rowid from kv where queue = ? and expires is'
+                                 ' not null and expires <= ? and is_result ='
+                                 ' 1 limit ?) '
+                                 'returning 1', (self.name, now, limit))
+                return len(curs.fetchall())
+        with self.db(commit=True) as curs:
+            query = ('select rowid from kv where queue = ? and expires is not'
+                     ' null and expires <= ? and is_result = 1')
+            params = [self.name, now]
+            if limit is not None:
+                query += ' limit ?'
+                params.append(limit)
+            curs.execute(query, params)
+            rowids = [row[0] for row in curs.fetchall()]
+            if rowids:
+                for i in range(0, len(rowids), 500):
+                    chunk = rowids[i:i + 500]
+                    curs.execute('delete from kv where rowid in (%s)' %
+                                 ','.join('?' * len(chunk)), chunk)
+            return len(rowids)
 
     def flush_results(self):
         self.sql('delete from kv where queue=?', (self.name,), True)
@@ -1119,7 +1351,8 @@ class SqliteStorage(BaseSqlStorage):
 
 class CySqliteStorage(SqliteStorage):
     def __init__(self, name='huey', filename='huey.db', pragmas=None,
-                 timeout=5, strict_fifo=False, create_tables=True, **kwargs):
+                 timeout=5, strict_fifo=False, create_tables=True,
+                 result_ttl=None, time_function=None, **kwargs):
         if cysqlite is None:
             raise ConfigurationError('"cysqlite" not found. Run "pip install '
                                      'cysqlite" to install.')
@@ -1142,6 +1375,8 @@ class CySqliteStorage(SqliteStorage):
             timeout=timeout,
             strict_fifo=strict_fifo,
             create_tables=create_tables,
+            result_ttl=result_ttl,
+            time_function=time_function,
             pragmas=pragmas,
             **kwargs)
 
@@ -1152,8 +1387,8 @@ class CySqliteStorage(SqliteStorage):
 
 class PostgresStorage(BaseSqlStorage):
     def __init__(self, name='huey', dsn=None, connection=None, blocking=True,
-                 read_timeout=1, table_prefix='huey', create_tables=True,
-                 **connection_params):
+                read_timeout=1, table_prefix='huey', create_tables=True,
+                result_ttl=None, **connection_params):
         if psycopg is None:
             raise ConfigurationError('"psycopg" (version 3.2 or newer) not '
                                      'found, cannot use Postgres storage '
@@ -1213,7 +1448,8 @@ class PostgresStorage(BaseSqlStorage):
         # this is safe on both sides of a fork.
         self._listen_local = threading.local()
 
-        super(PostgresStorage, self).__init__(name, create_tables=create_tables)
+        super(PostgresStorage, self).__init__(
+            name, result_ttl=result_ttl, create_tables=create_tables)
 
     def _connect(self):
         if self.connection is not None:
@@ -1363,7 +1599,10 @@ class PostgresStorage(BaseSqlStorage):
     def _key(self, key):
         return key.decode('utf-8') if isinstance(key, bytes) else key
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError(
+                'per-result TTL is not supported by this storage.')
         self.sql('insert into {} (queue, key, value) values (%s, %s, %s) '
                  'on conflict (queue, key) do update set '
                  'value = excluded.value'.format(self.table_kv),
@@ -1447,8 +1686,9 @@ class FileStorage(BaseStorage):
     MAX_PRIORITY = 0xffff
 
     def __init__(self, name, path, levels=2, use_thread_lock=False,
-                 **storage_kwargs):
-        super(FileStorage, self).__init__(name, **storage_kwargs)
+                 result_ttl=None, **storage_kwargs):
+        super(FileStorage, self).__init__(name, result_ttl=result_ttl,
+                                          **storage_kwargs)
 
         self.path = path
         if os.path.exists(self.path) and not os.path.isdir(self.path):
@@ -1593,7 +1833,10 @@ class FileStorage(BaseStorage):
         prefix_filename = itertools.chain(prefix, (checksum,))
         return os.path.join(self.result_path, *prefix_filename)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError(
+                'per-result TTL is not supported by this storage.')
         with self.lock:
             self._put_data(key, value)
 

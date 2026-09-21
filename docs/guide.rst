@@ -114,6 +114,59 @@ What happens when we schedule a task?
 
 For more details, see the :py:meth:`~TaskWrapper.schedule` API documentation.
 
+Result expiration (TTL)
+-----------------------
+
+Short-lived task results can be reclaimed automatically, while data that must
+be kept longer (such as revocation markers, task locks and chord coordination
+data) follows its own lifecycle and is never touched by the result TTL.
+
+Configure a default lifetime in seconds with ``result_ttl``:
+
+.. code-block:: python
+
+    # Task results expire 1 hour after they are stored.
+    huey = SqliteHuey(filename='/tmp/demo.db', result_ttl=3600)
+
+The accepted values are:
+
+* ``None`` (the default): results are retained until consumed or flushed.
+* a positive number: results expire that many seconds after being stored.
+* ``0``: results expire immediately (the storage write still happens, but is
+  considered expired on the first read).
+* a negative number: raises ``ValueError``.
+
+Once expired, a result is reported as unavailable by every read path: a normal
+get, a non-destructive ``preserve=True`` read, batch result reads
+(:py:meth:`~ResultGroup.get` and :py:meth:`~Huey.all_results`) and blocking
+waits. Reading a result never extends (renews) its lifetime.
+
+Individual tasks can override the default:
+
+.. code-block:: python
+
+    @huey.task(result_ttl=60)
+    def quick_report():
+        ...
+
+    r = quick_report.s(result_ttl=10)  # Per-invocation override.
+
+Expired rows/keys are removed lazily on access. For bounded, active
+reclamation call :py:meth:`~Huey.cleanup_results`, optionally with a
+``limit`` to cap how many expired items are removed in one call (e.g. from a
+periodic maintenance job):
+
+.. code-block:: python
+
+    removed = huey.cleanup_results(limit=1000)
+
+Result TTL is supported by the memory and SQLite storages. Enabling it on a
+storage that does not support expiration raises a configuration error. For
+SQLite, the expiration is stored as an absolute timestamp, so it works when
+multiple storage instances share the same database file; databases created by
+older Huey releases are migrated automatically and their existing rows (which
+carry no expiration information) remain readable and are never reclaimed.
+
 Periodic tasks
 --------------
 
