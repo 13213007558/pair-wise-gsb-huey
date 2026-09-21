@@ -5,6 +5,7 @@ import hashlib
 import heapq
 import itertools
 import json
+import math
 import os
 import re
 import shutil
@@ -33,6 +34,90 @@ from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
 from huey.utils import text_type
 from huey.utils import to_timestamp
+
+
+DEFAULT_PRIORITY_AGING = 60
+DEFAULT_PRIORITY_BOOST_MAX = 1000
+
+
+def configure_priority_aging(priority_aging=None, priority_aging_step=1,
+                             priority_aging_max=DEFAULT_PRIORITY_BOOST_MAX):
+    if priority_aging is None or priority_aging is False:
+        aging = None
+    elif priority_aging is True:
+        aging = float(DEFAULT_PRIORITY_AGING)
+    else:
+        aging = _finite_number(priority_aging, 'priority_aging')
+        if aging <= 0:
+            raise ValueError('priority_aging must be greater than zero.')
+
+    step = _finite_number(priority_aging_step, 'priority_aging_step')
+    if step <= 0:
+        raise ValueError('priority_aging_step must be greater than zero.')
+
+    if priority_aging_max is None:
+        max_boost = float(DEFAULT_PRIORITY_BOOST_MAX)
+    else:
+        max_boost = _finite_number(priority_aging_max,
+                                   'priority_aging_max')
+        if max_boost < 0:
+            raise ValueError('priority_aging_max must not be negative.')
+    if max_boost * step > 1e300:
+        raise ValueError('priority_aging_max * priority_aging_step is too '
+                         'large.')
+
+    return aging, step, max_boost
+
+
+def _finite_number(value, name):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError('%s must be a finite number.' % name)
+    value = float(value)
+    if not math.isfinite(value):
+        raise ValueError('%s must be a finite number.' % name)
+    return value
+
+
+def validate_priority(priority):
+    if priority is None:
+        return 0.0
+    return _finite_number(priority, 'priority')
+
+
+def validate_aging_priority(priority, step, max_boost):
+    priority = validate_priority(priority)
+    if priority + (step * max_boost) > 1e300:
+        raise ValueError('priority is too large for the configured aging '
+                         'bounds.')
+    return priority
+
+
+class PriorityAgingClock(object):
+    def __init__(self, clock=time.time):
+        self._clock = clock
+        self._last = 0.0
+
+    def now(self):
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise ValueError('priority aging clock must return a finite time.')
+        self._last = max(self._last, now)
+        return self._last
+
+    def peek(self):
+        now = float(self._clock())
+        if not math.isfinite(now):
+            raise ValueError('priority aging clock must return a finite time.')
+        return max(self._last, now)
+
+
+def effective_priority(priority, enqueued_at, now, aging, step=1,
+                       max_boost=DEFAULT_PRIORITY_BOOST_MAX):
+    age = max(0.0, now - enqueued_at)
+    boost = math.floor(age / aging)
+    if max_boost is not None:
+        boost = min(boost, max_boost)
+    return priority + (boost * step)
 
 
 class BaseStorage(object):
@@ -262,33 +347,78 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, priority_aging=None, priority_aging_step=1,
+                 priority_aging_max=DEFAULT_PRIORITY_BOOST_MAX,
+                 priority_clock=None, clock=None, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
         self._results = {}
         self._schedule = []
         self._lock = threading.RLock()
+        self._priority_aging, self._priority_aging_step, self._priority_aging_max = (
+            configure_priority_aging(priority_aging, priority_aging_step,
+                                    priority_aging_max))
+        self._aging_clock = PriorityAgingClock(priority_clock or clock or
+                                              time.time)
 
     def enqueue(self, data, priority=None):
         with self._lock:
+            if self._priority_aging is not None:
+                priority = validate_aging_priority(
+                    priority, self._priority_aging_step,
+                    self._priority_aging_max)
+            else:
+                priority = validate_priority(priority)
+            enqueued_at = (self._aging_clock.now()
+                           if self._priority_aging is not None else None)
             self._c += 1
-            priority = 0 if priority is None else -priority
-            heapq.heappush(self._queue, (priority, self._c, data))
+            if self._priority_aging is None:
+                heapq.heappush(self._queue,
+                               (-priority, self._c, None, data))
+            else:
+                self._queue.append(
+                    (priority, enqueued_at, self._c, data))
 
     def dequeue(self):
-        try:
-            _, _, data = heapq.heappop(self._queue)
-        except IndexError:
-            pass
-        else:
-            return data
+        with self._lock:
+            if not self._queue:
+                return
+            if self._priority_aging is None:
+                _, _, _, data = heapq.heappop(self._queue)
+                return data
+
+            now = self._aging_clock.now()
+            index = 0
+            selected = effective_priority(
+                self._queue[0][0], self._queue[0][1], now,
+                self._priority_aging, self._priority_aging_step,
+                self._priority_aging_max)
+            for idx, item in enumerate(self._queue[1:], 1):
+                candidate = effective_priority(
+                    item[0], item[1], now, self._priority_aging,
+                    self._priority_aging_step, self._priority_aging_max)
+                if (candidate > selected or
+                        (candidate == selected and item[2] < self._queue[index][2])):
+                    index = idx
+                    selected = candidate
+            return self._queue.pop(index)[3]
 
     def queue_size(self):
         return len(self._queue)
 
     def enqueued_items(self, limit=None):
-        items = [data for _, _, data in sorted(self._queue)]
+        if self._priority_aging is None:
+            items = [data for _, _, _, data in sorted(self._queue)]
+        else:
+            now = self._aging_clock.peek()
+            def order_key(item):
+                priority, enqueued_at, seq, _ = item
+                return (-effective_priority(
+                    priority, enqueued_at, now, self._priority_aging,
+                    self._priority_aging_step, self._priority_aging_max), seq)
+            items = [data for _, _, _, data in
+                     sorted(self._queue, key=order_key)]
         if limit:
             items = items[:limit]
         return items
@@ -356,13 +486,47 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+PRIORITY_AGING_POP_LUA = """\
+local queue = KEYS[1]
+local now = tonumber(ARGV[1])
+local aging = tonumber(ARGV[2])
+local step = tonumber(ARGV[3])
+local max_boost = tonumber(ARGV[4])
+local items = redis.call('zrange', queue, 0, -1, 'WITHSCORES')
+local best_member
+local best_effective
+local best_seq
+for i = 1, #items, 2 do
+    local member = items[i]
+    local priority = tonumber(items[i + 1])
+    local enqueued_at = struct.unpack('>I8', member, 1)
+    local seq = struct.unpack('>I8', member, 9)
+    local age = now - enqueued_at
+    if age < 0 then age = 0 end
+    local boost = math.floor(age / aging)
+    if boost > max_boost then boost = max_boost end
+    local effective = priority + (boost * step)
+    if best_member == nil or effective > best_effective or
+        (effective == best_effective and seq < best_seq) then
+        best_member = member
+        best_effective = effective
+        best_seq = seq
+    end
+end
+if best_member ~= nil and redis.call('zrem', queue, best_member) == 1 then
+    return best_member
+end"""
+
 
 class RedisStorage(BaseStorage):
-    priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
+    priority = False
     redis_client = Redis
 
     def __init__(self, name='huey', blocking=True, read_timeout=1,
                  connection_pool=None, url=None, client_name=None,
+                 priority_aging=None, priority_aging_step=1,
+                 priority_aging_max=DEFAULT_PRIORITY_BOOST_MAX,
+                 priority_clock=None, clock=None,
                  **connection_params):
 
         if Redis is None:
@@ -390,9 +554,18 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._priority_aging, self._priority_aging_step, self._priority_aging_max = (
+            configure_priority_aging(priority_aging, priority_aging_step,
+                                    priority_aging_max))
+        self._aging_clock = PriorityAgingClock(priority_clock or clock or
+                                              time.time)
+        self._priority_aging_pop = self.conn.register_script(
+            PRIORITY_AGING_POP_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
+        self.queue_notify_key = 'huey.redis.queue-notify.%s' % self.name
+        self.queue_seq_key = 'huey.redis.queue-seq.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
@@ -402,6 +575,7 @@ class RedisStorage(BaseStorage):
 
         self.blocking = blocking
         self.read_timeout = read_timeout
+        self.priority = type(self).priority or self._priority_aging is not None
 
     def clean_name(self, name):
         return re.sub('[^a-z0-9]', '', name)
@@ -410,12 +584,16 @@ class RedisStorage(BaseStorage):
         return time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
 
     def enqueue(self, data, priority=None):
+        if self._priority_aging is not None:
+            return self._enqueue_priority_aging(data, priority)
         if priority:
             raise NotImplementedError('Task priorities are not supported by '
                                       'this storage.')
         self.conn.lpush(self.queue_key, data)
 
     def dequeue(self):
+        if self._priority_aging is not None:
+            return self._dequeue_priority_aging()
         if self.blocking:
             try:
                 return self.conn.brpop(
@@ -429,14 +607,73 @@ class RedisStorage(BaseStorage):
             return self.conn.rpop(self.queue_key)
 
     def queue_size(self):
+        if self._priority_aging is not None:
+            return self.conn.zcard(self.queue_key)
         return self.conn.llen(self.queue_key)
 
     def enqueued_items(self, limit=None):
+        if self._priority_aging is not None:
+            return self._priority_aging_items(limit)
         limit = limit or -1
         return self.conn.lrange(self.queue_key, 0, limit)[::-1]
 
     def flush_queue(self):
-        self.conn.delete(self.queue_key)
+        keys = [self.queue_key]
+        if self._priority_aging is not None:
+            keys.extend((self.queue_notify_key, self.queue_seq_key))
+        self.conn.delete(*keys)
+
+    def _enqueue_priority_aging(self, data, priority=None):
+        priority = validate_aging_priority(
+            priority, self._priority_aging_step, self._priority_aging_max)
+        now = self._aging_clock.now()
+        now_us = max(0, min(2 ** 64 - 1, int(now * 1e6)))
+        seq = self.conn.incr(self.queue_seq_key)
+        prefix = struct.pack('>Q', now_us) + struct.pack('>Q', seq)
+        pipe = self.conn.pipeline()
+        pipe.zadd(self.queue_key, {prefix + data: priority})
+        pipe.rpush(self.queue_notify_key, 1)
+        pipe.execute()
+
+    def _dequeue_priority_aging(self):
+        def pop():
+            now = self._aging_clock.now()
+            return self._priority_aging_pop(
+                keys=[self.queue_key],
+                args=[int(now * 1e6), self._priority_aging * 1e6,
+                      self._priority_aging_step,
+                      self._priority_aging_max])
+
+        while True:
+            item = pop()
+            if item is not None or not self.blocking:
+                return item[16:] if item is not None else None
+            try:
+                notified = self.conn.blpop(self.queue_notify_key,
+                                           timeout=self.read_timeout)
+            except (ConnectionError, TimeoutError, TypeError, IndexError):
+                return None
+            if not notified:
+                return None
+            item = pop()
+            if item is not None:
+                return item[16:]
+
+    def _priority_aging_items(self, limit=None):
+        items = self.conn.zrange(self.queue_key, 0, -1, withscores=True)
+        now = self._aging_clock.peek()
+        def order_key(item):
+            member, priority = item
+            enqueued_at = struct.unpack('>Q', member[:8])[0] / 1e6
+            seq = struct.unpack('>Q', member[8:16])[0]
+            effective = effective_priority(
+                priority, enqueued_at, now, self._priority_aging,
+                self._priority_aging_step, self._priority_aging_max)
+            return (-effective, seq)
+        items = sorted(items, key=order_key)
+        if limit is not None:
+            items = items[:limit]
+        return [member[16:] for member, _ in items]
 
     def add_to_schedule(self, data, ts):
         self.conn.zadd(self.schedule_key, {data: self.convert_ts(ts)})
@@ -559,6 +796,8 @@ class RedisPriorityQueue(object):
     priority = True
 
     def enqueue(self, data, priority=None):
+        if self._priority_aging is not None:
+            return self._enqueue_priority_aging(data, priority)
         priority = 0 if priority is None else -priority
         # Prefix the message with an encoded timestamp to ensure that messages
         # created with the same priority are stored in the correct order. Since
@@ -569,6 +808,8 @@ class RedisPriorityQueue(object):
         self.conn.zadd(self.queue_key, {prefix + data: priority})
 
     def dequeue(self):
+        if self._priority_aging is not None:
+            return self._dequeue_priority_aging()
         if self.blocking:
             try:
                 # BZPOPMIN returns (key, data, score).
@@ -591,6 +832,8 @@ class RedisPriorityQueue(object):
         return self.conn.zcard(self.queue_key)
 
     def enqueued_items(self, limit=None):
+        if self._priority_aging is not None:
+            return self._priority_aging_items(limit)
         items = self.conn.zrange(self.queue_key, 0, limit or -1)
         return [item[8:] for item in items]  # Unprefix the data.
 
@@ -684,13 +927,17 @@ class SqliteStorage(BaseSqlStorage):
                    'on schedule (queue, timestamp)')
     table_task = ('create table if not exists task ('
                   'id integer not null primary key, queue text not null, '
-                  'data blob not null, priority real not null default 0.0)')
+                  'data blob not null, priority real not null default 0.0, '
+                  'enqueued_at real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
+                 priority_aging=None, priority_aging_step=1,
+                 priority_aging_max=DEFAULT_PRIORITY_BOOST_MAX,
+                 priority_clock=None, clock=None,
                  **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
@@ -698,6 +945,11 @@ class SqliteStorage(BaseSqlStorage):
         self._journal_mode = journal_mode
         self._timeout = timeout  # Busy timeout in seconds, default is 5.
         self._conn_kwargs = kwargs
+        self._priority_aging, self._priority_aging_step, self._priority_aging_max = (
+            configure_priority_aging(priority_aging, priority_aging_step,
+                                    priority_aging_max))
+        self._aging_clock = PriorityAgingClock(priority_clock or clock or
+                                              time.time)
 
         # By default Sqlite may reuse rowids when rows are removed. This means
         # that SqliteHuey may not strictly be a FIFO. If strict FIFO ordering
@@ -712,6 +964,26 @@ class SqliteStorage(BaseSqlStorage):
 
         super(SqliteStorage, self).__init__(name)
 
+    def initialize_schema(self):
+        super(SqliteStorage, self).initialize_schema()
+        columns = {row[1] for row in self.sql('pragma table_info(task)',
+                                              results=True)}
+        if 'enqueued_at' not in columns:
+            now = time.time()
+            with self.db(commit=True, close=True) as curs:
+                curs.execute('alter table task add column enqueued_at real')
+                curs.execute('update task set enqueued_at=?', (now,))
+
+    def _task_order(self, read_only=False):
+        if self._priority_aging is None:
+            return 'priority desc, id', ()
+        now = self._aging_clock.peek() if read_only else self._aging_clock.now()
+        max_boost = self._priority_aging_max
+        order = ('(priority + (min(?, max(0, cast(floor((? - enqueued_at) / ?) '
+                 'as integer))) * ?)) desc, id')
+        return order, (max_boost, now, self._priority_aging,
+                       self._priority_aging_step)
+
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
                                **self._conn_kwargs)
@@ -723,13 +995,25 @@ class SqliteStorage(BaseSqlStorage):
         return conn
 
     def enqueue(self, data, priority=None):
-        self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
-                 (self.name, to_blob(data), priority or 0), commit=True)
+        if self._priority_aging is None:
+            priority = validate_priority(priority)
+        else:
+            priority = validate_aging_priority(
+                priority, self._priority_aging_step,
+                self._priority_aging_max)
+        enqueued_at = (self._aging_clock.now()
+                       if self._priority_aging is not None else 0.0)
+        self.sql('insert into task (queue, data, priority, enqueued_at) '
+                 'values (?, ?, ?, ?)',
+                 (self.name, to_blob(data), priority, enqueued_at),
+                 commit=True)
 
     def dequeue(self):
+        order, order_params = self._task_order()
         with self.db(commit=True) as curs:
             curs.execute('select id, data from task where queue = ? '
-                         'order by priority desc, id limit 1', (self.name,))
+                         'order by %s limit 1' % order,
+                         (self.name,) + order_params)
             result = curs.fetchone()
             if result is not None:
                 tid, data = result
@@ -742,8 +1026,9 @@ class SqliteStorage(BaseSqlStorage):
                         (self.name,), results=True)[0][0]
 
     def enqueued_items(self, limit=None):
-        sql = 'select data from task where queue=? order by priority desc, id'
-        params = (self.name,)
+        order, order_params = self._task_order(read_only=True)
+        sql = 'select data from task where queue=? order by %s' % order
+        params = (self.name,) + order_params
         if limit is not None:
             sql += ' limit ?'
             params = (self.name, limit)

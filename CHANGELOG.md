@@ -3,6 +3,8 @@ Changelog
 
 ## master
 
+* Add optional priority aging to the in-memory, SQLite and Redis task queues.
+
 [View commits](https://github.com/coleifer/huey/compare/2.5.3...HEAD)
 
 ## 2.5.3

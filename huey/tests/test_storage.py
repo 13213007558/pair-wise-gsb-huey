@@ -256,7 +256,10 @@ class TestRedisExpireStorage(StorageTests, BaseTestCase):
 
 
 def get_redis_version():
-    return int(Redis().info()['redis_version'].split('.', 1)[0])
+    try:
+        return int(Redis().info()['redis_version'].split('.', 1)[0])
+    except Exception:
+        return 0
 
 
 @unittest.skipIf(get_redis_version() < 5, 'Requires Redis >= 5.0')

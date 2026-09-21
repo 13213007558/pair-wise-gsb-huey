@@ -46,8 +46,9 @@ Implementations of :py:class:`Huey` which handle task and result persistence.
     contains the complete list of arguments supported by the Redis client.
 
     .. note::
-        RedisHuey does not support task priorities. If you wish to use task
-        priorities with Redis, use :py:class:`PriorityRedisHuey`.
+        RedisHuey uses pure FIFO ordering by default. To use static task
+        priorities, use :py:class:`PriorityRedisHuey`. Passing
+        priority_aging also enables priority-capable ordering.
 
     RedisHuey uses a Redis LIST to store the queue of pending tasks. Redis
     lists are a natural fit, as they offer O(1) append and pop from either end
@@ -1489,6 +1490,11 @@ Huey comes with several built-in storage implementations:
         opposed to polling). Default is true.
     :param read_timeout: Timeout to use when performing a blocking pop, default
         is 1 second.
+    :param priority_aging: number of seconds required to gain one effective
+        priority level. Disabled by default; when enabled the queue uses a
+        sorted set and requires Redis 5.0 or newer.
+    :param priority_aging_step: effective priority gained per aging interval.
+    :param priority_aging_max: maximum number of aging levels a task may gain.
     :param connection_pool: a redis-py ``ConnectionPool`` instance.
     :param url: url for Redis connection.
     :param client_name: name used to identify Redis clients used by Huey.
@@ -1517,6 +1523,11 @@ Huey comes with several built-in storage implementations:
         opposed to polling). Default is true.
     :param read_timeout: Timeout to use when performing a blocking pop, default
         is 1 second.
+    :param priority_aging: number of seconds a task must wait for its effective
+        priority to increase by one level. ``True`` uses 60 seconds.
+        Disabled by default.
+    :param priority_aging_step: effective priority gained per aging interval.
+    :param priority_aging_max: maximum number of aging levels a task may gain.
     :param connection_pool: a redis-py ``ConnectionPool`` instance.
     :param url: url for Redis connection.
     :param client_name: name used to identify Redis clients used by Huey.
@@ -1557,6 +1568,11 @@ Huey comes with several built-in storage implementations:
         FIFO. By default, Sqlite may reuse rowids for deleted tasks, which can
         cause tasks to be run in a different order than the order in which they
         were enqueued.
+    :param priority_aging: number of seconds a task must wait for its effective
+        priority to increase by one level. ``True`` uses 60 seconds.
+        Disabled by default.
+    :param priority_aging_step: effective priority gained per aging interval.
+    :param priority_aging_max: maximum number of aging levels a task may gain.
     :param kwargs: Additional keyword arguments passed to the ``sqlite3``
         connection constructor.
 
@@ -1584,6 +1600,10 @@ Huey comes with several built-in storage implementations:
 
     In-memory storage engine for use when testing or developing. Designed for
     use with :ref:`immediate mode <immediate>`.
+
+    The optional ``priority_aging``, ``priority_aging_step`` and
+    ``priority_aging_max`` keyword arguments configure priority aging in the
+    same way as :py:class:`SqliteStorage`.
 
 
 .. py:class:: BlackHoleStorage()

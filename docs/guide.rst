@@ -251,12 +251,11 @@ Task priority
 
 .. note::
     Priority support for Redis requires Redis 5.0 or newer. To use task
-    priorities with Redis, use the :py:class:`PriorityRedisHuey` instead of
-    :py:class:`RedisHuey`.
+    priorities with Redis, use :py:class:`PriorityRedisHuey`, or enable
+    priority aging on :py:class:`RedisHuey`.
 
-    Task prioritization is fully supported by :py:class:`SqliteHuey` and the
-    file-based :py:class:`FileHuey`. The in-memory storage layer (used when
-    :ref:`immediate` is enabled) also supports task priorities.
+    Task prioritization is fully supported by :py:class:`MemoryHuey`,
+    :py:class:`SqliteHuey` and the file-based :py:class:`FileHuey`.
 
 Huey tasks can be given a priority, allowing you to ensure that your most
 important tasks do not get delayed when the workers are busy.
@@ -267,6 +266,38 @@ invocations can be assigned a priority on a one-off basis.
 
 .. note::
     When no priority is given, the task will default to a priority of ``0``.
+
+Priority aging
+~~~~~~~~~~~~~~
+
+High-priority tasks can otherwise prevent lower-priority work from ever
+running. Optional priority aging increases a task's effective priority based
+on how long it has waited in the ready queue. Enable it at the storage layer
+by specifying the number of seconds required to gain one effective priority
+level:
+
+.. code-block:: python
+
+    from huey import SqliteHuey
+
+    huey = SqliteHuey('my-app', priority_aging=60)
+
+With this configuration, a priority-0 task that has waited 60 seconds has the
+same effective priority as a newly enqueued priority-1 task. Equal effective
+priorities remain FIFO. Use ``priority_aging_step`` to change the amount of
+priority gained per interval and ``priority_aging_max`` to cap the gain
+(default 1000 levels).
+
+Aging is calculated from the immutable enqueue timestamp. Dequeue operations
+do not rewrite stored priorities, so ordering does not drift while tasks wait.
+Time spent in the schedule (including ETA or retry delay) is not counted;
+aging starts when the task is moved into the ready queue. Immediate retries
+and periodic re-enqueues likewise receive a fresh ready-queue timestamp.
+
+For Redis, aging uses a sorted set plus an atomic Lua operation to choose and
+remove one item. Passing ``priority_aging`` to :py:class:`RedisHuey`
+enables the same priority-capable queue protocol; existing installations can
+continue to use :py:class:`PriorityRedisHuey`.
 
 To see how this works, lets define a task that has a priority (``10``):
 
@@ -875,7 +906,8 @@ weaknesses of each storage layer.
     latency, although polling can be used instead by passing ``blocking=False``
     when instantiating ``RedisHuey``.
 
-    Task priorities are not supported by :py:class:`RedisHuey`.
+    :py:class:`RedisHuey` is pure FIFO by default, but supports the optional
+    priority-aging configuration described below.
 
 :py:class:`PriorityRedisHuey`
     Redis storage layer that supports task priorities. In order to make this
