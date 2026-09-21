@@ -3,6 +3,15 @@ Changelog
 
 ## master
 
+* Add `result_ttl` option for expiring task results. Expired results are
+  treated as unavailable by all reads (including `preserve=True` and
+  blocking reads) and can be reclaimed proactively via the bounded
+  `Huey.expire_results(limit=...)` cleanup API. Supported by the memory
+  and sqlite storages; other backends raise `ConfigurationError` when
+  `result_ttl` is set. Revocation flags, locks and chord coordination
+  data are not affected, and result data written by older versions
+  (without expiration information) remains readable.
+
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

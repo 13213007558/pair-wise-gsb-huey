@@ -198,7 +198,10 @@ class SqlStorage(BaseStorage):
          .where(self.Schedule.queue == self.name)
          .execute())
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError('result ttl is not supported by this '
+                                      'storage.')
         self.check_conn()
         if isinstance(self.database, PostgresqlDatabase):
             (self.KV

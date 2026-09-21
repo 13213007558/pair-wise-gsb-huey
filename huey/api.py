@@ -62,6 +62,17 @@ class Huey(object):
         any ``on_error`` handler. When ``False``, the error is withheld until
         the task's retries are exhausted. Defaults to ``True`` for backwards
         compatibility.
+    :param result_ttl: time-to-live, in seconds, for task results. Once the
+        TTL elapses the result is treated as unavailable by all reads
+        (including non-destructive and blocking reads) and becomes eligible
+        for cleanup via :py:meth:`Huey.expire_results`. ``None`` (the
+        default) stores results indefinitely. ``0`` causes results to expire
+        immediately, effectively disabling result retention. Negative values
+        raise a :py:exc:`ConfigurationError`. Result expiration requires
+        storage support (currently the memory and sqlite backends); a
+        :py:exc:`ConfigurationError` is raised if the storage does not
+        support it. Only task results expire -- revocation flags, locks and
+        chord coordination data are unaffected.
     :param bool utc: use UTC internally by converting from local time.
     :param bool immediate: useful for debugging; causes tasks to be executed
         synchronously in the application.
@@ -94,7 +105,8 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, storage_class=None,
-                 store_intermediate_errors=True, **storage_kwargs):
+                 store_intermediate_errors=True, result_ttl=None,
+                 **storage_kwargs):
 
         self.name = name
         self.results = results
@@ -112,6 +124,18 @@ class Huey(object):
         if storage_class is not None:
             self.storage_class = storage_class
         self.storage = self.create_storage()
+
+        if result_ttl is not None:
+            if isinstance(result_ttl, bool) or \
+                    not isinstance(result_ttl, (int, float)) or result_ttl < 0:
+                raise ConfigurationError(
+                    'result_ttl must be a non-negative number of seconds, '
+                    'or None to disable result expiration.')
+            if not self.storage.supports_result_ttl:
+                raise ConfigurationError(
+                    'result_ttl is not supported by the %s storage backend.'
+                    % type(self.storage).__name__)
+        self.result_ttl = result_ttl
 
         # Allow overriding the default TaskWrapper implementation.
         self.task_wrapper_class = self.get_task_wrapper_class()
@@ -388,9 +412,12 @@ class Huey(object):
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
 
-    def put_result(self, key, data):
+    def put_result(self, key, data, apply_ttl=True):
+        kwargs = {'is_result': True}
+        if apply_ttl and self.result_ttl is not None:
+            kwargs['ttl'] = self.result_ttl
         return self.storage.put_data(key, self.serializer.serialize(data),
-                                     is_result=True)
+                                     **kwargs)
 
     def put_if_empty(self, key, data, ttl=None):
         return self.storage.put_if_empty(key, self.serializer.serialize(data),
@@ -582,7 +609,9 @@ class Huey(object):
     def _check_chord(self, cc, value):
         chord_key = 'chord:%s' % cc.cid
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
-        self.put_result(result_key, value)
+        # Chord coordination data is internal bookkeeping and is not subject
+        # to result TTL expiration.
+        self.put_result(result_key, value, apply_ttl=False)
 
         if self.storage.incr(chord_key) == cc.size:
             self.storage.delete_counter(chord_key)
@@ -788,6 +817,21 @@ class Huey(object):
 
     def result_count(self):
         return self.storage.result_store_size()
+
+    def expire_results(self, limit=None):
+        """
+        Proactively delete expired task results from the result store.
+
+        Expired results are treated as unavailable by all reads regardless
+        of whether this method is called -- it simply reclaims the storage
+        eagerly. Only has an effect when the huey instance was created with
+        a ``result_ttl`` and the storage supports result expiration.
+
+        :param int limit: maximum number of expired results to remove. If
+            not specified, all expired results are removed.
+        :return: number of expired results that were removed.
+        """
+        return self.storage.expire_results(limit)
 
     def __bool__(self):
         return True

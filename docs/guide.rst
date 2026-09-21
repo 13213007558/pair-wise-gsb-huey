@@ -395,6 +395,53 @@ For more information, see:
 * :py:class:`Result`
 * :py:class:`TaskException`
 
+.. _result-expiration:
+
+Result expiration
+-----------------
+
+By default, task results are stored indefinitely. If your application
+produces many short-lived results, you can configure a time-to-live so that
+results expire automatically:
+
+.. code-block:: python
+
+    from huey import SqliteHuey
+
+    # Task results become unavailable 10 minutes after they are stored.
+    huey = SqliteHuey('my-app', result_ttl=600)
+
+The ``result_ttl`` parameter accepts the following values:
+
+* ``None`` (the default): results never expire.
+* A positive number: seconds after which a stored result expires. Once
+  expired, the result is treated as unavailable by all reads -- ordinary
+  reads, non-destructive reads (``preserve=True``), batch reads and blocking
+  waits -- and reading a result never extends its lifetime.
+* ``0``: results expire immediately, effectively disabling result retention.
+* Negative values (and non-numeric values) raise a
+  :py:exc:`ConfigurationError` when the huey instance is created.
+
+Result expiration applies only to task results. Internal bookkeeping --
+revocation flags, locks and chord coordination data -- is not affected by
+the TTL.
+
+Expired results are removed lazily as they are read. To reclaim storage
+eagerly, call :py:meth:`Huey.expire_results`, which accepts an optional
+``limit`` to bound how many expired results are removed in a single call:
+
+.. code-block:: python
+
+    # Remove up to 100 expired results; returns the number removed.
+    huey.expire_results(limit=100)
+
+.. note::
+    Result expiration requires storage support and is currently implemented
+    by the memory and sqlite backends. Enabling ``result_ttl`` with any
+    other storage raises a :py:exc:`ConfigurationError`. For redis, the
+    :py:class:`RedisExpireHuey` storage provides similar behavior via its
+    ``expire_time`` parameter.
+
 .. _immediate:
 
 Immediate mode

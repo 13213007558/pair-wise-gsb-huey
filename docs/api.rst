@@ -226,7 +226,7 @@ Huey types
 Huey object
 -----------
 
-.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, store_intermediate_errors=True, storage_kwargs)
+.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, store_intermediate_errors=True, result_ttl=None, storage_kwargs)
 
     :param str name: the name of the task queue, e.g. your application's name.
     :param bool results: whether to store task results.
@@ -236,6 +236,12 @@ Huey object
         any ``on_error`` handler. When ``False``, the error is withheld until the
         task's retries are exhausted. Defaults to ``True`` for backwards
         compatibility. See :ref:`store-intermediate-errors`.
+    :param result_ttl: time-to-live, in seconds, for task results. Expired
+        results are treated as unavailable by all reads and can be reclaimed
+        with :py:meth:`~Huey.expire_results`. ``None`` (the default) stores
+        results indefinitely, ``0`` expires results immediately, and negative
+        values raise a :py:exc:`ConfigurationError`. Requires storage support
+        (currently memory and sqlite). See :ref:`result-expiration`.
     :param bool utc: use UTC internally, convert naive datetimes from local
         time to UTC (if local time is other than UTC).
     :param bool immediate: useful for debugging, causes tasks to be executed
@@ -1132,6 +1138,18 @@ Huey object
     .. py:method:: result_count()
 
         :returns: the number of key/value pairs in the result store.
+
+    .. py:method:: expire_results(limit=None)
+
+        Proactively delete expired task results from the result store.
+        Expired results are treated as unavailable by all reads regardless
+        of whether this method is called -- it simply reclaims the storage
+        eagerly. Only has an effect when the huey instance was created with
+        a ``result_ttl``.
+
+        :param int limit: maximum number of expired results to remove. If
+            not specified, all expired results are removed.
+        :returns: the number of expired results that were removed.
 
     .. py:method:: flush()
 
@@ -2485,4 +2503,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

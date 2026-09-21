@@ -81,7 +81,10 @@ class ValkeyGlideStorage(RedisStorage):
         tasks = self.conn.zrange(self.schedule_key, RangeByIndex(0, stop))
         return [base64.b64decode(t) for t in tasks]
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError('result ttl is not supported by this '
+                                      'storage.')
         self.conn.hset(self.result_key, {key: value})
 
     def peek_data(self, key):

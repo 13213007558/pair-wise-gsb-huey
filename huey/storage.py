@@ -43,9 +43,15 @@ class BaseStorage(object):
     """
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
+    supports_result_ttl = False  # Can store expiring task results?
 
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
+
+    def _now(self):
+        # Wall-clock timestamp used for result expiration. Defined as a
+        # method so that it can be overridden (e.g. with a test clock).
+        return time.time()
 
     def close(self):
         """
@@ -151,7 +157,7 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
         """
         Store an arbitrary key/value pair, overwrites any existing value.
 
@@ -159,6 +165,10 @@ class BaseStorage(object):
         :param bytes value: value
         :param bool is_result: indicate if we are storing a (volatile) task
             result versus metadata like a task revocation key or lock.
+        :param float ttl: optional time-to-live, in seconds, after which the
+            value is considered expired. Only supported by some storages (see
+            supports_result_ttl); others raise NotImplementedError when a
+            TTL is specified.
         :return: No return value.
         """
         raise NotImplementedError
@@ -231,6 +241,20 @@ class BaseStorage(object):
         :return: Boolean value.
         """
         raise NotImplementedError
+
+    def expire_results(self, limit=None):
+        """
+        Proactively remove expired task results from the data-store. This
+        provides bounded cleanup for storages that support result TTLs --
+        expired results are treated as unavailable on read regardless of
+        whether this method has been called.
+
+        :param int limit: maximum number of expired results to remove. If
+            not specified, all expired results are removed.
+        :return: number of expired results that were removed.
+        """
+        raise NotImplementedError('result expiration is not supported by '
+                                  'this storage.')
 
     def put_if_empty(self, key, value, ttl=None):
         """
@@ -318,11 +342,12 @@ class BlackHoleStorage(BaseStorage):
     def schedule_size(self): return 0
     def scheduled_items(self, limit=None): return []
     def flush_schedule(self): pass
-    def put_data(self, key, value, is_result=False): pass
+    def put_data(self, key, value, is_result=False, ttl=None): pass
     def peek_data(self, key): return EmptyData
     def pop_data(self, key): return EmptyData
     def has_data_for_key(self, key): return False
     def put_if_empty(self, key, value, ttl=None): return True
+    def expire_results(self, limit=None): return 0
     def incr(self, key, amount=1): return amount
     def delete_counter(self, key): pass
     def result_store_size(self): return 0
@@ -332,12 +357,15 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
+    supports_result_ttl = True
+
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
         self._results = {}
         self._expires = {}
+        self._result_expires = {}  # Expiration timestamps for task results.
         self._schedule = []
         self._counters = {}
         self._lock = threading.RLock()
@@ -403,25 +431,57 @@ class MemoryStorage(BaseStorage):
             del self._expires[key]
             self._results.pop(key, None)
 
-    def put_data(self, key, value, is_result=False):
+    def _expire_result(self, key):
+        # Lazily remove a task result whose TTL has elapsed. Reads never
+        # extend the lifetime of a result.
+        expires = self._result_expires.get(key)
+        if expires is not None and expires <= self._now():
+            del self._result_expires[key]
+            self._results.pop(key, None)
+
+    def put_data(self, key, value, is_result=False, ttl=None):
         self._results[key] = value
         self._expires.pop(key, None)
+        if ttl is None:
+            self._result_expires.pop(key, None)
+        else:
+            self._result_expires[key] = self._now() + ttl
 
     def peek_data(self, key):
         self._expire(key)
+        self._expire_result(key)
         return self._results.get(key, EmptyData)
 
     def pop_data(self, key):
         self._expire(key)
+        self._expire_result(key)
+        self._result_expires.pop(key, None)
         return self._results.pop(key, EmptyData)
 
     def has_data_for_key(self, key):
         self._expire(key)
+        self._expire_result(key)
         return key in self._results
+
+    def expire_results(self, limit=None):
+        now = self._now()
+        expired = sorted(
+            (expires, key)
+            for key, expires in self._result_expires.items()
+            if expires <= now)
+        if limit is not None:
+            expired = expired[:limit]
+        count = 0
+        for _, key in expired:
+            del self._result_expires[key]
+            if self._results.pop(key, None) is not None:
+                count += 1
+        return count
 
     def put_if_empty(self, key, value, ttl=None):
         with self._lock:
             self._expire(key)
+            self._expire_result(key)
             if key in self._results:
                 return False
             self.put_data(key, value)
@@ -439,13 +499,16 @@ class MemoryStorage(BaseStorage):
             self._counters.pop(key, None)
 
     def result_store_size(self):
+        self.expire_results()
         return len(self._results)
 
     def result_items(self):
+        self.expire_results()
         return dict(self._results)
 
     def flush_results(self):
         self._results = {}
+        self._result_expires = {}
 
     def flush_counters(self):
         self._counters = {}
@@ -608,7 +671,10 @@ class RedisStorage(BaseStorage):
         pipe.expire(nkey, self.notify_result_ttl)
         pipe.execute()
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError('result ttl is not supported by this '
+                                      'storage.')
         self.conn.hset(self.result_key, key, value)
         if is_result and self.notify_result:
             self._notify(key)
@@ -702,7 +768,10 @@ class RedisExpireStorage(RedisStorage):
         self.result_key = lambda k: rp + encode(k)
         self.counter_key = lambda k: cp + encode(k)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError('result ttl is not supported by this '
+                                      'storage; use expire_time instead.')
         if is_result:
             # We only want to expire task result data. If we are storing an
             # important metadata like a revocation key, we need to preserve it.
@@ -882,6 +951,8 @@ class BaseSqlStorage(BaseStorage):
 
 
 class SqliteStorage(BaseSqlStorage):
+    supports_result_ttl = True
+
     begin_sql = 'begin exclusive'
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
@@ -905,6 +976,15 @@ class SqliteStorage(BaseSqlStorage):
                      'primary key(queue, key))')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
            table_counter, drop_index_task]
+
+    # Task results stored with a TTL are prefixed with a small header: a
+    # magic marker followed by an 8-byte big-endian double holding the
+    # expiration timestamp. Values written by older versions of huey (or
+    # without a TTL) have no header and never expire. Since the timestamps
+    # are always positive, the packed big-endian doubles compare correctly
+    # as blobs, allowing expiration checks to run in SQL.
+    result_exp_prefix = b'\x00\x01huey-exp\x00'
+    result_exp_struct = struct.Struct('>d')
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -1018,7 +1098,36 @@ class SqliteStorage(BaseSqlStorage):
     def flush_schedule(self):
         self.sql('delete from schedule where queue = ?', (self.name,), True)
 
-    def put_data(self, key, value, is_result=False):
+    def _wrap_result(self, value, ttl):
+        expires = self._now() + ttl
+        return (self.result_exp_prefix +
+                self.result_exp_struct.pack(expires) + bytes(value))
+
+    def _unwrap_result(self, value):
+        # Returns 2-tuple of (payload, expiration-or-None). Values written
+        # by older versions of huey have no header and never expire.
+        n = len(self.result_exp_prefix)
+        if len(value) >= n + 8 and value[:n] == self.result_exp_prefix:
+            expires, = self.result_exp_struct.unpack(value[n:n + 8])
+            return value[n + 8:], expires
+        return value, None
+
+    def _not_expired_sql(self):
+        # SQL predicate matching values that are either legacy (no header)
+        # or whose TTL has not yet elapsed. The packed expiration timestamp
+        # is a positive double, so big-endian blob comparison is equivalent
+        # to numeric comparison.
+        n = len(self.result_exp_prefix)
+        return ('(substr(value, 1, %d) <> ? or substr(value, %d, 8) > ?)'
+                % (n, n + 1))
+
+    def _not_expired_params(self):
+        return (self.result_exp_prefix,
+                self.result_exp_struct.pack(self._now()))
+
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            value = self._wrap_result(value, ttl)
         self.sql('insert or replace into kv (queue, key, value) '
                  'values (?, ?, ?)',
                  (self.name, key, self.to_blob(value)), True)
@@ -1026,16 +1135,26 @@ class SqliteStorage(BaseSqlStorage):
     def peek_data(self, key):
         res = self.sql('select value from kv where queue = ? and key = ?',
                        (self.name, key), results=True)
-        return res[0][0] if res else EmptyData
+        if not res:
+            return EmptyData
+        value, expires = self._unwrap_result(res[0][0])
+        if expires is not None and expires <= self._now():
+            return EmptyData
+        return value
 
     def peek_many(self, keys):
         accum = {}
+        now = self._now()
         for i in range(0, len(keys), 500):
             chunk = keys[i:i + 500]
-            accum.update(self.sql(
+            res = self.sql(
                 'select key, value from kv where queue = ? and key in (%s)' %
                 ','.join('?' * len(chunk)), (self.name,) + tuple(chunk),
-                results=True))
+                results=True)
+            for key, value in res:
+                value, expires = self._unwrap_result(value)
+                if expires is None or expires > now:
+                    accum[key] = value
         return accum
 
     def pop_data(self, key):
@@ -1045,7 +1164,9 @@ class SqliteStorage(BaseSqlStorage):
                              'returning value', (self.name, key))
                 result = curs.fetchone()
                 if result is not None:
-                    return result[0]
+                    value, expires = self._unwrap_result(result[0])
+                    if expires is None or expires > self._now():
+                        return value
             else:
                 curs.execute('select value from kv where queue = ? and key = ?',
                              (self.name, key))
@@ -1054,12 +1175,31 @@ class SqliteStorage(BaseSqlStorage):
                     curs.execute('delete from kv where queue=? and key=?',
                                  (self.name, key))
                     if curs.rowcount == 1:
-                        return result[0]
+                        value, expires = self._unwrap_result(result[0])
+                        if expires is None or expires > self._now():
+                            return value
             return EmptyData
 
     def has_data_for_key(self, key):
-        return bool(self.sql('select 1 from kv where queue=? and key=?',
-                             (self.name, key), results=True))
+        sql = ('select 1 from kv where queue = ? and key = ? and ' +
+               self._not_expired_sql())
+        params = (self.name, key) + self._not_expired_params()
+        return bool(self.sql(sql, params, results=True))
+
+    def expire_results(self, limit=None):
+        # Bounded cleanup of expired task results. A negative LIMIT is
+        # treated by sqlite as "no limit".
+        n = len(self.result_exp_prefix)
+        sql = ('delete from kv where rowid in ('
+               'select rowid from kv where queue = ? '
+               'and substr(value, 1, %d) = ? '
+               'and substr(value, %d, 8) <= ? limit ?)' % (n, n + 1))
+        params = (self.name, self.result_exp_prefix,
+                  self.result_exp_struct.pack(self._now()),
+                  -1 if limit is None else limit)
+        with self.db(commit=True) as curs:
+            curs.execute(sql, params)
+            return curs.rowcount
 
     def put_if_empty(self, key, value, ttl=None):
         if ttl is not None:
@@ -1102,13 +1242,21 @@ class SqliteStorage(BaseSqlStorage):
                  (self.name, key), commit=True)
 
     def result_store_size(self):
-        return self.sql('select count(*) from kv where queue=?', (self.name,),
-                        results=True)[0][0]
+        sql = ('select count(*) from kv where queue = ? and ' +
+               self._not_expired_sql())
+        params = (self.name,) + self._not_expired_params()
+        return self.sql(sql, params, results=True)[0][0]
 
     def result_items(self):
         res = self.sql('select key, value from kv where queue=?', (self.name,),
                        results=True)
-        return dict((k, v) for k, v in res)
+        now = self._now()
+        accum = {}
+        for key, value in res:
+            value, expires = self._unwrap_result(value)
+            if expires is None or expires > now:
+                accum[key] = value
+        return accum
 
     def flush_results(self):
         self.sql('delete from kv where queue=?', (self.name,), True)
@@ -1363,7 +1511,10 @@ class PostgresStorage(BaseSqlStorage):
     def _key(self, key):
         return key.decode('utf-8') if isinstance(key, bytes) else key
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError('result ttl is not supported by this '
+                                      'storage.')
         self.sql('insert into {} (queue, key, value) values (%s, %s, %s) '
                  'on conflict (queue, key) do update set '
                  'value = excluded.value'.format(self.table_kv),
@@ -1593,7 +1744,10 @@ class FileStorage(BaseStorage):
         prefix_filename = itertools.chain(prefix, (checksum,))
         return os.path.join(self.result_path, *prefix_filename)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, ttl=None):
+        if ttl is not None:
+            raise NotImplementedError('result ttl is not supported by this '
+                                      'storage.')
         with self.lock:
             self._put_data(key, value)
 
