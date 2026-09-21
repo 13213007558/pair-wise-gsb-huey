@@ -17,6 +17,10 @@ The following signals are implemented by Huey:
 * ``SIGNAL_EXECUTING``: task is about to be executed.
 * ``SIGNAL_EXPIRED``: task expired.
 * ``SIGNAL_LOCKED``: failed to acquire lock, aborting task.
+* ``SIGNAL_MESSAGE_REJECTED``: a message could not be decoded, resolved to a
+  registered task, migrated to the current schema, or bound to the declared
+  signature. The original message is requeued and the task function is not
+  called.
 * ``SIGNAL_RETRYING``: task failed, but will be retried.
 * ``SIGNAL_REVOKED``: task is revoked and will not be executed.
 * ``SIGNAL_SCHEDULED``: task is not yet ready to run and has been added to the
@@ -33,6 +37,9 @@ The following signals will include additional arguments:
 
 * ``SIGNAL_ERROR``: includes a third argument ``exc``, which is the
   ``Exception`` that was raised while executing the task.
+* ``SIGNAL_MESSAGE_REJECTED``: the task argument is ``None`` and the third
+  argument is a ``MessageDecodeError`` containing the rejection reason and the
+  decoded message fields, without logging raw message payloads.
 
 .. note::
     Signals are run within the context of the consumer **except** that the

@@ -22,6 +22,7 @@ from huey.constants import WORKER_PROCESS
 from huey.constants import WORKER_THREAD
 from huey.constants import WORKER_TYPES
 from huey.exceptions import ConfigurationError
+from huey.exceptions import MessageDecodeError
 from huey.utils import time_clock
 
 
@@ -109,12 +110,26 @@ class Worker(BaseProcess):
 
     def loop(self, now=None):
         task = None
+        data = None
         try:
-            task = self.huey.dequeue()
+            data = self.huey.storage.dequeue()
         except Exception:
             self._logger.exception('Error reading from queue')
             self.sleep()
         else:
+            if data is not None:
+                try:
+                    task = self.huey.deserialize_task(data)
+                except MessageDecodeError as exc:
+                    self._logger.warning('Invalid task message; requeueing '
+                                         'original message: %s', exc.reason)
+                    try:
+                        self.huey.reject_task_message(data, exc)
+                    except Exception:
+                        self._logger.exception(
+                            'Unable to requeue invalid task message.')
+                    self.sleep()
+                    return
             if task is not None:
                 self.delay = self.default_delay
                 try:

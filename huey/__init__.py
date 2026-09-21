@@ -13,4 +13,6 @@ from huey.api import RedisHuey
 from huey.api import SqliteHuey
 from huey.api import crontab
 from huey.exceptions import CancelExecution
+from huey.exceptions import MessageDecodeError
 from huey.exceptions import RetryTask
+from huey.schema import TaskSchema

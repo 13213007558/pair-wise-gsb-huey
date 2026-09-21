@@ -19,12 +19,14 @@ from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import HueyException
+from huey.exceptions import MessageDecodeError
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.registry import Registry
 from huey.serializer import Serializer
+from huey.schema import TaskSchema
 from huey.storage import BlackHoleStorage
 from huey.storage import FileStorage
 from huey.storage import MemoryStorage
@@ -64,6 +66,9 @@ class Huey(object):
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend when immediate-mode is enabled.
+    :param str name_collision: policy when two task classes use the same task
+        name. The default ``error`` rejects duplicates; ``allow`` keeps the
+        fully-qualified task names distinct.
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -89,7 +94,7 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, always_eager=None,
-                 storage_class=None, **storage_kwargs):
+                 storage_class=None, name_collision='error', **storage_kwargs):
         if always_eager is not None:
             warnings.warn('"always_eager" parameter is deprecated, use '
                           '"immediate" instead', DeprecationWarning)
@@ -126,7 +131,7 @@ class Huey(object):
         self._post_execute = OrderedDict()
         self._startup = OrderedDict()
         self._shutdown = OrderedDict()
-        self._registry = Registry()
+        self._registry = Registry(name_collision=name_collision)
         self._signal = S.Signal()
         self._tasks_in_flight = set()
 
@@ -297,8 +302,43 @@ class Huey(object):
         return self.serializer.serialize(message)
 
     def deserialize_task(self, data):
-        message = self.serializer.deserialize(data)
-        return self._registry.create_task(message)
+        try:
+            message = self.serializer.deserialize(data)
+        except Exception as exc:
+            raise MessageDecodeError(
+                'deserialization-failed',
+                data=data,
+                original=exc)
+
+        try:
+            return self._registry.create_task(message)
+        except MessageDecodeError as exc:
+            exc.data = data
+            if exc.task_name is None and hasattr(message, 'name'):
+                exc.task_name = message.name
+            raise
+        except Exception as exc:
+            raise MessageDecodeError(
+                'invalid-message',
+                data=data,
+                message=message,
+                original=exc)
+
+    def reject_task_message(self, data, exc, timestamp=None):
+        logger.warning(
+            'Rejecting task message without acknowledging it: reason=%s '
+            'task=%s schema=%s supported=%s error=%s',
+            getattr(exc, 'reason', 'unknown'),
+            getattr(exc, 'task_name', None),
+            getattr(exc, 'schema_version', None),
+            getattr(exc, 'supported_version', None),
+            getattr(exc, 'original', exc))
+        self._emit(S.SIGNAL_MESSAGE_REJECTED, None, exc)
+        if timestamp is not None:
+            self.storage.add_to_schedule(data, timestamp)
+        else:
+            priority = getattr(getattr(exc, 'message', None), 'priority', None)
+            self.storage.enqueue(data, priority)
 
     def enqueue(self, task):
         # Resolve the expiration time when the task is enqueued.
@@ -608,8 +648,8 @@ class Huey(object):
         for msg in self.storage.read_schedule(timestamp):
             try:
                 task = self.deserialize_task(msg)
-            except Exception:
-                logger.exception('Unable to deserialize scheduled task.')
+            except MessageDecodeError as exc:
+                self.reject_task_message(msg, exc, timestamp)
             else:
                 accum.append(task)
         return accum
@@ -691,6 +731,7 @@ class Task(object):
     default_priority = None
     default_retries = 0
     default_retry_delay = 0
+    schema = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
@@ -711,6 +752,10 @@ class Task(object):
 
         self.on_complete = on_complete
         self.on_error = on_error
+        self.schema_version = self.schema.version if self.schema else None
+        self.original_schema_version = self.schema_version
+        self.original_args = self.args
+        self.original_kwargs = self.kwargs
 
     @property
     def data(self):
@@ -818,6 +863,12 @@ class TaskWrapper(object):
         self.settings = settings
         if task_base is not None:
             self.task_base = task_base
+
+        schema = settings.get('schema')
+        if schema is not None:
+            if not isinstance(schema, TaskSchema):
+                raise HueyException('schema must be a TaskSchema instance')
+            schema.bind(func, context=context)
 
         # Dynamically create task class and register with Huey instance.
         self.task_class = self.create_task(func, context, name, **settings)

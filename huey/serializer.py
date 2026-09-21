@@ -8,6 +8,7 @@ except ImportError:
     zlib = None
 import hashlib
 import hmac
+import json
 import logging
 import pickle
 import sys
@@ -131,3 +132,81 @@ class SignedSerializer(Serializer):
 
     def _deserialize(self, data):
         return super(SignedSerializer, self)._deserialize(self._unsign(data))
+
+
+class JSONSerializer(Serializer):
+    message_envelope = '__huey_message__'
+
+    def _serialize(self, data):
+        from huey.registry import Message
+        payload = self._encode_message(data, Message)
+        return json.dumps(payload, default=self._default).encode('utf-8')
+
+    def _deserialize(self, data):
+        payload = json.loads(data.decode('utf-8'))
+        from huey.registry import Message
+
+        return self._decode_message(payload, Message)
+
+    def _encode_message(self, value, message_class):
+        if isinstance(value, message_class):
+            return {
+                self.message_envelope: True,
+                'fields': list(value._fields),
+                'values': [self._encode_message(item, message_class)
+                           for item in value],
+                'schema': value.schema,
+                'original_schema': getattr(
+                    value, 'original_schema', None),
+                'original_args': self._encode_message(
+                    getattr(value, 'original_args', None), message_class),
+                'original_kwargs': self._encode_message(
+                    getattr(value, 'original_kwargs', None), message_class),
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._encode_message(item, message_class)
+                    for item in value]
+        if isinstance(value, dict):
+            return dict((key, self._encode_message(item, message_class))
+                        for key, item in value.items())
+        return value
+
+    def _decode_message(self, value, message_class):
+        if (isinstance(value, dict) and
+                value.get(self.message_envelope) is True):
+            fields = value.get('fields')
+            values = value.get('values')
+            if fields != list(message_class._fields):
+                raise ValueError('Invalid Huey JSON message fields')
+            if not isinstance(values, list):
+                raise ValueError('Invalid Huey JSON message values')
+            if len(values) != len(message_class._fields):
+                raise ValueError('Invalid Huey JSON message field count')
+            values = [self._decode_message(item, message_class)
+                      for item in values]
+            message = message_class(*values, schema=value.get('schema'))
+            for name in ('original_schema', 'original_args',
+                         'original_kwargs'):
+                if value.get(name) is not None:
+                    setattr(message, name, value[name])
+            return message
+        if isinstance(value, list):
+            return [self._decode_message(item, message_class)
+                    for item in value]
+        if isinstance(value, dict):
+            return dict((key, self._decode_message(item, message_class))
+                        for key, item in value.items())
+        return value
+
+    def _default(self, value):
+        raise TypeError('Object of type %s is not JSON serializable' %
+                        type(value).__name__)
+
+
+class SignedJSONSerializer(SignedSerializer, JSONSerializer):
+    def _serialize(self, message):
+        data = JSONSerializer._serialize(self, message)
+        return self._sign(data)
+
+    def _deserialize(self, data):
+        return JSONSerializer._deserialize(self, self._unsign(data))

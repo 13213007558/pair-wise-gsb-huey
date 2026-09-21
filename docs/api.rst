@@ -255,7 +255,7 @@ Huey object
 
             huey = RedisHuey(immediate=True)
 
-    .. py:method:: task(retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, **kwargs)
+    .. py:method:: task(retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, schema=None, **kwargs)
 
         :param int retries: number of times to retry the function if an
             unhandled exception occurs when it is executed.
@@ -271,6 +271,8 @@ Huey object
             can be either an integer (seconds), a timedelta, or a datetime. For
             relative expiration values, the expire time will be resolved when
             the task is enqueued.
+        :param TaskSchema schema: optional schema version and migrations used
+            after a message is deserialized and before the task is called.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
@@ -381,6 +383,41 @@ Huey object
 
         For more information, see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
+
+    .. py:class:: TaskSchema(version=1, migrations=None)
+
+        Declare the current parameter schema version and the migrations needed
+        to decode older messages. Migration functions receive ``(args,
+        kwargs)`` and return either ``(args, kwargs)`` or a dictionary. Huey
+        runs each migration in version order, binds the final arguments to the
+        task signature, and rejects unknown or invalid arguments instead of
+        calling the task.
+
+        .. code-block:: python
+
+            from huey.schema import TaskSchema
+
+            def migrate_v1(args, kwargs):
+                kwargs['new_name'] = kwargs.pop('old_name')
+                return args, kwargs
+
+            @huey.task(schema=TaskSchema(
+                    version=2,
+                    migrations={1: migrate_v1}))
+            def my_task(new_name):
+                ...
+
+        Messages without a schema version are treated as version ``1`` for a
+        schema-declared task. Messages from a newer producer are rejected, and
+        decoding or migration failures emit ``message-rejected`` and leave the
+        original message in the queue rather than acknowledging it. New
+        versioned messages use a wire representation that an older worker
+        cannot silently deserialize as the old task signature.
+
+        Two task classes may not reuse a bare task name in the same Huey
+        registry. This default catches rolling-deployment registration
+        conflicts. Fully-qualified names remain available by passing
+        ``name_collision="allow"`` when constructing :py:class:`Huey`.
 
     .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, **kwargs)
 
@@ -1401,6 +1438,13 @@ Serializer
     The Serializer class implements a simple interface that can be extended to
     provide your own serialization format. The default implementation uses
     ``pickle``.
+
+    :py:class:`JSONSerializer` is also provided. Huey task messages are wrapped
+    in an explicit envelope so an older JSON worker cannot mistake a new
+    versioned message for an older positional tuple and execute it with the
+    wrong signature. JSON can represent the task metadata and primitive
+    arguments supported by ``json.dumps``; pickle remains the serializer for
+    arbitrary Python result values.
 
     To override, the following methods should be implemented. Compression is
     handled transparently elsewhere in the API.
