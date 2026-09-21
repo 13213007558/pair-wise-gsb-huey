@@ -2190,16 +2190,23 @@ Serializer
         :returns: the deserialized object.
 
 
-.. py:class:: SignedSerializer(secret, salt='huey', **kwargs)
+.. py:class:: SignedSerializer(secret=None, salt='huey', key_id=None, secret_keys=None, legacy_secrets=None, allow_legacy_format=False, max_decompressed_size=16 * 1024 * 1024, **kwargs)
 
     :param str secret: secret key used to generate HMAC signatures.
     :param str salt: salt combined with the secret (default ``'huey'``).
+    :param dict secret_keys: mapping of key id to secret. Use this for rotation.
+    :param str key_id: id of the key used to sign new messages.
+    :param legacy_secrets: secrets used only to verify legacy messages.
+    :param bool allow_legacy_format: explicitly permit unsigned-envelope data
+        written by older Huey releases. Defaults to ``False``.
+    :param int max_decompressed_size: maximum decompressed payload size.
     :param kwargs: additional keyword arguments passed to the base
         :py:class:`Serializer` (e.g. ``compression``, ``use_zlib``).
 
-    A subclass of :py:class:`Serializer` that adds an HMAC-SHA1 signature to
-    every serialized message. When deserializing, the signature is verified and
-    a ``ValueError`` is raised if the message has been tampered with.
+    A subclass of :py:class:`Serializer` that writes a versioned, authenticated
+    envelope. The version, key id, compression flag and payload are all covered
+    by HMAC-SHA256. Unknown key ids and invalid signatures are rejected before
+    decompression or pickle deserialization.
 
     This is useful when the storage backend (e.g. Redis) is shared or
     network-exposed and you want to prevent malicious injection of crafted
@@ -2218,8 +2225,16 @@ Serializer
         The signed serializer detects tampering but does **not** encrypt the
         data. Task arguments remain visible in the storage backend.
 
-    Both the application and the consumer must use the same ``secret`` and
-    ``salt``.
+    The single ``secret`` form retains the original usage. Pass
+    ``allow_legacy_format=True`` to also read uncompressed and compressed
+    messages written by the old HMAC-SHA1 format; that compatibility path is
+    off by default and can be disabled again independently. Legacy compressed
+    payloads are limited by ``max_decompressed_size`` to prevent unbounded
+    memory allocation.
+
+    For rotation, supply several ``secret_keys`` and choose the active
+    ``key_id``. Messages already in storage can be verified by older key ids,
+    while new messages use only the active id.
 
 .. _exceptions:
 
@@ -2485,4 +2500,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

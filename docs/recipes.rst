@@ -365,8 +365,10 @@ Signed Serializer for Untrusted Environments
 
 By default Huey uses ``pickle`` to serialize tasks and results. If your Redis
 instance is shared or network-exposed, a malicious actor could inject a crafted
-pickle payload. The :py:class:`SignedSerializer` adds an HMAC signature to
-every message, so tampered data is rejected:
+pickle payload. The versioned :py:class:`SignedSerializer` envelope adds an
+HMAC-SHA256 signature to the version, key id, compression flag and payload.
+Huey verifies that boundary before decompressing the payload or calling
+``pickle.loads()``:
 
 .. code-block:: python
 
@@ -377,9 +379,75 @@ every message, so tampered data is rejected:
         'my-app',
         serializer=SignedSerializer(secret='my-secret-key'))
 
-The ``secret`` must be the same for both the application process and the
-consumer. If a message has been tampered with, deserialization will raise a
-``ValueError``.
+The single-``secret`` form remains supported. New messages use the default key
+id ``"default"``. Verification errors raise ``ValueError``; Huey logs only a
+fixed rejection message and never logs a secret or the payload.
+
+Rotating keys
+~~~~~~~~~~~~~
+
+Configure multiple named keys. The active ``key_id`` is used for new messages;
+all ids in ``secret_keys`` can verify messages already in the queue, schedule
+or result store.
+
+Phase 1: deploy the new code everywhere while still reading existing messages.
+The old Huey release wrote unsigned-envelope data, so reading it requires
+explicitly enabling the legacy format. The active secret is still the old
+secret at this point:
+
+.. code-block:: python
+
+    serializer = SignedSerializer(
+        secret='2025-01-secret',
+        allow_legacy_format=True,
+        max_decompressed_size=16 * 1024 * 1024)
+
+Phase 2: introduce a replacement key without invalidating old queue messages.
+New messages are written with ``2026-09``, while versioned messages signed with
+``2025-01`` and old-envelope messages remain readable:
+
+.. code-block:: python
+
+    serializer = SignedSerializer(
+        secret_keys={
+            '2025-01': '2025-01-secret',
+            '2026-09': 'new-key'},
+        key_id='2026-09',
+        legacy_secrets=['2025-01-secret'],
+        allow_legacy_format=True,
+        max_decompressed_size=16 * 1024 * 1024)
+
+Phase 3: after every queued task, scheduled message and retained result signed
+with old material has drained, stop accepting the old format independently:
+
+.. code-block:: python
+
+    serializer = SignedSerializer(
+        secret_keys={
+            '2025-01': '2025-01-secret',
+            '2026-09': 'new-key'},
+        key_id='2026-09',
+        allow_legacy_format=False)
+
+Phase 4: after all versioned messages that still use the old key id have
+drained, remove that key so it can no longer verify anything:
+
+.. code-block:: python
+
+    serializer = SignedSerializer(
+        secret_keys={'2026-09': 'new-key'},
+        key_id='2026-09',
+        allow_legacy_format=False)
+
+During a zero-downtime deployment, upgrade consumers before producers in Phase
+1. Old consumers cannot understand the new versioned envelope, so producers
+must not switch to it until all consumers can read it. In Phase 2 the new
+``key_id`` immediately prevents new messages from using a compromised key,
+while old queue messages continue to be accepted.
+
+Legacy compressed messages are decompressed while recovering the signed
+pickle, but decompression is bounded by ``max_decompressed_size``. Set this
+limit to the largest legitimate compressed result you expect to store.
 
 .. note::
     The signed serializer does **not** encrypt the data, it only detects
