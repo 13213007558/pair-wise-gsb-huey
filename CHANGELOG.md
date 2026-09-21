@@ -3,6 +3,13 @@ Changelog
 
 ## master
 
+* Fix a race where two consumers checking the same `revoke_once` flag
+  could both observe the revoked state, causing the task to never run.
+  Consuming a one-shot (or expired) revocation flag is now an atomic
+  compare-and-delete against the storage layer (`Storage.delete_if_value()`),
+  so exactly one worker observes the revocation and any others execute the
+  task normally. Custom storage backends must implement
+  `delete_if_value()` atomically; the base class raises `NotImplementedError`.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

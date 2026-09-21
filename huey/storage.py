@@ -224,6 +224,20 @@ class BaseStorage(object):
         """
         return self.pop_data(key) is not EmptyData
 
+    def delete_if_value(self, key, value):
+        """
+        Atomically delete the value at the given key, but only if the
+        currently-stored value is exactly equal to the given value. This
+        compare-and-delete operation must be atomic with respect to other
+        readers and writers, including those in other processes.
+
+        :param bytes key: Key to conditionally delete.
+        :param bytes value: Expected value.
+        :return: Boolean indicating whether the key was deleted.
+        """
+        raise NotImplementedError('atomic compare-and-delete is not '
+                                  'implemented by this storage backend')
+
     def has_data_for_key(self, key):
         """
         Return whether there is data for the given key.
@@ -321,6 +335,7 @@ class BlackHoleStorage(BaseStorage):
     def put_data(self, key, value, is_result=False): pass
     def peek_data(self, key): return EmptyData
     def pop_data(self, key): return EmptyData
+    def delete_if_value(self, key, value): return False
     def has_data_for_key(self, key): return False
     def put_if_empty(self, key, value, ttl=None): return True
     def incr(self, key, amount=1): return amount
@@ -415,6 +430,14 @@ class MemoryStorage(BaseStorage):
         self._expire(key)
         return self._results.pop(key, EmptyData)
 
+    def delete_if_value(self, key, value):
+        with self._lock:
+            self._expire(key)
+            if self._results.get(key, EmptyData) != value:
+                return False
+            del self._results[key]
+            return True
+
     def has_data_for_key(self, key):
         self._expire(key)
         return key in self._results
@@ -461,6 +484,21 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+# Atomically delete a hash field only if its current value matches the
+# expected value. Returns 1 when the field was deleted, 0 otherwise.
+DELETE_IF_VALUE_LUA = """\
+if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then
+    return redis.call('hdel', KEYS[1], ARGV[1])
+end
+return 0"""
+
+# Same as above, but for storages that use a top-level key per value.
+DELETE_KEY_IF_VALUE_LUA = """\
+if redis.call('get', KEYS[1]) == ARGV[1] then
+    return redis.call('del', KEYS[1])
+end
+return 0"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
@@ -496,6 +534,7 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._delete_if_value = self.conn.register_script(DELETE_IF_VALUE_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
         self.queue_key = 'huey.redis.%s' % self.name
@@ -631,6 +670,10 @@ class RedisStorage(BaseStorage):
     def delete_data(self, key):
         return self.conn.hdel(self.result_key, key) != 0
 
+    def delete_if_value(self, key, value):
+        return bool(self._delete_if_value(keys=[self.result_key],
+                                          args=[key, value]))
+
     def wait_result(self, key, timeout=None, backoff=1.15, max_delay=1.0):
         if not self.notify_result:
             return super(RedisStorage, self).wait_result(key, timeout,
@@ -694,6 +737,8 @@ class RedisExpireStorage(RedisStorage):
         super(RedisExpireStorage, self).__init__(name, *args, **kwargs)
 
         self._expire_time = expire_time
+        self._delete_key_if_value = self.conn.register_script(
+            DELETE_KEY_IF_VALUE_LUA)
 
         self.result_prefix = rp = b'huey.r.%s.' % self.name.encode('utf8')
         self.counter_prefix = cp = b'huey.c.%s.' % self.name.encode('utf8')
@@ -727,6 +772,10 @@ class RedisExpireStorage(RedisStorage):
 
     def delete_data(self, key):
         return self.conn.delete(self.result_key(key))
+
+    def delete_if_value(self, key, value):
+        return bool(self._delete_key_if_value(keys=[self.result_key(key)],
+                                              args=[value]))
 
     def has_data_for_key(self, key):
         return self.conn.exists(self.result_key(key)) != 0
@@ -1061,6 +1110,13 @@ class SqliteStorage(BaseSqlStorage):
         return bool(self.sql('select 1 from kv where queue=? and key=?',
                              (self.name, key), results=True))
 
+    def delete_if_value(self, key, value):
+        # A single DELETE statement is atomic, even across connections.
+        with self.db(commit=True) as curs:
+            curs.execute('delete from kv where queue = ? and key = ? and '
+                         'value = ?', (self.name, key, self.to_blob(value)))
+            return curs.rowcount == 1
+
     def put_if_empty(self, key, value, ttl=None):
         if ttl is not None:
             raise NotImplementedError('ttl is not supported by this storage.')
@@ -1394,6 +1450,14 @@ class PostgresStorage(BaseSqlStorage):
                              'key = %s'.format(self.table_kv),
                              (self.name, self._key(key)), results=True))
 
+    def delete_if_value(self, key, value):
+        # A single DELETE statement is atomic, even across connections.
+        with self.db() as curs:
+            curs.execute('delete from {} where queue = %s and key = %s and '
+                         'value = %s'.format(self.table_kv),
+                        (self.name, self._key(key), value))
+            return curs.rowcount == 1
+
     def put_if_empty(self, key, value, ttl=None):
         if ttl is not None:
             raise NotImplementedError('ttl is not supported by this storage.')
@@ -1655,6 +1719,22 @@ class FileStorage(BaseStorage):
 
         # If file is corrupt or has been tampered with, return EmptyData.
         return value if value is not None else EmptyData
+
+    def delete_if_value(self, key, value):
+        filename = self.path_for_key(key)
+
+        with self.lock:
+            if not os.path.exists(filename):
+                return False
+
+            with open(filename, 'rb') as fh:
+                _, stored_value = self._unpack_result(fh.read())
+
+            if stored_value is None or stored_value != value:
+                return False
+
+            os.unlink(filename)
+            return True
 
     def has_data_for_key(self, key):
         return os.path.exists(self.path_for_key(key))

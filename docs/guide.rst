@@ -725,8 +725,21 @@ API docs:
 * :py:meth:`Result.is_revoked` for checking the status of a task instance.
 * :py:meth:`TaskWrapper.revoke` and :py:meth:`TaskWrapper.restore` for revoking
   all instances of a task.
-* :py:meth:`TaskWrapper.is_revoked` for checking the status of the task
-  function itself.
+ * :py:meth:`TaskWrapper.is_revoked` for checking the status of the task
+   function itself.
+
+.. note::
+    When the consumer executes a task, the revocation check and the
+    consumption of a one-shot (``revoke_once``) or expired revocation flag
+    are performed as a single atomic compare-and-delete against the storage
+    layer. This means that if the same task is checked concurrently by
+    multiple workers -- for example after a duplicate delivery or requeue --
+    exactly one worker will observe the one-shot revocation and skip the
+    task, while the others execute it normally. Because consumption is a
+    single storage operation and no lock or lease is held, a worker crash
+    cannot leave the flag in a stuck state: a crash before the check leaves
+    the revocation in place for the next execution, and a crash after the
+    check simply counts as the one permitted consumption.
 
 Canceling from within a Task
 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^

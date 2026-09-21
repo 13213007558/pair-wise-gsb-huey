@@ -249,6 +249,15 @@ class SqlStorage(BaseStorage):
         self.check_conn()
         return self.kv().where(self.KV.key == key).exists()
 
+    def delete_if_value(self, key, value):
+        # A single DELETE statement is atomic, even across connections.
+        self.check_conn()
+        dq = self.KV.delete().where(
+            (self.KV.queue == self.name) &
+            (self.KV.key == key) &
+            (self.KV.value == value))
+        return dq.execute() == 1
+
     def put_if_empty(self, key, value, ttl=None):
         if ttl is not None:
             raise NotImplementedError('ttl is not supported by this storage.')

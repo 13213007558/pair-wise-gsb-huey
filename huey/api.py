@@ -712,11 +712,8 @@ class Huey(object):
         if isinstance(task, TaskWrapper):
             task = task.task_class
         if inspect.isclass(task) and issubclass(task, Task):
-            data = self.storage.peek_data(self._task_key(task, 'rt'))
-            is_revoked, can_restore = self._check_revoked(data, timestamp, peek)
-            if can_restore:
-                self.restore_all(task)
-            return is_revoked
+            return self._is_revoked_key(self._task_key(task, 'rt'),
+                                        timestamp, peek)
 
         if isinstance(task, Result):
             task = task.task
@@ -727,16 +724,40 @@ class Huey(object):
         rt_key = self._task_key(type(task), 'rt')
         keys = [task.revoke_id] if by_id else [task.revoke_id, rt_key]
         data = self.storage.peek_many(keys)
-        is_revoked, can_restore = self._check_revoked(
-            data.get(task.revoke_id, EmptyData), timestamp, peek)
-        if can_restore:
-            self.restore(task)
-        if not is_revoked and not by_id:
-            is_revoked, can_restore = self._check_revoked(
-                data.get(rt_key, EmptyData), timestamp, peek)
-            if can_restore:
-                self.restore_all(type(task))
+        if self._is_revoked_key(task.revoke_id, timestamp, peek,
+                                data.get(task.revoke_id, EmptyData)):
+            return True
+        if by_id:
+            return False
+        return self._is_revoked_key(rt_key, timestamp, peek,
+                                    data.get(rt_key, EmptyData))
 
+    def _is_revoked_key(self, key, timestamp, peek, data=EmptyData):
+        # Evaluate the revocation flag stored at the given key. When peek is
+        # False and the flag is one-shot (or an expired timestamp), the flag
+        # is consumed atomically using a compare-and-delete, so that exactly
+        # one caller observes the consumed state -- even when multiple
+        # consumers, potentially in different processes, check the same flag
+        # concurrently. If the compare-and-delete fails, the flag was
+        # concurrently consumed or replaced, so it is re-read and
+        # re-evaluated rather than acting on a stale decision.
+        if data is EmptyData:
+            data = self.storage.peek_data(key)
+
+        # The number of attempts is bounded so that pathological contention
+        # (the flag being repeatedly rewritten) cannot livelock the caller.
+        # If no attempt succeeds, the last evaluation is returned without
+        # consuming the flag, leaving it for a subsequent check.
+        for _ in range(3):
+            is_revoked, can_restore = self._check_revoked(data, timestamp,
+                                                          peek)
+            if not can_restore:
+                return is_revoked
+            if self.storage.delete_if_value(key, data):
+                return is_revoked
+            data = self.storage.peek_data(key)
+
+        is_revoked, _ = self._check_revoked(data, timestamp, peek=True)
         return is_revoked
 
     def add_schedule(self, task):

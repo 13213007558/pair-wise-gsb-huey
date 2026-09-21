@@ -10,6 +10,7 @@ from glide_sync import Transaction
 from huey.api import RedisHuey
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
+from huey.storage import DELETE_IF_VALUE_LUA
 from huey.storage import RedisStorage
 from huey.storage import SCHEDULE_POP_LUA
 
@@ -35,6 +36,7 @@ class ValkeyGlideStorage(RedisStorage):
             self.conn = GlideClient.create(config)
 
         self._pop = Script(SCHEDULE_POP_LUA)
+        self._delete_if_value = Script(DELETE_IF_VALUE_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
@@ -110,6 +112,10 @@ class ValkeyGlideStorage(RedisStorage):
 
     def delete_data(self, key):
         return self.conn.hdel(self.result_key, [key]) != 0
+
+    def delete_if_value(self, key, value):
+        return bool(self.conn.invoke_script(
+            self._delete_if_value, keys=[self.result_key], args=[key, value]))
 
     def flush_queue(self):
         self.conn.delete([self.queue_key])

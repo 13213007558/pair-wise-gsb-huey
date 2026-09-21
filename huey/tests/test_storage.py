@@ -71,6 +71,46 @@ class StorageTests(object):
                          {'k1': b'v1', 'k2': b'v2'})
         self.assertEqual(self.s.peek_many(['kx']), {})
 
+    def test_delete_if_value(self):
+        self.s.put_data('k1', b'v1')
+
+        # Mismatched value: key is not deleted.
+        self.assertFalse(self.s.delete_if_value('k1', b'vx'))
+        self.assertEqual(self.s.peek_data('k1'), b'v1')
+
+        # Matching value: key is deleted atomically.
+        self.assertTrue(self.s.delete_if_value('k1', b'v1'))
+        self.assertTrue(self.s.peek_data('k1') is EmptyData)
+
+        # Missing key: nothing to delete.
+        self.assertFalse(self.s.delete_if_value('k1', b'v1'))
+        self.assertFalse(self.s.delete_if_value('kx', b'v1'))
+
+    def test_delete_if_value_concurrent(self):
+        # Exactly one caller wins the race to delete a given key/value.
+        self.s.put_data('k1', b'v1')
+        nthreads = 8
+        barrier = threading.Barrier(nthreads)
+        results = []
+        results_lock = threading.Lock()
+
+        def delete():
+            barrier.wait(timeout=10)
+            result = self.s.delete_if_value('k1', b'v1')
+            with results_lock:
+                results.append(result)
+
+        threads = [threading.Thread(target=delete) for _ in range(nthreads)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(15)
+            self.assertFalse(thread.is_alive())
+
+        self.assertEqual(len(results), nthreads)
+        self.assertEqual(sum(1 for r in results if r), 1)
+        self.assertTrue(self.s.peek_data('k1') is EmptyData)
+
     def test_result_items_str_keys(self):
         # Task ids are stored as str, and every backend returns them as str.
         self.s.put_data('k1', b'v1')
