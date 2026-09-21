@@ -245,6 +245,16 @@ class SqlStorage(BaseStorage):
                     (self.KV.key == key))
                 return kv.value if dq.execute() == 1 else EmptyData
 
+    def delete_if_value(self, key, value):
+        self.check_conn()
+        with self.database.atomic():
+            deleted = (self.KV.delete()
+                       .where((self.KV.queue == self.name) &
+                              (self.KV.key == key) &
+                              (self.KV.value == value))
+                       .execute())
+        return deleted == 1
+
     def has_data_for_key(self, key):
         self.check_conn()
         return self.kv().where(self.KV.key == key).exists()

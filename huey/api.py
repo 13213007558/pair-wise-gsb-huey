@@ -708,10 +708,94 @@ class Huey(object):
             # Task is still revoked. Do not restore.
             return True, False
 
+    def _consume_revoked_key(self, key, data, timestamp):
+        """
+        Consume a single revocation key as part of a task-execution decision.
+
+        Returns a 3-tuple ``(is_revoked, handled, data)`` where ``handled``
+        indicates the key yielded a definitive decision for the caller and
+        ``data`` is the current raw value of the key after a lost
+        compare-and-delete race (so callers can retry without another read).
+
+        When the key must be removed (expired revocation or one-shot
+        ``revoke_once``), the removal is an atomic compare-and-delete so that
+        exactly one consumer can consume a given revocation value across
+        processes. A failed comparison means the key was rewritten (e.g. a
+        fresh ``revoke()``) since it was read: nothing is consumed and the
+        key is re-evaluated against the new value instead of silently
+        treating the marker as consumed.
+        """
+        if data is EmptyData:
+            return False, True, data
+
+        revoke_until, revoke_once = self.serializer.deserialize(data)
+        if revoke_until is not None and timestamp is None:
+            timestamp = self._get_timestamp()
+
+        if revoke_once:
+            # Exactly one consumer gets to consume this revocation.
+            if self.storage.delete_if_value(key, data):
+                return True, True, data
+            # The key was changed by another writer since we read it. The new
+            # value is supplied by the caller via another round-trip.
+            return False, False, EmptyData
+
+        if revoke_until is not None and revoke_until <= timestamp:
+            # The revocation window elapsed. Remove the stale marker, but
+            # never let a lost race masquerade as a consumed expiry.
+            if self.storage.delete_if_value(key, data):
+                return False, True, data
+            return False, False, EmptyData
+
+        # Persistent revocation that is still in effect: nothing to consume.
+        return True, True, data
+
+    def _is_revoked_for_execution(self, task, timestamp):
+        """
+        Atomic-with-the-execution-decision variant of :meth:`is_revoked`.
+        One-shot (``revoke_once``) and expired markers are consumed using the
+        storage's compare-and-delete primitive, so at most one worker can
+        observe a given marker as consumed; persistent revocations are left
+        untouched. Markers changed concurrently (a new revoke/restore) are
+        re-read and re-evaluated rather than consumed as best effort.
+        """
+        by_class = inspect.isclass(task) and issubclass(task, Task)
+        by_id = not by_class and not isinstance(task, Task)
+        if by_id:
+            task = Task(id=task)
+
+        if timestamp is None:
+            timestamp = self._get_timestamp()
+
+        # A task class only carries the class-level revocation; an instance
+        # first checks its per-instance key then the class-level key, while an
+        # id only checks its own per-instance key.
+        if by_class:
+            keys = [self._task_key(task, 'rt')]
+        elif by_id:
+            keys = [task.revoke_id]
+        else:
+            keys = [task.revoke_id, self._task_key(type(task), 'rt')]
+
+        for revoke_key in keys:
+            data = self.storage.peek_data(revoke_key)
+            while True:
+                is_revoked, handled, data = self._consume_revoked_key(
+                    revoke_key, data, timestamp)
+                if handled:
+                    break
+                data = self.storage.peek_data(revoke_key)
+            if is_revoked:
+                return True
+
+        return False
+
     def is_revoked(self, task, timestamp=None, peek=True):
         if isinstance(task, TaskWrapper):
             task = task.task_class
         if inspect.isclass(task) and issubclass(task, Task):
+            if not peek:
+                return self._is_revoked_for_execution(task, timestamp)
             data = self.storage.peek_data(self._task_key(task, 'rt'))
             is_revoked, can_restore = self._check_revoked(data, timestamp, peek)
             if can_restore:
@@ -723,6 +807,9 @@ class Huey(object):
         by_id = not isinstance(task, Task)
         if by_id:
             task = Task(id=task)
+
+        if not peek:
+            return self._is_revoked_for_execution(task, timestamp)
 
         rt_key = self._task_key(type(task), 'rt')
         keys = [task.revoke_id] if by_id else [task.revoke_id, rt_key]

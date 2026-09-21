@@ -803,6 +803,37 @@ At any time, the task can be restored using the usual
 :py:meth:`~TaskWrapper.restore` method, and it's status can be checked using
 the :py:meth:`~TaskWrapper.is_revoked` method.
 
+One-shot revocation and concurrency
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When a consumer makes the decision to execute a task, consuming a
+``revoke_once`` marker is performed as an *atomic compare-and-delete*
+operation in the storage backend (Lua scripts on Redis, an exclusive
+transaction on SQLite, a single ``DELETE ... RETURNING`` statement on
+Postgres, and so on). This guarantees that when multiple consumers race over
+the same revoked task, at most one of them consumes (and skips on account of)
+a given marker; every other consumer proceeds normally. This does not rely on
+in-process locks, so it works across worker processes and machines.
+
+The semantics are:
+
+* A ``revoke_once`` marker is consumed by exactly one execution decision.
+  If a worker crashes after dequeueing a task but before making that
+  decision, the marker remains stored and is consumed by the next occurrence
+  (e.g. a re-enqueued replacement); it is never held by the dead worker.
+* A task that fails and is automatically retried makes a fresh execution
+  decision for the retry. The one-shot marker was already consumed by the
+  first occurrence, so the retry is not revoked again.
+* Re-enqueueing the same task (same id) after it was skipped behaves like
+  any new occurrence: the marker is gone, so the task runs.
+* If the marker is rewritten by another writer between the read and the
+  compare-and-delete (e.g. a new ``revoke()`` or ``restore()``), the consumer
+  re-reads and honors the new value instead of silently consuming a stale
+  marker.
+* Persistent revocations (and revocations with ``revoke_until`` still in the
+  future) are never consumed. When ``revoke_until`` has elapsed, the stale
+  marker is removed atomically and the task executes.
+
 Task expiration
 ---------------
 

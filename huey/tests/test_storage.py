@@ -71,6 +71,17 @@ class StorageTests(object):
                          {'k1': b'v1', 'k2': b'v2'})
         self.assertEqual(self.s.peek_many(['kx']), {})
 
+    def test_delete_if_value(self):
+        self.s.put_data(b'k', b'v1')
+        # Missing key and value mismatch delete nothing.
+        self.assertFalse(self.s.delete_if_value(b'missing', b'v1'))
+        self.assertFalse(self.s.delete_if_value(b'k', b'other'))
+        self.assertEqual(self.s.peek_data(b'k'), b'v1')
+        # Exact match consumes the key exactly once.
+        self.assertTrue(self.s.delete_if_value(b'k', b'v1'))
+        self.assertEqual(self.s.peek_data(b'k'), EmptyData)
+        self.assertFalse(self.s.delete_if_value(b'k', b'v1'))
+
     def test_result_items_str_keys(self):
         # Task ids are stored as str, and every backend returns them as str.
         self.s.put_data('k1', b'v1')

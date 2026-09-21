@@ -3,6 +3,14 @@ Changelog
 
 ## master
 
+* Consuming a `revoke_once` marker is now atomic with the task-execution
+  decision across processes. Each storage backend provides a
+  compare-and-delete primitive (`delete_if_value`) used to remove a marker
+  only when its value is unchanged, so at most one worker can consume a given
+  one-shot revocation; a marker rewritten concurrently (fresh revoke/restore)
+  is re-read and honored instead of being silently consumed. Backends without
+  an implementation raise `NotImplementedError` rather than degrading to a
+  best-effort read-then-delete.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can
