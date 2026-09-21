@@ -19,6 +19,7 @@ from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
+from huey.exceptions import ResultMissing
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
@@ -441,6 +442,11 @@ class Huey(object):
             return self._execute(task, timestamp)
 
     def _execute(self, task, timestamp):
+        if self._task_handoff_tracked(task):
+            completed = self._get_terminal_state(task)
+            if completed is not None:
+                return self._resume_completed_task(task, completed)
+
         if self._pre_execute:
             try:
                 self._run_pre_execute(task)
@@ -525,8 +531,17 @@ class Huey(object):
         surface_error = (exception is not None and
                          (self.store_intermediate_errors or not task.retries))
 
+        acknowledged = True
+        if exception is None and self._task_handoff_tracked(task):
+            acknowledged = self._acknowledge_completion(
+                task, exception, task_value)
+        elif (exception is not None and not task.retries and
+              self._task_handoff_tracked(task)):
+            acknowledged = self._acknowledge_completion(
+                task, exception, task_value)
+
         if self.results and not isinstance(task, PeriodicTask):
-            if surface_error:
+            if exception is not None and surface_error:
                 error_data = self.build_error_result(task, exception)
                 self.put_result(task.id, Error(error_data))
                 next_task = task.on_complete if not task.retries else None
@@ -544,23 +559,31 @@ class Huey(object):
             # Task executed successfully, send the COMPLETE signal.
             self._emit(S.SIGNAL_COMPLETE, task)
 
-        if task.on_complete and exception is None:
+        if acknowledged and task.on_complete and exception is None:
             next_task = task.on_complete
             next_task.extend_data(task_value)
-            self.enqueue(next_task)
-        elif task.on_error and surface_error:
+            if self._pipeline_tracked(task):
+                self._enqueue_if_unclaimed(next_task)
+            else:
+                self.enqueue(next_task)
+        elif acknowledged and task.on_error and surface_error:
             # Fire with only this attempt's exception; copy so the append does
             # not accumulate on the shared handler when the task is retried.
             next_task = copy.copy(task.on_error)
             next_task.extend_data(exception)
-            self.enqueue(next_task)
+            if task.retries:
+                self.enqueue(next_task)
+            elif not self._pipeline_tracked(task):
+                self.enqueue(next_task)
+            else:
+                self._enqueue_if_unclaimed(next_task)
 
         if exception is None:
             # Only the task carrying the chord_config reports its success. An
             # intermediate pipeline stage hands off to on_complete instead.
             if task.chord_config is not None:
                 self._check_chord(task.chord_config, task_value)
-        elif not task.retries:
+        elif exception is not None and not task.retries:
             error = Error(self.build_error_result(task, exception))
             self._abort_chord_member(task, error)
 
@@ -569,6 +592,86 @@ class Huey(object):
             self._requeue_task(task, self._get_timestamp(), retry_eta)
 
         return task_value
+
+    def _completion_key(self, task):
+        return 'a:%s' % task.id
+
+    def _get_ack_state(self, task):
+        data = self.get_raw(self._completion_key(task), peek=True)
+        if data is EmptyData:
+            return
+        return self.serializer.deserialize(data)
+
+    def _get_terminal_state(self, task):
+        state = self._get_ack_state(task)
+        if state in ('ok', 'none', 'error'):
+            return state
+
+    def _task_handoff_tracked(self, task):
+        if not self.results or self._immediate:
+            return False
+        if isinstance(task, PeriodicTask):
+            return False
+        if task.on_complete is not None:
+            return True
+        return self._get_ack_state(task) is not None
+
+    def _pipeline_tracked(self, task):
+        return (self.results and not self._immediate and
+                not isinstance(task, PeriodicTask) and
+                task.on_complete is not None)
+
+    def _acknowledge_completion(self, task, exception, task_value):
+        if exception is None:
+            state = 'none' if task_value is None else 'ok'
+        else:
+            state = 'error'
+        self.put_result(self._completion_key(task), state)
+        return True
+
+    def _completion_result(self, task, state):
+        if state == 'none':
+            return None
+        if state == 'error':
+            data = self.get_raw(task.id, peek=True)
+            if data is EmptyData:
+                raise ResultMissing(task.id, 'missing')
+            result = self.serializer.deserialize(data)
+            if not isinstance(result, Error):
+                raise ResultMissing(task.id, 'invalid')
+            return result
+
+        data = self.get_raw(task.id, peek=True)
+        if data is EmptyData:
+            raise ResultMissing(task.id, 'missing')
+        result = self.serializer.deserialize(data)
+        if isinstance(result, Error):
+            raise ResultMissing(task.id, 'invalid')
+        return result
+
+    def _resume_completed_task(self, task, state):
+        if state == 'error':
+            result = self._completion_result(task, state)
+            if task.on_error:
+                next_task = copy.copy(task.on_error)
+                next_task.extend_data(result.metadata)
+                self._enqueue_if_unclaimed(next_task)
+
+            self._abort_chord_member(task, result)
+            return
+
+        value = self._completion_result(task, state)
+        if task.on_complete:
+            next_task = task.on_complete
+            next_task.extend_data(value)
+            self._enqueue_if_unclaimed(next_task)
+        if task.chord_config is not None:
+            self._check_chord(task.chord_config, value)
+        return value
+
+    def _enqueue_if_unclaimed(self, task):
+        if self.put_if_empty(self._completion_key(task), 'queued'):
+            self.enqueue(task)
 
     def _abort_chord_member(self, task, value):
         # The dead task will never run its on_complete chain, so a chord

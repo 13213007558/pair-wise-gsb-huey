@@ -4,6 +4,7 @@ from huey.api import Result
 from huey.api import Task
 from huey.contrib.asyncio import aget_result
 from huey.contrib.asyncio import aget_result_group
+from huey.exceptions import RetryTask
 from huey.exceptions import ResultTimeout
 from huey.exceptions import TaskException
 from huey.tests.base import BaseTestCase
@@ -47,3 +48,45 @@ class TestAsyncioHelpers(BaseTestCase):
         async def main():
             return await aget_result_group(task_a.map([1, 2, 3]))
         self.assertEqual(asyncio.run(main()), [2, 3, 4])
+
+    def test_aget_pipeline_after_retry_success(self):
+        attempts = [0]
+
+        @self.huey.task(retries=1)
+        def first():
+            attempts[0] += 1
+            if attempts[0] == 1:
+                raise RetryTask()
+            return 2
+
+        @self.huey.task()
+        def second(value):
+            return value + 1
+
+        results = self.huey.enqueue(first.s().then(second))
+
+        async def main():
+            return await aget_result_group(results)
+
+        self.assertEqual(asyncio.run(main()), [2, 3])
+        self.assertEqual(attempts, [2])
+
+    def test_aget_pipeline_after_retry_failure(self):
+        attempts = [0]
+
+        @self.huey.task(retries=1)
+        def first():
+            attempts[0] += 1
+            raise ValueError('failed')
+
+        @self.huey.task()
+        def second(value):
+            return value
+
+        results = self.huey.enqueue(first.s().then(second))
+
+        async def main():
+            return await aget_result_group(results)
+
+        self.assertRaises(TaskException, lambda: asyncio.run(main()))
+        self.assertEqual(attempts, [2])

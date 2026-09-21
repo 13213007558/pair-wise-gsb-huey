@@ -1,6 +1,8 @@
 import asyncio
 import datetime
 import inspect
+import os
+import tempfile
 import time
 
 from huey.api import ChordResult
@@ -8,6 +10,7 @@ from huey.api import MemoryHuey
 from huey.api import PeriodicTask
 from huey.api import Result
 from huey.api import ResultGroup
+from huey.api import SqliteHuey
 from huey.api import Task
 from huey.api import TaskWrapper
 from huey.api import chord
@@ -18,6 +21,7 @@ from huey.exceptions import CancelExecution
 from huey.exceptions import RateLimitExceeded
 from huey.exceptions import ResultTimeout
 from huey.exceptions import ConfigurationError
+from huey.exceptions import ResultMissing
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
@@ -2619,6 +2623,249 @@ class TestTaskChaining(BaseTestCase):
         self.assertEqual(r1(), 0)
         self.assertRaises(TaskException, r2.get)
         self.assertEqual(len(self.huey), 0)
+
+
+class PipelineIdempotenceTests(object):
+    def restart_storage(self):
+        pass
+
+    def execute_raw(self, raw):
+        return self.huey.execute(self.huey.deserialize_task(raw))
+
+    def assert_ack_state(self, result, state):
+        self.assertEqual(self.huey.get('a:%s' % result.id, peek=True), state)
+
+    def test_pipeline_retry_success_is_forwarded_once(self):
+        counts = [0, 0, 0]
+
+        @self.huey.task(retries=1)
+        def first(value):
+            counts[0] += 1
+            if counts[0] == 1:
+                raise RetryTask()
+            return value
+
+        @self.huey.task()
+        def second(value):
+            counts[1] += 1
+            return value + 1
+
+        @self.huey.task()
+        def third(value):
+            counts[2] += 1
+            return value + 100
+
+        r_first, r_second, r_third = self.huey.enqueue(
+            first.s(1).then(second).then(third))
+        raw_first = self.huey.storage.enqueued_items()[0]
+
+        self.assertTrue(self.execute_next() is None)  # Failed attempt.
+        self.assertEqual(self.execute_next(), 1)  # Successful retry.
+        raw_second = self.huey.storage.enqueued_items()[0]
+
+        self.restart_storage()
+
+        self.assertEqual(self.execute_next(), 2)
+        raw_third = self.huey.storage.enqueued_items()[0]
+        self.assertEqual(self.execute_next(), 102)
+        self.assertEqual(len(self.huey), 0)
+
+        # Redelivering any already-terminal message must not execute the node
+        # or enqueue another confirmed downstream callback.
+        self.assertEqual(self.execute_raw(raw_first), 1)
+        self.assertEqual(self.execute_raw(raw_second), 2)
+        self.assertEqual(self.execute_raw(raw_third), 102)
+        self.assertEqual(len(self.huey), 0)
+
+        self.assertEqual(counts, [2, 1, 1])
+        expected = [1, 2, 102]
+        for result, value in zip((r_first, r_second, r_third), expected):
+            result.reset()
+            self.assertEqual(result.get(preserve=True), value)
+            self.assertEqual(
+                self.huey.get(result.id, peek=True), value)
+            self.assert_ack_state(result, 'ok')
+        self.assertEqual([r.reset() or r.get(preserve=True) for r in
+                          (r_first, r_second, r_third)], expected)
+
+    def test_pipeline_retry_failure_does_not_run_downstream(self):
+        counts = [0, 0, 0]
+
+        @self.huey.task(retries=1)
+        def first():
+            counts[0] += 1
+            raise TestError('boom')
+
+        @self.huey.task()
+        def second(value):
+            counts[1] += 1
+            return value
+
+        @self.huey.task()
+        def third(value):
+            counts[2] += 1
+            return value
+
+        r_first, r_second, r_third = self.huey.enqueue(
+            first.s().then(second).then(third))
+        raw_first = self.huey.storage.enqueued_items()[0]
+
+        self.assertTrue(self.execute_next() is None)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(len(self.huey), 0)
+        self.execute_raw(raw_first)
+
+        self.assertEqual(counts, [2, 0, 0])
+        for result in (r_first, r_second, r_third):
+            result.reset()
+            self.assertRaises(TaskException, result.get, preserve=True)
+            self.assertIsInstance(
+                self.huey.get(result.id, peek=True), Error)
+        self.assert_ack_state(r_first, 'error')
+
+    def test_pipeline_callback_retry_success_is_forwarded_once(self):
+        counts = [0, 0, 0]
+
+        @self.huey.task()
+        def first(value):
+            counts[0] += 1
+            return value
+
+        @self.huey.task(retries=1)
+        def second(value):
+            counts[1] += 1
+            if counts[1] == 1:
+                raise RetryTask()
+            return value
+
+        @self.huey.task()
+        def third(value):
+            counts[2] += 1
+            return value + 10
+
+        r_first, r_second, r_third = self.huey.enqueue(
+            first.s(1).then(second).then(third))
+        self.assertEqual(self.execute_next(), 1)
+        self.assertTrue(self.execute_next() is None)
+        raw_retry = self.huey.storage.enqueued_items()[0]
+        self.assertEqual(self.execute_next(), 1)
+        self.assertEqual(self.execute_next(), 11)
+
+        self.assertEqual(self.execute_raw(raw_retry), 1)
+        self.assertEqual(counts, [1, 2, 1])
+        self.assertEqual(r_first.get(preserve=True), 1)
+        self.assertEqual(r_second.get(preserve=True), 1)
+        self.assertEqual(r_third.get(preserve=True), 11)
+        self.assertEqual(len(self.huey), 0)
+
+    def test_pipeline_callback_failure_does_not_advance(self):
+        counts = [0, 0, 0]
+
+        @self.huey.task()
+        def first(value):
+            counts[0] += 1
+            return value
+
+        @self.huey.task(retries=1)
+        def second(value):
+            counts[1] += 1
+            raise TestError('callback failed')
+
+        @self.huey.task()
+        def third(value):
+            counts[2] += 1
+            return value
+
+        r_first, r_second, r_third = self.huey.enqueue(
+            first.s(1).then(second).then(third))
+        self.assertEqual(self.execute_next(), 1)
+        self.assertTrue(self.execute_next() is None)  # Retryable failure.
+        raw_second = self.huey.storage.enqueued_items()[0]
+        self.assertTrue(self.execute_next() is None)  # Final failure.
+        self.execute_raw(raw_second)
+
+        self.assertEqual(counts, [1, 2, 0])
+        self.assertEqual(r_first.get(preserve=True), 1)
+        for result in (r_second, r_third):
+            self.assertRaises(TaskException, result.get, preserve=True)
+        self.assert_ack_state(r_second, 'error')
+        self.assertEqual(len(self.huey), 0)
+
+    def test_completed_none_is_not_treated_as_missing(self):
+        counts = [0, 0]
+
+        @self.huey.task()
+        def first():
+            counts[0] += 1
+            return None
+
+        @self.huey.task()
+        def second():
+            counts[1] += 1
+            return 'done'
+
+        r_first, r_second = self.huey.enqueue(first.s().then(second))
+        raw_first = self.huey.storage.enqueued_items()[0]
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(self.execute_next(), 'done')
+        self.execute_raw(raw_first)
+
+        self.assertEqual(counts, [1, 1])
+        self.assert_ack_state(r_first, 'none')
+        self.assertEqual(r_second.get(preserve=True), 'done')
+
+    def test_missing_completed_result_is_distinguishable(self):
+        counts = [0, 0]
+
+        @self.huey.task()
+        def first(value):
+            counts[0] += 1
+            return value
+
+        @self.huey.task()
+        def second(value):
+            counts[1] += 1
+            return value
+
+        self.huey.enqueue(first.s(1).then(second))
+        raw_first = self.huey.storage.enqueued_items()[0]
+        self.assertEqual(self.execute_next(), 1)
+        self.huey.delete(self.huey.dequeue().id)  # Drop callback too.
+        self.huey.delete(first_id := self.huey.deserialize_task(raw_first).id)
+
+        with self.assertRaises(ResultMissing) as caught:
+            self.execute_raw(raw_first)
+        self.assertEqual(caught.exception.reason, 'missing')
+        self.assertEqual(caught.exception.task_id, first_id)
+        self.assertEqual(counts, [1, 0])
+        self.assertEqual(len(self.huey), 0)
+
+
+class TestPipelineIdempotenceMemory(PipelineIdempotenceTests, BaseTestCase):
+    pass
+
+
+class TestPipelineIdempotenceSqlite(PipelineIdempotenceTests, BaseTestCase):
+    def setUp(self):
+        fd, self.filename = tempfile.mkstemp(suffix='.db')
+        os.close(fd)
+        super(TestPipelineIdempotenceSqlite, self).setUp()
+
+    def get_huey(self):
+        return SqliteHuey(filename=self.filename, timeout=3, utc=False)
+
+    def restart_storage(self):
+        self.huey.storage.close()
+        storage = self.huey.storage
+        storage.__init__(filename=self.filename, timeout=3)
+
+    def tearDown(self):
+        super(TestPipelineIdempotenceSqlite, self).tearDown()
+        self.huey.storage.close()
+        for path in (self.filename, self.filename + '-wal',
+                     self.filename + '-shm'):
+            if os.path.exists(path):
+                os.unlink(path)
 
 
 class TestTaskLocking(BaseTestCase):

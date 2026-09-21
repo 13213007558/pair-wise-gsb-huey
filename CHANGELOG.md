@@ -3,6 +3,10 @@ Changelog
 
 ## master
 
+* Persist pipeline handoff acknowledgements so a redelivered message cannot
+  run a confirmed callback twice; raise `ResultMissing` when an acknowledged
+  result has expired or been removed.
+
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

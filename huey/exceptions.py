@@ -3,6 +3,12 @@ class ConfigurationError(HueyException): pass
 class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
+class ResultMissing(HueyException):
+    def __init__(self, task_id=None, reason='missing'):
+        self.task_id = task_id
+        self.reason = reason
+        super(ResultMissing, self).__init__(
+            'result for task %s is %s' % (task_id, reason))
 
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):

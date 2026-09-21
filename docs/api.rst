@@ -2243,6 +2243,11 @@ Exceptions
     Raised when attempting to block on a call to :py:meth:`Result.get` (for
     instance) and the timeout is exceeded without the result being ready.
 
+.. py:class:: ResultMissing
+
+    Raised internally while resuming a redelivered pipeline task when its
+    acknowledged result has expired or been removed.
+
 .. py:class:: TaskTimeout
 
     Raised when a task exceeds its specified execution time.
@@ -2485,4 +2490,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-
