@@ -3,6 +3,10 @@ Changelog
 
 ## master
 
+* Version the `SignedSerializer` envelope with an authenticated key ID,
+  version and compression flags. Add key-ring support, explicit opt-in legacy
+  message verification, bounded legacy decompression, and HMAC-SHA256 for new
+  messages.
 * Fix `RedisSemaphore` admitting more than `value` holders under contention.
   Acquisition now evicts, counts and adds in one Lua script, using the server
   clock, so a caller whose timestamp was sampled before a slower caller's can

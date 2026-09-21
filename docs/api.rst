@@ -2190,20 +2190,38 @@ Serializer
         :returns: the deserialized object.
 
 
-.. py:class:: SignedSerializer(secret, salt='huey', **kwargs)
+.. py:class:: SignedSerializer(secret=None, salt='huey', secrets=None, active_key_id='default', accept_legacy=False, legacy_secret=None, max_decompressed_size=67108864, **kwargs)
 
-    :param str secret: secret key used to generate HMAC signatures.
+    :param str secret: secret key used to generate HMAC signatures. Keep
+        using this parameter for a single, current secret.
     :param str salt: salt combined with the secret (default ``'huey'``).
+    :param dict secrets: mapping of key IDs to secret keys, used for key
+        rotation. The key ID is stored in the signed envelope.
+    :param str active_key_id: key ID used when writing new messages.
+    :param bool accept_legacy: accept messages written by older Huey
+               releases. Legacy support is disabled by default and can be
+               turned off again without changing the rest of the config.
+    :param str legacy_secret: old secret used only to verify legacy
+               messages when ``accept_legacy`` is enabled.
+    :param int max_decompressed_size: maximum accepted decompressed message
+               size, in bytes (default 64 MiB).
     :param kwargs: additional keyword arguments passed to the base
         :py:class:`Serializer` (e.g. ``compression``, ``use_zlib``).
 
-    A subclass of :py:class:`Serializer` that adds an HMAC-SHA1 signature to
-    every serialized message. When deserializing, the signature is verified and
-    a ``ValueError`` is raised if the message has been tampered with.
+    A subclass of :py:class:`Serializer` that writes a versioned, HMAC-SHA256
+    signed envelope. The magic value, version, key ID, compression flags,
+    payload length and payload are all covered by the signature. When
+    deserializing, a ``ValueError`` is raised if a message has an unknown key,
+    a bad signature, or a corrupt envelope. Pickle is not invoked until after
+    the signature is verified.
 
     This is useful when the storage backend (e.g. Redis) is shared or
     network-exposed and you want to prevent malicious injection of crafted
     pickle payloads.
+
+    Legacy messages use the older HMAC-SHA1 layout and are accepted only when
+    ``accept_legacy`` is enabled. Compressed legacy messages are decompressed
+    with ``max_decompressed_size`` as a bound.
 
     .. code-block:: python
 
@@ -2218,8 +2236,8 @@ Serializer
         The signed serializer detects tampering but does **not** encrypt the
         data. Task arguments remain visible in the storage backend.
 
-    Both the application and the consumer must use the same ``secret`` and
-    ``salt``.
+    The application and consumer must both trust the key ID in a message.
+    See :ref:`recipe-signed-serializer` for the staged key-rotation example.
 
 .. _exceptions:
 
@@ -2485,4 +2503,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

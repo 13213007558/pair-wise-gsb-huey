@@ -360,13 +360,14 @@ shows how to time task execution and record it to a metrics system:
 
 .. _recipe-signed-serializer:
 
-Signed Serializer for Untrusted Environments
----------------------------------------------
+Signed Serializer and Key Rotation for Untrusted Environments
+-------------------------------------------------------------
 
 By default Huey uses ``pickle`` to serialize tasks and results. If your Redis
 instance is shared or network-exposed, a malicious actor could inject a crafted
 pickle payload. The :py:class:`SignedSerializer` adds an HMAC signature to
-every message, so tampered data is rejected:
+every message, so unknown keys, bad signatures and corrupt envelopes are
+rejected before pickle deserialization:
 
 .. code-block:: python
 
@@ -377,9 +378,67 @@ every message, so tampered data is rejected:
         'my-app',
         serializer=SignedSerializer(secret='my-secret-key'))
 
-The ``secret`` must be the same for both the application process and the
-consumer. If a message has been tampered with, deserialization will raise a
-``ValueError``.
+New messages use a versioned envelope authenticated with HMAC-SHA256. The
+magic value, version, key ID, compression flags, payload length and payload
+are covered by the signature, so changing those fields cannot move a message
+outside the authenticated boundary. Deserialization raises ``ValueError`` for
+invalid messages without putting secrets or payload contents in the exception.
+
+Rotating a secret
+~~~~~~~~~~~~~~~~~
+
+Suppose ``old-secret`` is the leaked secret and ``new-secret`` is the
+replacement. First deploy the new configuration to consumers, then deploy it
+to producers. Existing legacy tasks and results remain readable, while
+upgraded producers write only with ``new-secret``.
+
+.. code-block:: python
+
+    import os
+
+    from huey import RedisHuey
+    from huey.serializer import SignedSerializer
+
+    # Transition phase: read drained legacy data, write new v1 data.
+    serializer = SignedSerializer(
+        secrets={'current': os.environ['HUEY_SECRET']},  # new-secret
+        active_key_id='current',
+        accept_legacy=True,
+        legacy_secret=os.environ['HUEY_LEGACY_SECRET'],  # old-secret
+        compression=True,
+        max_decompressed_size=64 * 1024 * 1024)
+
+    huey = RedisHuey('my-app', serializer=serializer)
+
+After the queue is empty and all result/revocation TTLs using the old format
+have expired, deploy a configuration with the legacy reader switched off:
+
+.. code-block:: python
+
+    serializer = SignedSerializer(
+        secrets={'current': os.environ['HUEY_SECRET']},
+        active_key_id='current',
+        accept_legacy=False,
+        compression=True)
+
+Once that configuration is deployed everywhere, remove the old secret and use
+the normal single-secret form:
+
+.. code-block:: python
+
+    serializer = SignedSerializer(
+        secret=os.environ['HUEY_SECRET'],
+        compression=True)
+
+If you have messages already written with the new envelope under an older
+non-leaked key, include that key in ``secrets`` during rotation. Do not add it
+as ``legacy_secret``; that parameter only verifies the pre-versioned layout.
+``accept_legacy`` is independent of ``legacy_secret`` and can be turned off
+without removing the other configured signing keys.
+
+Compressed legacy messages are streamed through a bounded decompressor. The
+default decompressed limit is 64 MiB; set ``max_decompressed_size`` according
+to your largest legitimate task or result.
 
 .. note::
     The signed serializer does **not** encrypt the data, it only detects
