@@ -12,5 +12,9 @@ from huey.api import RedisExpireHuey
 from huey.api import RedisHuey
 from huey.api import SqliteHuey
 from huey.api import crontab
+from huey.schema import TaskSchema
+from huey.serializer import JsonSerializer
+from huey.serializer import SignedJsonSerializer
 from huey.exceptions import CancelExecution
 from huey.exceptions import RetryTask
+from huey.exceptions import TaskSchemaError

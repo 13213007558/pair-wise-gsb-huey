@@ -8,9 +8,11 @@ except ImportError:
     zlib = None
 import hashlib
 import hmac
+import json
 import logging
 import pickle
 import sys
+import datetime
 
 from huey.exceptions import ConfigurationError
 from huey.utils import encode
@@ -131,3 +133,104 @@ class SignedSerializer(Serializer):
 
     def _deserialize(self, data):
         return super(SignedSerializer, self)._deserialize(self._unsign(data))
+
+
+class JsonSerializer(Serializer):
+    type_marker = '__huey_type__'
+    value_marker = '__huey_value__'
+
+    def _serialize(self, data):
+        return json.dumps(self._encode_value(data),
+                          separators=(',', ':')).encode('utf8')
+
+    def _deserialize(self, data):
+        if isinstance(data, bytes):
+            data = data.decode('utf8')
+        return json.loads(data, object_hook=self._decode_hook)
+
+    def _tag(self, type_name, value):
+        return {self.type_marker: type_name, self.value_marker: value}
+
+    def _parse_datetime(self, value):
+        try:
+            return datetime.datetime.fromisoformat(value)
+        except AttributeError:
+            fmt = '%Y-%m-%dT%H:%M:%S.%f' if '.' in value else \
+                    '%Y-%m-%dT%H:%M:%S'
+            return datetime.datetime.strptime(value, fmt)
+
+    def _parse_time(self, value):
+        try:
+            return datetime.time.fromisoformat(value)
+        except AttributeError:
+            fmt = '%H:%M:%S.%f' if '.' in value else '%H:%M:%S'
+            return datetime.datetime.strptime(value, fmt).time()
+
+    def _encode_value(self, obj):
+        if isinstance(obj, dict):
+            return dict((key, self._encode_value(value))
+                        for key, value in obj.items())
+        if isinstance(obj, list):
+            return [self._encode_value(value) for value in obj]
+        if hasattr(obj, '_fields'):
+            from huey.registry import Message
+            from huey.registry import VersionedMessage
+            if isinstance(obj, Message):
+                return self._tag('Message', [self._encode_value(value)
+                                             for value in obj])
+            if isinstance(obj, VersionedMessage):
+                return self._tag('VersionedMessage',
+                                 [self._encode_value(value) for value in obj])
+        if isinstance(obj, tuple):
+            return self._tag('tuple', [self._encode_value(value)
+                                       for value in obj])
+        if isinstance(obj, set):
+            return self._tag('set', [self._encode_value(value)
+                                     for value in obj])
+        if isinstance(obj, bytes):
+            return self._tag('bytes', obj.decode('latin1'))
+        if isinstance(obj, datetime.datetime):
+            return self._tag('datetime', obj.isoformat())
+        if isinstance(obj, datetime.date):
+            return self._tag('date', obj.isoformat())
+        if isinstance(obj, datetime.time):
+            return self._tag('time', obj.isoformat())
+        if isinstance(obj, datetime.timedelta):
+            return self._tag('timedelta', obj.total_seconds())
+        return obj
+
+    def _decode_hook(self, obj):
+        if set(obj) == {self.type_marker, self.value_marker}:
+            type_name = obj[self.type_marker]
+            value = obj[self.value_marker]
+            if type_name == 'Message':
+                from huey.registry import Message
+                return Message(*value)
+            if type_name == 'VersionedMessage':
+                from huey.registry import VersionedMessage
+                return VersionedMessage(*value)
+            if type_name == 'tuple':
+                return tuple(value)
+            if type_name == 'set':
+                return set(value)
+            if type_name == 'bytes':
+                return value.encode('latin1')
+            if type_name == 'datetime':
+                return self._parse_datetime(value)
+            if type_name == 'date':
+                return datetime.datetime.strptime(value, '%Y-%m-%d').date()
+            if type_name == 'time':
+                return self._parse_time(value)
+            if type_name == 'timedelta':
+                return datetime.timedelta(seconds=value)
+            raise ValueError('Unsupported Huey JSON type %r' % type_name)
+        return obj
+
+
+class SignedJsonSerializer(SignedSerializer, JsonSerializer):
+    def _serialize(self, message):
+        data = JsonSerializer._serialize(self, message)
+        return self._sign(data)
+
+    def _deserialize(self, data):
+        return JsonSerializer._deserialize(self, self._unsign(data))

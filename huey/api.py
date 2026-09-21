@@ -21,9 +21,11 @@ from huey.exceptions import ConfigurationError
 from huey.exceptions import HueyException
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
+from huey.exceptions import TaskSchemaError
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.registry import Registry
+from huey.schema import TaskSchema
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
 from huey.storage import FileStorage
@@ -126,6 +128,7 @@ class Huey(object):
         self._post_execute = OrderedDict()
         self._startup = OrderedDict()
         self._shutdown = OrderedDict()
+        self._schema_rejected = None
         self._registry = Registry()
         self._signal = S.Signal()
         self._tasks_in_flight = set()
@@ -172,7 +175,7 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, priority=None, context=False,
-             name=None, expires=None, **kwargs):
+             name=None, expires=None, schema=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -184,11 +187,13 @@ class Huey(object):
                 default_retry_delay=retry_delay,
                 default_priority=priority,
                 default_expires=expires,
+                schema=schema,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       priority=None, context=False, name=None, expires=None,
+                      schema=None,
                       **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
@@ -204,6 +209,7 @@ class Huey(object):
                 default_retry_delay=retry_delay,
                 default_priority=priority,
                 default_expires=expires,
+                schema=schema,
                 validate_datetime=method_validate,
                 task_base=PeriodicTask,
                 **kwargs)
@@ -271,6 +277,13 @@ class Huey(object):
             # Assume we were given the function itself.
             name = name.__name__
         return self._shutdown.pop(name, None) is not None
+
+    def on_schema_rejected(self, callback):
+        self._schema_rejected = callback
+        return callback
+
+    def unregister_on_schema_rejected(self):
+        self._schema_rejected = None
 
     def notify_interrupted_tasks(self):
         while self._tasks_in_flight:
@@ -376,6 +389,32 @@ class Huey(object):
             return self._execute(task, timestamp)
 
     def _execute(self, task, timestamp):
+        if task.task_schema is not None:
+            try:
+                task.migrate_schema()
+            except TaskSchemaError as exc:
+                logger.error('Task %s rejected before execution: %s',
+                             task.id, exc, exc_info=True)
+                self._emit(S.SIGNAL_SCHEMA_REJECTED, task, exc)
+                callback = self._schema_rejected
+                if callback is None:
+                    self._emit(S.SIGNAL_RETRYING, task)
+                    self._requeue_schema_task(task, self._get_timestamp())
+                else:
+                    try:
+                        if callback(task, exc) is not False:
+                            self._emit(S.SIGNAL_RETRYING, task)
+                            self._requeue_schema_task(task,
+                                                       self._get_timestamp())
+                    except Exception:
+                        logger.exception('Schema rejection callback failed '
+                                         'for task %s.', task.id)
+                        self._requeue_schema_task(task,
+                                                   self._get_timestamp())
+                return
+            if task.schema_migrated:
+                self._emit(S.SIGNAL_SCHEMA_MIGRATED, task)
+
         if self._pre_execute:
             try:
                 self._run_pre_execute(task)
@@ -472,6 +511,16 @@ class Huey(object):
             self.add_schedule(task)
         else:
             self.enqueue(task)
+
+    def _requeue_schema_task(self, task, timestamp):
+        logger.info('Requeueing rejected schema task %s without consuming '
+                    'retries.', task.id)
+        data = self.serialize_task(task)
+        if task.retry_delay:
+            eta = timestamp + datetime.timedelta(seconds=task.retry_delay)
+            self.storage.add_to_schedule(data, eta)
+        else:
+            self.storage.enqueue(data, task.priority)
 
     def _run_pre_execute(self, task):
         for name, callback in self._pre_execute.items():
@@ -691,13 +740,31 @@ class Task(object):
     default_priority = None
     default_retries = 0
     default_retry_delay = 0
+    task_schema = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
-                 on_complete=None, on_error=None, expires_resolved=None):
+                 on_complete=None, on_error=None, expires_resolved=None,
+                 schema=_sentinel, message_schema_version=_sentinel):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
+        self.task_schema = type(self).task_schema if schema is _sentinel \
+            else schema
+        self.original_args = self.args if isinstance(self.args, tuple) else \
+                (self.args,) if self.args is not None and not \
+                isinstance(self.args, list) else tuple(self.args or ())
+        self.original_kwargs = dict(self.kwargs)
+        self.args = self.original_args
+        current_version = getattr(self.task_schema, 'version', None)
+        self.message_schema_version = current_version \
+            if message_schema_version is _sentinel \
+            else message_schema_version
+        self.schema_effective_version = 1 \
+            if self.task_schema is not None and \
+            self.message_schema_version is None \
+            else self.message_schema_version
+        self.schema_migrated = False
         self.id = id or self.create_id()
         self.revoke_id = 'r:%s' % self.id
         self.eta = eta
@@ -751,14 +818,16 @@ class Task(object):
             return
 
         if isinstance(data, tuple):
-            self.args += data
+            self.original_args += data
         elif isinstance(data, dict):
             # XXX: alternate would be self.kwargs.update(data), but this will
             # stomp on user-provided parameters.
             for key, value in data.items():
-                self.kwargs.setdefault(key, value)
+                self.original_kwargs.setdefault(key, value)
         else:
-            self.args = self.args + (data,)
+            self.original_args = self.original_args + (data,)
+        self.args = self.original_args
+        self.kwargs = self.original_kwargs
 
     def then(self, task, *args, **kwargs):
         if self.on_complete:
@@ -788,6 +857,10 @@ class Task(object):
         # Implementation provided by subclass, see: TaskWrapper.create_task().
         raise NotImplementedError
 
+    def migrate_schema(self):
+        if self.task_schema is not None:
+            self.task_schema.migrate_task(self)
+
     def __eq__(self, rhs):
         if not isinstance(rhs, Task):
             return False
@@ -807,7 +880,8 @@ class TaskWrapper(object):
     task_base = Task
 
     def __init__(self, huey, func, retries=None, retry_delay=None,
-                 context=False, name=None, task_base=None, **settings):
+                 context=False, name=None, task_base=None, schema=None,
+                 **settings):
         self.__doc__ = getattr(func, '__doc__', None)
         self.huey = huey
         self.func = func
@@ -815,29 +889,40 @@ class TaskWrapper(object):
         self.retry_delay = retry_delay
         self.context = context
         self.name = name
+        self.schema = schema
         self.settings = settings
         if task_base is not None:
             self.task_base = task_base
 
         # Dynamically create task class and register with Huey instance.
-        self.task_class = self.create_task(func, context, name, **settings)
+        self.task_class = self.create_task(func, context, name, schema,
+                                          **settings)
         self.huey._registry.register(self.task_class)
 
     def unregister(self):
         return self.huey._registry.unregister(self.task_class)
 
-    def create_task(self, func, context=False, name=None, **settings):
+    def create_task(self, func, context=False, name=None, schema=None,
+                    **settings):
         def execute(self):
             args, kwargs = self.data
             if self.context:
                 kwargs['task'] = self
             return func(*args, **kwargs)
 
+        task_schema = None
+        if schema is not None:
+            if not isinstance(schema, TaskSchema):
+                raise ConfigurationError('task schema must be a TaskSchema '
+                                         'instance')
+            task_schema = schema.bind(func, context)
+
         attrs = {
             'context': context,
             'execute': execute,
             '__module__': func.__module__,
-            '__doc__': func.__doc__}
+            '__doc__': func.__doc__,
+            'task_schema': task_schema}
         attrs.update(settings)
 
         if not name:

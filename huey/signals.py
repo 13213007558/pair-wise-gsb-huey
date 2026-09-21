@@ -12,6 +12,8 @@ SIGNAL_REVOKED = 'revoked'
 SIGNAL_SCHEDULED = 'scheduled'
 SIGNAL_INTERRUPTED = 'interrupted'
 SIGNAL_ENQUEUED = 'enqueued'
+SIGNAL_SCHEMA_MIGRATED = 'schema-migrated'
+SIGNAL_SCHEMA_REJECTED = 'schema-rejected'
 
 
 class Signal(object):

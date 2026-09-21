@@ -12,6 +12,10 @@ Message = namedtuple('Message', ('id', 'name', 'eta', 'retries', 'retry_delay',
 # messages enqueued with a smaller-set of arguments.
 Message.__new__.__defaults__ = (None,) * len(Message._fields)
 
+# Versioned payloads use a separate outer envelope. Workers that do not know
+# this type fail while decoding instead of silently executing new payloads.
+VersionedMessage = namedtuple('VersionedMessage', ('version', 'message'))
+
 
 class Registry(object):
     def __init__(self):
@@ -24,9 +28,17 @@ class Registry(object):
     def register(self, task_class):
         task_str = self.task_to_string(task_class)
         if task_str in self._registry:
-            raise ValueError('Attempting to register a task with the same '
-                             'identifier as existing task. Specify a different'
-                             ' name= to register this task. "%s"' % task_str)
+            existing = self._registry[task_str]
+            schema = getattr(task_class, 'task_schema', None)
+            existing_schema = getattr(existing, 'task_schema', None)
+            raise ValueError('Attempting to register task %s, but this '
+                             'module-qualified identifier is already '
+                             'registered with schema version %s. The new task '
+                             'uses schema version %s. Unregister the old task '
+                             'or choose a distinct name=.' % (
+                                     task_str,
+                                     getattr(existing_schema, 'version', None),
+                                     getattr(schema, 'version', None)))
 
         self._registry[task_str] = task_class
         if hasattr(task_class, 'validate_datetime'):
@@ -54,9 +66,10 @@ class Registry(object):
         if task_str not in self._registry:
             raise HueyException('%s not found in TaskRegistry' % task_str)
 
+        args = task.original_args
+        kwargs = dict(task.original_kwargs)
         # Remove the "task" instance from any arguments before serializing.
-        if task.kwargs and 'task' in task.kwargs:
-            task.kwargs.pop('task')
+        kwargs.pop('task', None)
 
         on_complete = None
         if task.on_complete is not None:
@@ -66,26 +79,38 @@ class Registry(object):
         if task.on_error is not None:
             on_error = self.create_message(task.on_error)
 
-        return Message(
+        payload = Message(
             task.id,
             task_str,
             task.eta,
             task.retries,
             task.retry_delay,
             task.priority,
-            task.args,
-            task.kwargs,
+            args,
+            kwargs,
             on_complete,
             on_error,
             task.expires,
             task.expires_resolved)
+        if task.task_schema is not None:
+            return VersionedMessage(task.message_schema_version, payload)
+        return payload
 
     def create_task(self, message):
+        if isinstance(message, VersionedMessage):
+            schema_version = message.version
+            message = message.message
+        else:
+            schema_version = None
+
         # Compatibility with Huey 1.11 message format.
         if not isinstance(message, Message) and isinstance(message, tuple):
             tid, name, eta, retries, retry_delay, (args, kwargs), oc = message
             message = Message(tid, name, eta, retries, retry_delay, None, args,
                               kwargs, oc, None)
+
+        if not isinstance(message, Message):
+            raise HueyException('Task message payload is invalid.')
 
         TaskClass = self.string_to_task(message.name)
 
@@ -108,7 +133,9 @@ class Registry(object):
             message.expires,
             on_complete,
             on_error,
-            message.expires_resolved)
+            message.expires_resolved,
+            schema=getattr(TaskClass, 'task_schema', None),
+            message_schema_version=schema_version)
 
     @property
     def periodic_tasks(self):

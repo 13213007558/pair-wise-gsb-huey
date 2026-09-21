@@ -248,6 +248,45 @@ Huey object
             # queue.
             huey.immediate = False
 
+        Task payloads can optionally declare a schema version. A versioned
+        message uses an outer envelope that older workers fail to decode
+        instead of executing new arguments with stale code. Register a
+        migration for every old payload version that this worker can accept:
+
+        .. code-block:: python
+
+            from huey import RedisHuey, TaskSchema
+
+            huey = RedisHuey('my-app')
+
+            def migrate_v1(old_value):
+                return (), {'new_value': old_value}
+
+            @huey.task(schema=TaskSchema(2, migrations={1: migrate_v1}))
+            def my_task(new_value):
+                pass
+
+        Migrations run after the message is decoded and before pre-execute
+        hooks and the task function are called. Unknown fields, unsupported or
+        missing versions, invalid migration results, and exceptions raised by
+        a migration raise ``TaskSchemaError`` and emit ``schema-rejected``.
+        The task function, result store, callbacks and normal task-retry path
+        are not invoked. The original decoded message keeps its received
+        version and retry count; use :py:meth:`Huey.on_schema_rejected` to
+        route poison messages to a dead-letter queue or return ``False`` after
+        recording them. Successfully migrated v1 payloads emit
+        ``schema-migrated``.
+
+        Registration remains local to each Huey instance. The registry key is
+        the task class module plus its task name. Reusing the same
+        fully-qualified key is always an explicit error, including schema
+        version changes; unregister the old class or choose a distinct
+        ``name=``. Tasks in different modules may use the same function name
+        because their registry keys remain distinct. The pickle serializer
+        keeps its existing boundary; ``JsonSerializer`` reconstructs only Huey
+        messages and a small whitelist of primitive-compatible types,
+        and ``SignedJsonSerializer`` signs those JSON messages.
+
         Immediate mode can also be specified when your Huey instance is
         created:
 
@@ -255,7 +294,7 @@ Huey object
 
             huey = RedisHuey(immediate=True)
 
-    .. py:method:: task(retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, **kwargs)
+    .. py:method:: task(retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, schema=None, **kwargs)
 
         :param int retries: number of times to retry the function if an
             unhandled exception occurs when it is executed.
@@ -638,6 +677,14 @@ Huey object
         :returns: boolean
 
         Unregister the specified on-shutdown hook.
+
+    .. py:method:: on_schema_rejected(callback)
+
+        Register a callback for a payload that could not be migrated to the
+        registered task schema. The callback receives the task and a
+        ``TaskSchemaError``. Returning ``False`` prevents Huey from
+        re-enqueueing the original message, allowing the callback to record it
+        in a dead-letter queue.
 
     .. py:method:: signal(*signals)
 
