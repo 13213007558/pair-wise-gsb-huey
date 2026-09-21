@@ -127,6 +127,21 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def enqueue_scheduled(self, ts, prepare, batch_size=500):
+        """Move due schedule rows into the task queue atomically.
+
+        Storages that support this operation must keep the row removal and
+        queue insert in the same transaction. ``prepare`` receives the raw
+        schedule data and returns ``(data, priority)`` for the queue insert.
+        """
+        scheduled = self.read_schedule(ts)
+        count = 0
+        for raw_data in scheduled:
+            data, priority = prepare(raw_data)
+            self.enqueue(data, priority)
+            count += 1
+        return count
+
     def schedule_size(self):
         """
         :return: The number of tasks currently in the schedule.
@@ -859,15 +874,21 @@ class BaseSqlStorage(BaseStorage):
                 if commit: cursor.execute(self.begin_sql)
                 yield cursor
             except Exception:
-                if commit: conn.rollback()
+                if commit: self._rollback_transaction(conn)
                 raise
             else:
-                if commit: conn.commit()
+                if commit: self._commit_transaction(conn)
             finally:
                 cursor.close()
                 if close:
                     conn.close()
                     self._conn = None
+
+    def _commit_transaction(self, conn):
+        conn.commit()
+
+    def _rollback_transaction(self, conn):
+        conn.rollback()
 
     def initialize_schema(self):
         with self.db(commit=True, close=True) as curs:
@@ -882,7 +903,7 @@ class BaseSqlStorage(BaseStorage):
 
 
 class SqliteStorage(BaseSqlStorage):
-    begin_sql = 'begin exclusive'
+    begin_sql = 'begin immediate'
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     sqlite_version_info = getattr(sqlite3, 'sqlite_version_info', None)
     table_kv = ('create table if not exists kv ('
@@ -914,6 +935,7 @@ class SqliteStorage(BaseSqlStorage):
         self._fsync = fsync
         self._journal_mode = journal_mode
         self._timeout = timeout  # Busy timeout in seconds, default is 5.
+        self._isolation_level = kwargs.pop('isolation_level', None)
         self._conn_kwargs = kwargs
 
         # By default Sqlite may reuse rowids when rows are removed. This means
@@ -936,8 +958,9 @@ class SqliteStorage(BaseSqlStorage):
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
                                check_same_thread=False,
+                               isolation_level=self._isolation_level,
                                **self._conn_kwargs)
-        conn.isolation_level = None  # Autocommit mode.
+        conn.execute('pragma busy_timeout=%s' % int(self._timeout * 1000))
         conn.execute('pragma journal_mode="%s"' % self._journal_mode)
         if self._cache_mb:
             conn.execute('pragma cache_size=%s' % (-1000 * self._cache_mb))
@@ -1001,6 +1024,45 @@ class SqliteStorage(BaseSqlStorage):
                 curs.execute('delete from schedule where id in (%s)' %
                              ','.join('?' * len(chunk)), chunk)
             return data
+
+    def enqueue_scheduled(self, ts, prepare, batch_size=500):
+        count = 0
+        timestamp = ts.timestamp()
+
+        while True:
+            with self.db(commit=True) as curs:
+                curs.execute(
+                    'select id, data from schedule where queue = ? and '
+                    'timestamp <= ? order by timestamp, id limit ?',
+                    (self.name, timestamp, batch_size))
+                rows = curs.fetchall()
+                if not rows:
+                    break
+
+                prepared = [(raw_data, prepare(raw_data))
+                            for _, raw_data in rows]
+                for _, (data, priority) in prepared:
+                    self._enqueue_scheduled_task(curs, data, priority)
+
+                placeholders = ','.join('?' * len(rows))
+                curs.execute('delete from schedule where id in (%s)' %
+                             placeholders,
+                             [scheduled_id for scheduled_id, _ in rows])
+                count += len(prepared)
+
+            self._after_schedule_batch_commit()
+            if len(rows) < batch_size:
+                break
+
+        return count
+
+    def _enqueue_scheduled_task(self, cursor, data, priority):
+        cursor.execute('insert into task (queue, data, priority) '
+                       'values (?, ?, ?)',
+                       (self.name, self.to_blob(data), priority or 0))
+
+    def _after_schedule_batch_commit(self):
+        pass
 
     def schedule_size(self):
         return self.sql('select count(id) from schedule where queue=?',
@@ -1147,6 +1209,7 @@ class CySqliteStorage(SqliteStorage):
 
     def _create_connection(self):
         return cysqlite.connect(self.filename, timeout=self._timeout,
+                                isolation_level=self._isolation_level,
                                 **self._conn_kwargs)
 
 
