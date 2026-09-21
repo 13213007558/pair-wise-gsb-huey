@@ -3,6 +3,8 @@ class ConfigurationError(HueyException): pass
 class TaskLockedException(HueyException): pass
 class ResultTimeout(HueyException): pass
 class TaskTimeout(HueyException): pass
+class ResultStoreClosed(HueyException): pass
+class ResultExpired(HueyException): pass
 
 class RateLimitExceeded(HueyException):
     def __init__(self, key, delay, retry=True):

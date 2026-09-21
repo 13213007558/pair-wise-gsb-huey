@@ -19,6 +19,8 @@ from huey.consumer import Consumer
 from huey.exceptions import CancelExecution
 from huey.exceptions import ConfigurationError
 from huey.exceptions import RateLimitExceeded
+from huey.exceptions import ResultExpired
+from huey.exceptions import ResultStoreClosed
 from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
@@ -397,10 +399,17 @@ class Huey(object):
                                          ttl)
 
     def get_raw(self, key, peek=False):
+        if self.storage.closed:
+            raise ResultStoreClosed(
+                'cannot read result for "%s": result store is closed' % key)
         if peek:
-            return self.storage.peek_data(key)
+            data = self.storage.peek_data(key)
         else:
-            return self.storage.pop_data(key)
+            data = self.storage.pop_data(key)
+        if data is EmptyData and self.storage.is_expired(key):
+            raise ResultExpired(
+                'result for "%s" expired and is no longer available' % key)
+        return data
 
     def get(self, key, peek=False):
         data = self.get_raw(key, peek)
@@ -436,9 +445,31 @@ class Huey(object):
             self._emit(S.SIGNAL_EXPIRED, task)
             self._abort_chord_member(task, SKIPPED)
         else:
+            if self.results and not isinstance(task, PeriodicTask):
+                completed = self._get_completed_result(task)
+                if completed is not EmptyData:
+                    logger.info('Task %s already completed, not re-executing.',
+                                task.id)
+                    return completed
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
             return self._execute(task, timestamp)
+
+    def _get_completed_result(self, task):
+        # If a terminal result was already stored for this task, a previous
+        # worker finished executing it (and advanced any pipeline) before the
+        # message was redelivered -- e.g. the consumer crashed after writing
+        # the result. Return the stored value so the task, and the chain
+        # hanging off of it, is not executed a second time.
+        data = self.storage.peek_data(task.id)
+        if data is EmptyData:
+            return EmptyData
+        value = self.serializer.deserialize(data)
+        if isinstance(value, Error) and value.metadata.get('retries'):
+            # Intermediate error from a failed attempt that still had
+            # retries remaining -- not a terminal result.
+            return EmptyData
+        return value
 
     def _execute(self, task, timestamp):
         if self._pre_execute:
@@ -552,6 +583,11 @@ class Huey(object):
             # Fire with only this attempt's exception; copy so the append does
             # not accumulate on the shared handler when the task is retried.
             next_task = copy.copy(task.on_error)
+            # Each dispatch of the handler is a distinct invocation, so the
+            # copy gets its own id -- otherwise a re-dispatch (e.g. after a
+            # retry) would look like a duplicate of the same task instance.
+            next_task.id = next_task.create_id()
+            next_task.revoke_id = 'r:%s' % next_task.id
             next_task.extend_data(exception)
             self.enqueue(next_task)
 

@@ -46,6 +46,7 @@ class BaseStorage(object):
 
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
+        self.closed = False
 
     def close(self):
         """
@@ -53,7 +54,18 @@ class BaseStorage(object):
 
         :returns: (optional) boolean indicating success
         """
-        pass
+        self.closed = True
+        return True
+
+    def is_expired(self, key):
+        """
+        Return whether the data for the given key was removed because its
+        TTL expired. Used to distinguish an expired result from a missing
+        one. Only storages that implement TTLs need to override this.
+
+        :return: Boolean indicating whether the key expired.
+        """
+        return False
 
     def enqueue(self, data, priority=None):
         """
@@ -338,6 +350,7 @@ class MemoryStorage(BaseStorage):
         self._queue = []
         self._results = {}
         self._expires = {}
+        self._expired = set()
         self._schedule = []
         self._counters = {}
         self._lock = threading.RLock()
@@ -401,11 +414,19 @@ class MemoryStorage(BaseStorage):
     def _expire(self, key):
         if self._expires.get(key, float('inf')) <= time.monotonic():
             del self._expires[key]
-            self._results.pop(key, None)
+            if self._results.pop(key, None) is not None:
+                # Remember that the key expired so readers can distinguish
+                # an expired value from one that never existed.
+                self._expired.add(key)
+
+    def is_expired(self, key):
+        self._expire(key)
+        return key in self._expired
 
     def put_data(self, key, value, is_result=False):
         self._results[key] = value
         self._expires.pop(key, None)
+        self._expired.discard(key)
 
     def peek_data(self, key):
         self._expire(key)
@@ -446,6 +467,7 @@ class MemoryStorage(BaseStorage):
 
     def flush_results(self):
         self._results = {}
+        self._expired = set()
 
     def flush_counters(self):
         self._counters = {}
@@ -834,6 +856,7 @@ class BaseSqlStorage(BaseStorage):
             self.initialize_schema()
 
     def close(self):
+        self.closed = True
         if self._conn is None:
             return False
         with self.lock:

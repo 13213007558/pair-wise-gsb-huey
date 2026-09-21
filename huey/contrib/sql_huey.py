@@ -102,6 +102,7 @@ class SqlStorage(BaseStorage):
                                        self.Counter])
 
     def close(self):
+        self.closed = True
         return self.database.close()
 
     def tasks(self, *columns):

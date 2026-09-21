@@ -1170,6 +1170,21 @@ For more information, see the following API docs:
     ``store_none=True`` or (preferable) have your tasks return a sentinel value
     instead.
 
+.. note::
+    A pipeline advances *at most once* for each task. If a worker writes a
+    task result to the result store but crashes before the dequeued
+    message is acknowledged, the message may be delivered again. Huey detects
+    the stored result and skips re-executing the task, so the downstream
+    chain is not run a second time. An intermediate error stored while
+    retries remain does not trigger this behavior, so retried tasks still
+    execute normally.
+
+    When reading results, a missing result is reported as ``None``. Two
+    conditions are reported as distinguishable errors instead: reading from
+    a closed result store raises ``ResultStoreClosed``, and reading a result
+    whose TTL has expired raises ``ResultExpired`` (expiration tracking is
+    provided by the memory storage).
+
 Error pipelines
 ^^^^^^^^^^^^^^^
 

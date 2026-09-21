@@ -1987,6 +1987,10 @@ Result
             been read, to prevent the result store from growing without bounds.
         :raises: ResultTimeout if blocking and timeout specified without result
             becoming ready yet.
+        :raises: ResultStoreClosed if the result store has been closed.
+        :raises: ResultExpired if the result was stored with a TTL that has
+            since expired (only detectable by storages that track expirations,
+            e.g. the memory storage).
 
         Attempt to retrieve the return value of a task. By default,
         :py:meth:`~Result.get` will check for the value, returning
@@ -2485,4 +2489,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-
