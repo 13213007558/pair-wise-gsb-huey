@@ -5,6 +5,7 @@ import signal
 import sys
 import threading
 import time
+import uuid
 
 from multiprocessing import Event as ProcessEvent
 from multiprocessing import Process
@@ -85,10 +86,20 @@ class Worker(BaseProcess):
     """
     process_name = 'Worker'
 
-    def __init__(self, huey, default_delay, max_delay, backoff):
+    def __init__(self, huey, default_delay, max_delay, backoff,
+                 consumer_id=None, worker_id=None, drain_flag=None,
+                 force_flag=None):
         self.delay = self.default_delay = default_delay
         self.max_delay = max_delay
         self.backoff = backoff
+        self.consumer_id = consumer_id
+        self.worker_id = worker_id or 0
+        self.owner_id = ('%s.worker-%s' % (consumer_id, worker_id)
+                         if consumer_id is not None else None)
+        self.drain_flag = drain_flag
+        self.force_flag = force_flag
+        self.phase = 'idle'
+        self.message = None
         super(Worker, self).__init__(huey)
 
     def initialize(self):
@@ -108,22 +119,63 @@ class Worker(BaseProcess):
                 self._logger.exception('shutdown hook "%s" failed', name)
 
     def loop(self, now=None):
+        if self.drain_flag is not None and self.drain_flag.is_set():
+            raise StopIteration
+
         task = None
+        message = None
         try:
-            task = self.huey.dequeue()
+            if self.consumer_id is not None:
+                blocking = (self.drain_flag is None or
+                            not self.drain_flag.is_set())
+                message = self.huey.pull_message(
+                    self.consumer_id, self.owner_id,
+                    block=blocking and self.huey.storage.blocking,
+                    timeout=self.huey.storage.read_timeout
+                    if hasattr(self.huey.storage, 'read_timeout') else None)
+                if message is not None:
+                    task = self.huey.deserialize_task(message['data'])
+            else:
+                task = self.huey.dequeue()
         except Exception:
             self._logger.exception('Error reading from queue')
             self.sleep()
+        except StopIteration:
+            raise
         else:
             if task is not None:
                 self.delay = self.default_delay
+                self.phase = 'running'
+                self.message = message
+                if message is not None:
+                    self.huey.storage.set_message_state(message['id'],
+                                                        'running')
                 try:
-                    self.huey.execute(task, now)
+                    self.huey.execute(task, now, message=message)
                 except Exception as exc:
                     self._logger.exception('Unhandled error during execution '
                                            'of task %s.', task.id)
+                    if message is not None:
+                        self._requeue_message(message)
+                except KeyboardInterrupt:
+                    if message is None:
+                        raise
+                    self._logger.warning('Interrupted task %s.', task.id)
+                    raise
+                finally:
+                    self.phase = 'idle'
+                    self.message = None
             elif not self.huey.storage.blocking:
                 self.sleep()
+
+    def _requeue_message(self, message):
+        try:
+            self.huey.storage.requeue_message(
+                message['id'], owner_id=self.owner_id,
+                consumer_id=self.consumer_id)
+        except Exception:
+            self._logger.exception('Unable to requeue message %s.',
+                                   message['id'])
 
     def sleep(self):
         if self.delay > self.max_delay:
@@ -145,9 +197,10 @@ class Scheduler(BaseProcess):
     periodic_task_seconds = 60
     process_name = 'Scheduler'
 
-    def __init__(self, huey, interval, periodic):
+    def __init__(self, huey, interval, periodic, stop_flag=None):
         super(Scheduler, self).__init__(huey)
         self.interval = max(min(interval, 60), 1)
+        self.stop_flag = stop_flag
 
         self.periodic = periodic
         self._next_loop = time_clock()
@@ -173,7 +226,10 @@ class Scheduler(BaseProcess):
             self._next_periodic += self.periodic_task_seconds
             self.enqueue_periodic_tasks(now)
 
-        self.sleep_for_interval(current, self.interval)
+        if self.stop_flag is None:
+            self.sleep_for_interval(current, self.interval)
+        else:
+            self.stop_flag.wait(self.interval)
 
     def enqueue_periodic_tasks(self, now):
         self._logger.debug('Checking periodic tasks')
@@ -258,7 +314,7 @@ class Consumer(object):
                  backoff=1.15, max_delay=10.0, scheduler_interval=1,
                  worker_type=WORKER_THREAD, check_worker_health=True,
                  health_check_interval=10, flush_locks=False,
-                 extra_locks=None):
+                 extra_locks=None, drain_timeout=None):
 
         self._logger = logging.getLogger('huey.consumer')
         if huey.immediate:
@@ -283,6 +339,14 @@ class Consumer(object):
         if worker_type == WORKER_GREENLET and Greenlet is None:
             raise ImportError('Could not import gevent - is it installed?')
         self.worker_type = worker_type  # What process model are we using?
+        self.drain_timeout = drain_timeout
+        if drain_timeout is not None and not huey.storage.supports_drain():
+            raise ConfigurationError(
+                'The configured storage backend does not support drain.')
+        if drain_timeout is not None and worker_type == WORKER_PROCESS and \
+                type(huey.storage).__name__ == 'MemoryStorage':
+            raise ConfigurationError(
+                'Memory storage cannot coordinate drain across processes.')
 
         # Configure health-check and consumer main-loop attributes.
         self._stop_flag_timeout = 0.1
@@ -299,6 +363,14 @@ class Consumer(object):
         self._restart = False
         self._graceful = True
         self.stop_flag = self.environment.get_stop_flag()
+        self.drain_flag = self.environment.get_stop_flag()
+        self.scheduler_stop_flag = self.environment.get_stop_flag()
+        self.force_flag = self.environment.get_stop_flag()
+        self.consumer_id = (uuid.uuid4().hex
+                            if drain_timeout is not None else None)
+        self._consumer_deadline = None
+        self._finalize_deadline = None
+        self._drain_recovered = False
 
         # In the event the consumer was killed while running a task that held
         # a lock, this ensures that all locks are flushed before starting.
@@ -313,7 +385,7 @@ class Consumer(object):
         # Create the worker process(es) (also not started yet).
         self.worker_threads = []
         for i in range(workers):
-            worker = self._create_worker()
+            worker = self._create_worker(i + 1)
             process = self._create_process(worker, 'Worker-%d' % (i + 1))
 
             # The worker threads are stored as [(worker impl, worker_t), ...].
@@ -334,18 +406,23 @@ class Consumer(object):
                              ', '.join(WORKER_TYPES))
         return WORKER_TO_ENVIRONMENT[worker_type]()
 
-    def _create_worker(self):
+    def _create_worker(self, worker_id=0):
         return self.worker_class(
             huey=self.huey,
             default_delay=self.default_delay,
             max_delay=self.max_delay,
-            backoff=self.backoff)
+            backoff=self.backoff,
+            consumer_id=self.consumer_id,
+            worker_id=worker_id,
+            drain_flag=self.drain_flag,
+            force_flag=self.force_flag)
 
     def _create_scheduler(self):
         return self.scheduler_class(
             huey=self.huey,
             interval=self.scheduler_interval,
-            periodic=self.periodic)
+            periodic=self.periodic,
+            stop_flag=self.scheduler_stop_flag)
 
     def _create_process(self, process, name):
         """
@@ -360,6 +437,8 @@ class Consumer(object):
             try:
                 while not self.stop_flag.is_set():
                     process.loop()
+            except StopIteration:
+                pass
             except KeyboardInterrupt:
                 pass
             except:
@@ -405,6 +484,9 @@ class Consumer(object):
         for _, worker_process in self.worker_threads:
             worker_process.start()
 
+        if self.consumer_id is not None:
+            self._register_consumer(recover=True)
+
         # Finally set the signal handlers for main process.
         self._set_signal_handlers()
 
@@ -421,6 +503,7 @@ class Consumer(object):
             try:
                 for _, worker_process in self.worker_threads:
                     worker_process.join()
+                self.scheduler_stop_flag.set()
                 self.scheduler.join()
             except KeyboardInterrupt:
                 self._logger.info('Received request to shut down now.')
@@ -453,6 +536,13 @@ class Consumer(object):
             self._logger.info('Consumer exiting.')
 
     def loop(self, health_check_ts=None):
+        if self.consumer_id is not None:
+            self.huey.storage.heartbeat_consumer(self.consumer_id,
+                                                self.consumer_id)
+
+        if self.drain_flag.is_set() and not self.stop_flag.is_set():
+            return self._drain_loop(health_check_ts)
+
         try:
             self.stop_flag.wait(timeout=self._stop_flag_timeout)
         except KeyboardInterrupt:
@@ -477,6 +567,111 @@ class Consumer(object):
 
         return health_check_ts
 
+    def _register_consumer(self, recover=False):
+        storage = self.huey.storage
+        storage.register_consumer(self.consumer_id, self.consumer_id)
+        if recover:
+            requeued = storage.recover_messages(
+                self.consumer_id, min_age=1.0,
+                timestamp=time.time())
+            if requeued:
+                self._logger.warning('Took over %s unacknowledged task(s).',
+                                     requeued)
+
+    def _drain_loop(self, health_check_ts):
+        now = time_clock()
+        if self._consumer_deadline is None:
+            self._begin_drain(now)
+
+        alive_workers = [process for _, process in self.worker_threads
+                         if self.environment.is_alive(process)]
+        if not alive_workers:
+            self._finish_drain(recovered=False)
+            raise ConsumerStopped
+
+        if now >= self._consumer_deadline and self._finalize_deadline is None:
+            self._timeout_drain(now)
+
+        if self._finalize_deadline is not None:
+            finalizing = self._workers_in_phase('finalizing')
+            alive_finalizing = [process for worker, process in finalizing
+                                if self.environment.is_alive(process)]
+            if not alive_finalizing or now >= self._finalize_deadline:
+                self._finish_drain(recovered=True)
+                raise ConsumerStopped
+
+        time.sleep(min(0.1, max(0, self._consumer_deadline - now)))
+        return health_check_ts
+
+    def _begin_drain(self, now):
+        self._logger.info('Draining consumer tasks (timeout=%s).',
+                          self.drain_timeout)
+        self._consumer_deadline = now + float(self.drain_timeout or 0)
+        self.scheduler_stop_flag.set()
+
+    def _workers_in_phase(self, phase):
+        return [(worker, process) for worker, process in self.worker_threads
+                if getattr(worker, 'phase', None) == phase]
+
+    def _interrupt_thread(self, process):
+        import ctypes
+        exc = ctypes.py_object(KeyboardInterrupt)
+        thread_id = process.ident
+        count = ctypes.pythonapi.PyThreadState_SetAsyncExc(
+            ctypes.c_long(thread_id), exc)
+        if count == 0:
+            return False
+        if count > 1:
+            ctypes.pythonapi.PyThreadState_SetAsyncExc(
+                ctypes.c_long(thread_id), None)
+            return False
+        return True
+
+    def _timeout_drain(self, now):
+        self._logger.warning('Drain timeout reached; stopping active tasks.')
+        self.force_flag.set()
+        for worker, process in self._workers_in_phase('running'):
+            if self.worker_type == WORKER_PROCESS:
+                process.terminate()
+            elif self.worker_type == WORKER_GREENLET:
+                gevent.kill(process, KeyboardInterrupt)
+            elif process.is_alive() and process.ident:
+                self._interrupt_thread(process)
+        self._finalize_deadline = now + min(float(self.drain_timeout or 0),
+                                            1.0)
+
+    def _force_stop(self):
+        self._logger.warning('Forcing consumer shutdown.')
+        self.force_flag.set()
+        self.scheduler_stop_flag.set()
+        if self.worker_type == WORKER_PROCESS:
+            for _, process in self.worker_threads:
+                if self.environment.is_alive(process):
+                    process.terminate()
+        elif self.worker_type == WORKER_GREENLET:
+            gevent.killall([process for _, process in self.worker_threads],
+                           KeyboardInterrupt)
+        else:
+            for _, process in self.worker_threads:
+                if process.is_alive() and process.ident:
+                    self._interrupt_thread(process)
+        self.stop_flag.set()
+
+    def _finish_drain(self, recovered=False):
+        self.stop_flag.set()
+        self.scheduler_stop_flag.set()
+        if recovered:
+            requeued = self.huey.storage.recover_messages(
+                self.consumer_id, force=True)
+            if requeued:
+                self._logger.warning('%s task(s) requeued after drain.',
+                                     requeued)
+        for _, process in self.worker_threads:
+            process.join(timeout=1)
+        self.scheduler.join(timeout=1)
+        self.huey.storage.unregister_consumer(self.consumer_id,
+                                              self.consumer_id)
+
     def check_worker_health(self):
         """
         Check the health of the worker processes. Workers that have died will
@@ -489,7 +684,8 @@ class Consumer(object):
             if not self.environment.is_alive(worker_t):
                 self._logger.warning('Worker %d died, restarting.', i + 1)
                 worker = self._create_worker()
-                worker_t = self._create_process(worker, 'Worker-%d' % (i + 1))
+                worker_t = self._create_process(
+                    worker, 'Worker-%d' % (i + 1))
                 worker_t.start()
                 restart_occurred = True
             workers.append((worker, worker_t))
@@ -534,19 +730,25 @@ class Consumer(object):
 
     def _handle_stop_signal(self, sig_num, frame):
         self._logger.info('Received SIGTERM')
-        self._received_signal = True
-        self._restart = False
-        self._graceful = False
-        if self.worker_type == WORKER_GREENLET:
-            def kill_workers():
-                gevent.killall([t for _, t in self.worker_threads],
-                               KeyboardInterrupt)
-            gevent.spawn(kill_workers)
+        if self.drain_timeout is None or self.stop_flag.is_set():
+            self._received_signal = True
+            self._restart = False
+            self._graceful = False
+        elif self.drain_flag.is_set():
+            self._force_stop()
+        else:
+            self._received_signal = True
+            self._restart = False
+            self._graceful = True
+            self.drain_flag.set()
 
     def _handle_restart_signal(self, sig_num, frame):
         self._logger.info('Received SIGHUP, will restart')
         self._received_signal = True
         self._restart = True
+        self._graceful = True
+        if self.drain_timeout is not None:
+            self.drain_flag.set()
 
     def _set_child_signal_handlers(self):
         # Install signal handlers in child process. We ignore SIGHUP (restart)
@@ -560,5 +762,7 @@ class Consumer(object):
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     def _handle_stop_signal_worker(self, sig_num, frame):
+        if self.force_flag.is_set():
+            raise KeyboardInterrupt
         # Raise an interrupt in the subprocess' main loop.
         raise KeyboardInterrupt

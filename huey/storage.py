@@ -15,6 +15,7 @@ except ImportError:
 import struct
 import threading
 import time
+import uuid
 import warnings
 
 try:
@@ -240,6 +241,36 @@ class BaseStorage(object):
         self.flush_schedule()
         self.flush_results()
 
+    def supports_drain(self):
+        return False
+
+    def register_consumer(self, consumer_id, owner_id, timestamp=None):
+        return False
+
+    def heartbeat_consumer(self, consumer_id, owner_id, timestamp=None):
+        return False
+
+    def unregister_consumer(self, consumer_id, owner_id):
+        return False
+
+    def pull_message(self, consumer_id, owner_id, block=True, timeout=None):
+        data = self.dequeue()
+        if data is not None:
+            return {'id': data, 'data': data, 'priority': None}
+
+    def set_message_state(self, message_id, state):
+        return False
+
+    def ack_message(self, message_id, owner_id=None):
+        return False
+
+    def requeue_message(self, message_id, owner_id=None, consumer_id=None,
+                        timestamp=None, data=None):
+        return False
+
+    def recover_messages(self, consumer_id, min_age=None, timestamp=None):
+        return 0
+
 
 class BlackHoleStorage(BaseStorage):
     def enqueue(self, data, priority=None): pass
@@ -268,6 +299,8 @@ class MemoryStorage(BaseStorage):
         self._queue = []
         self._results = {}
         self._schedule = []
+        self._unacked = {}
+        self._consumers = {}
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -277,12 +310,105 @@ class MemoryStorage(BaseStorage):
             heapq.heappush(self._queue, (priority, self._c, data))
 
     def dequeue(self):
-        try:
-            _, _, data = heapq.heappop(self._queue)
-        except IndexError:
-            pass
-        else:
-            return data
+        with self._lock:
+            try:
+                _, _, data = heapq.heappop(self._queue)
+            except IndexError:
+                pass
+            else:
+                return data
+
+    def supports_drain(self):
+        return True
+
+    def register_consumer(self, consumer_id, owner_id, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        with self._lock:
+            self._consumers[consumer_id] = {
+                'owner_id': owner_id,
+                'timestamp': timestamp,
+            }
+            return True
+
+    def heartbeat_consumer(self, consumer_id, owner_id, timestamp=None):
+        return self.register_consumer(consumer_id, owner_id, timestamp)
+
+    def unregister_consumer(self, consumer_id, owner_id):
+        with self._lock:
+            consumer = self._consumers.get(consumer_id)
+            if consumer is not None and consumer['owner_id'] == owner_id:
+                self._consumers.pop(consumer_id, None)
+                return True
+            return False
+
+    def pull_message(self, consumer_id, owner_id, block=True, timeout=None):
+        with self._lock:
+            try:
+                priority, _, data = heapq.heappop(self._queue)
+            except IndexError:
+                return
+            message_id = uuid.uuid4().hex.encode('utf8')
+            self._unacked[message_id] = {
+                'data': data,
+                'priority': -priority,
+                'owner_id': owner_id,
+                'consumer_id': consumer_id,
+                'state': 'running',
+                'timestamp': time.time(),
+            }
+            return {'id': message_id, 'data': data, 'priority': -priority}
+
+    def set_message_state(self, message_id, state):
+        with self._lock:
+            message = self._unacked.get(message_id)
+            if message is None:
+                return False
+            message['state'] = state
+            return True
+
+    def ack_message(self, message_id, owner_id=None):
+        with self._lock:
+            message = self._unacked.get(message_id)
+            if message is None:
+                return False
+            if owner_id is not None and message['owner_id'] != owner_id:
+                return False
+            self._unacked.pop(message_id, None)
+            return True
+
+    def requeue_message(self, message_id, owner_id=None, consumer_id=None,
+                        timestamp=None, data=None):
+        with self._lock:
+            message = self._unacked.get(message_id)
+            if message is None:
+                return False
+            if owner_id is not None and message['owner_id'] != owner_id:
+                return False
+            self._c += 1
+            priority = message['priority'] or 0
+            heapq.heappush(self._queue,
+                           (-priority, self._c,
+                            data if data is not None else message['data']))
+            self._unacked.pop(message_id, None)
+            return True
+
+    def recover_messages(self, consumer_id, min_age=None, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        cutoff = timestamp - (min_age or 0)
+        with self._lock:
+            requeued = 0
+            active = consumer_id in self._consumers
+            for message_id in list(self._unacked):
+                message = self._unacked[message_id]
+                stale = message['timestamp'] <= cutoff
+                if (message['consumer_id'] == consumer_id and
+                        (not active or stale)):
+                    if self.requeue_message(message_id, consumer_id=consumer_id):
+                        requeued += 1
+            if not active:
+                for old_id in list(self._consumers):
+                    self._consumers.pop(old_id, None)
+            return requeued
 
     def queue_size(self):
         return len(self._queue)
@@ -356,6 +482,77 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+CONSUMER_UNREGISTER_LUA = """\
+if redis.call('hget', KEYS[1], ARGV[1]) == ARGV[2] then
+    return redis.call('hdel', KEYS[1], ARGV[1])
+end
+return 0"""
+
+LIST_ACK_LUA = """\
+local data = redis.call('rpop', KEYS[1])
+if data then
+    redis.call('hdel', KEYS[2], ARGV[1])
+    return 1
+end
+return 0"""
+
+LIST_REQUEUE_LUA = """\
+local data = redis.call('rpop', KEYS[1])
+if data then
+    if #ARGV == 2 then data = ARGV[2] end
+    redis.call('rpush', KEYS[2], data)
+    redis.call('hdel', KEYS[3], ARGV[1])
+    return 1
+end
+return 0"""
+
+LIST_RECOVER_LUA = """\
+local items = redis.call('lrange', KEYS[1], 0, -1)
+local moved = 0
+for i = 1, #items do
+    if ARGV[2] == '1' or
+       redis.call('hget', KEYS[3], items[i]) ~= 'finalizing' then
+        redis.call('rpush', KEYS[2], items[i])
+        moved = moved + 1
+    end
+end
+if moved > 0 then
+    redis.call('del', KEYS[1])
+end
+return moved"""
+
+PRIORITY_PULL_LUA = """\
+local items = redis.call('zpopmin', KEYS[1], 1)
+if #items == 0 then return false end
+local prefix = struct.pack('>Q', tonumber(ARGV[4]))
+redis.call('hset', KEYS[2], ARGV[1], items[1])
+redis.call('hset', KEYS[3], ARGV[1], ARGV[2])
+redis.call('hset', KEYS[4], ARGV[1], ARGV[3])
+redis.call('hset', KEYS[5], ARGV[1], items[2])
+return {ARGV[1], items[1]} """
+
+PRIORITY_ACK_LUA = """\
+local removed = redis.call('hdel', KEYS[2], ARGV[1])
+if removed > 0 then
+    redis.call('hdel', KEYS[3], ARGV[1])
+    redis.call('hdel', KEYS[4], ARGV[1])
+    redis.call('hdel', KEYS[5], ARGV[1])
+end
+return removed"""
+
+PRIORITY_REQUEUE_LUA = """\
+local data = redis.call('hget', KEYS[2], ARGV[1])
+if not data then return 0 end
+if #ARGV >= 3 then data = ARGV[3] end
+local priority = tonumber(redis.call('hget', KEYS[5], ARGV[1]) or '0')
+local prefix = struct.pack('>Q', tonumber(ARGV[2]))
+redis.call('zadd', KEYS[1], priority, prefix .. data)
+redis.call('hdel', KEYS[2], ARGV[1])
+redis.call('hdel', KEYS[3], ARGV[1])
+redis.call('hdel', KEYS[4], ARGV[1])
+redis.call('hdel', KEYS[5], ARGV[1])
+return 1"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
@@ -396,12 +593,23 @@ class RedisStorage(BaseStorage):
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
+        self.consumer_key = 'huey.consumers.%s' % self.name
+        self.processing_prefix = 'huey.processing.%s.' % self.name
+        self.processing_data_key = 'huey.processing.data.%s' % self.name
+        self.processing_owner_key = 'huey.processing.owner.%s' % self.name
+        self.processing_state_key = 'huey.processing.state.%s' % self.name
+        self.processing_priority_key = 'huey.processing.priority.%s' % self.name
 
         if client_name is not None:
             self.conn.client_setname(client_name)
 
         self.blocking = blocking
         self.read_timeout = read_timeout
+        self._consumer_unregister = self.conn.register_script(
+            CONSUMER_UNREGISTER_LUA)
+        self._list_ack = self.conn.register_script(LIST_ACK_LUA)
+        self._list_requeue = self.conn.register_script(LIST_REQUEUE_LUA)
+        self._list_recover = self.conn.register_script(LIST_RECOVER_LUA)
 
     def clean_name(self, name):
         return re.sub('[^a-z0-9]', '', name)
@@ -490,6 +698,93 @@ class RedisStorage(BaseStorage):
 
     def flush_results(self):
         self.conn.delete(self.result_key)
+
+    def supports_drain(self):
+        return True
+
+    def _timestamp(self, timestamp=None):
+        return time.time() if timestamp is None else timestamp
+
+    def register_consumer(self, consumer_id, owner_id, timestamp=None):
+        self.conn.hset(self.consumer_key, consumer_id,
+                       self._timestamp(timestamp))
+        return True
+
+    def heartbeat_consumer(self, consumer_id, owner_id, timestamp=None):
+        return self.register_consumer(consumer_id, owner_id, timestamp)
+
+    def unregister_consumer(self, consumer_id, owner_id):
+        return bool(self._consumer_unregister(
+            keys=[self.consumer_key], args=[consumer_id, owner_id]))
+
+    def processing_key(self, owner_id):
+        return self.processing_prefix + owner_id
+
+    def pull_message(self, consumer_id, owner_id, block=True, timeout=None):
+        message_id = uuid.uuid4().hex
+        processing_key = self.processing_key(
+            '%s.%s' % (owner_id, message_id))
+        if block:
+            data = self.conn.brpoplpush(self.queue_key, processing_key,
+                                        timeout=timeout or self.read_timeout)
+        else:
+            data = self.conn.rpoplpush(self.queue_key, processing_key)
+        if data is not None:
+            return {'id': message_id, 'data': data, 'priority': None}
+
+    def set_message_state(self, message_id, state):
+        return bool(self.conn.hset(self.processing_state_key, message_id,
+                                   state))
+
+    def ack_message(self, message_id, owner_id=None):
+        if owner_id is None:
+            return False
+        return bool(self._list_ack(
+            keys=[self.processing_key(owner_id),
+                  self.processing_state_key],
+            args=[message_id]))
+
+    def requeue_message(self, message_id, owner_id=None, consumer_id=None,
+                        timestamp=None, data=None):
+        if owner_id is None:
+            return False
+        return bool(self._list_requeue(
+            keys=[self.processing_key(owner_id), self.queue_key,
+                  self.processing_state_key],
+            args=[message_id] + ([data] if data is not None else [])))
+
+    def _stale_processing_consumers(self, consumer_id, cutoff):
+        consumers = self.conn.hgetall(self.consumer_key)
+        stale = set()
+        for old_id, heartbeat in consumers.items():
+            old_id = old_id.decode('utf8') if isinstance(old_id, bytes) else old_id
+            heartbeat = float(heartbeat)
+            if old_id == consumer_id or heartbeat <= cutoff:
+                stale.add(old_id)
+        return stale
+
+    def _owner_from_processing_key(self, processing_key):
+        suffix = processing_key[len(self.processing_prefix):]
+        if isinstance(suffix, bytes):
+            suffix = suffix.decode('utf8')
+        return suffix.rsplit('.', 1)[0]
+
+    def recover_messages(self, consumer_id, min_age=None, timestamp=None,
+                         force=False):
+        timestamp = self._timestamp(timestamp)
+        cutoff = timestamp - (min_age or 0)
+        stale = self._stale_processing_consumers(consumer_id, cutoff)
+        requeued = 0
+        pattern = self.processing_prefix + '*'
+        for processing_key in self.conn.scan_iter(pattern):
+            old_consumer = self._owner_from_processing_key(
+                processing_key).split('.', 1)[0]
+            if old_consumer in stale:
+                requeued += int(self._list_recover(
+                    keys=[processing_key, self.queue_key,
+                          self.processing_state_key],
+                    args=[None, '1' if force else '0']))
+        return requeued
 
 
 class RedisExpireStorage(RedisStorage):
@@ -594,6 +889,67 @@ class RedisPriorityQueue(object):
         items = self.conn.zrange(self.queue_key, 0, limit or -1)
         return [item[8:] for item in items]  # Unprefix the data.
 
+    def pull_message(self, consumer_id, owner_id, block=True, timeout=None):
+        deadline = time.time() + (timeout if timeout is not None
+                                  else self.read_timeout)
+        while True:
+            message_id = uuid.uuid4().hex
+            result = self.conn.eval(
+                PRIORITY_PULL_LUA, 5, self.queue_key,
+                self.processing_data_key, self.processing_owner_key,
+                self.processing_state_key, self.processing_priority_key,
+                message_id, owner_id, 'running', int(time.time() * 1e6))
+            if result:
+                return {'id': result[0].decode('utf8'),
+                        'data': result[1], 'priority': None}
+            if not block or time.time() >= deadline:
+                return
+            time.sleep(min(0.1, max(0, deadline - time.time())))
+
+    def set_message_state(self, message_id, state):
+        return bool(self.conn.hset(self.processing_state_key, message_id,
+                                   state))
+
+    def ack_message(self, message_id, owner_id=None):
+        return bool(self.conn.eval(
+            PRIORITY_ACK_LUA, 5, self.queue_key, self.processing_data_key,
+            self.processing_owner_key, self.processing_state_key,
+            self.processing_priority_key, message_id))
+
+    def requeue_message(self, message_id, owner_id=None, consumer_id=None,
+                        timestamp=None, data=None):
+        args = [message_id, int(time.time() * 1e6)]
+        if data is not None:
+            args.append(data)
+        return bool(self.conn.eval(
+            PRIORITY_REQUEUE_LUA, 2, self.queue_key,
+            self.processing_data_key, self.processing_owner_key,
+            self.processing_state_key, self.processing_priority_key,
+            *args))
+
+    def recover_messages(self, consumer_id, min_age=None, timestamp=None,
+                         force=False):
+        timestamp = self._timestamp(timestamp)
+        cutoff = timestamp - (min_age or 0)
+        stale = self._stale_processing_consumers(consumer_id, cutoff)
+        requeued = 0
+        for message_id, old_owner in self.conn.hgetall(
+                self.processing_owner_key).items():
+            if isinstance(message_id, bytes):
+                old_consumer = old_owner.split(b'.', 1)[0]
+            else:
+                old_consumer = old_owner.split('.', 1)[0]
+            if isinstance(old_consumer, bytes):
+                old_consumer = old_consumer.decode('utf8')
+            if old_consumer in stale:
+                state = self.conn.hget(self.processing_state_key, message_id)
+                if isinstance(state, bytes):
+                    state = state.decode('utf8')
+                if force or state != 'finalizing':
+                    if self.requeue_message(message_id):
+                        requeued += 1
+        return requeued
+
 
 class PriorityRedisStorage(RedisPriorityQueue, RedisStorage): pass
 
@@ -687,7 +1043,20 @@ class SqliteStorage(BaseSqlStorage):
                   'data blob not null, priority real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
-    ddl = [table_kv, table_sched, index_sched, table_task, index_task]
+    table_unacked = ('create table if not exists unacked ('
+                     'id text not null primary key, queue text not null, '
+                     'consumer_id text not null, owner_id text not null, '
+                     'state text not null, data blob not null, '
+                     'priority real not null default 0.0, '
+                     'timestamp real not null)')
+    index_unacked = ('create index if not exists unacked_queue_consumer '
+                     'on unacked (queue, consumer_id, timestamp)')
+    table_consumer = ('create table if not exists consumer ('
+                      'queue text not null, consumer_id text not null, '
+                      'owner_id text not null, timestamp real not null, '
+                      'primary key (queue, consumer_id))')
+    ddl = [table_kv, table_sched, index_sched, table_task, index_task,
+           table_unacked, index_unacked, table_consumer]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -736,6 +1105,116 @@ class SqliteStorage(BaseSqlStorage):
                 curs.execute('delete from task where id = ?', (tid,))
                 if curs.rowcount == 1:
                     return to_bytes(data)
+
+    def supports_drain(self):
+        return True
+
+    def register_consumer(self, consumer_id, owner_id, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        self.sql('insert or replace into consumer '
+                 '(queue, consumer_id, owner_id, timestamp) '
+                 'values (?, ?, ?, ?)',
+                 (self.name, consumer_id, owner_id, timestamp), True)
+        return True
+
+    def heartbeat_consumer(self, consumer_id, owner_id, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        self.sql('update consumer set timestamp=?, owner_id=? where queue=? '
+                 'and consumer_id=?',
+                 (timestamp, owner_id, self.name, consumer_id), True)
+        return True
+
+    def unregister_consumer(self, consumer_id, owner_id):
+        return self.sql('delete from consumer where queue=? and consumer_id=? '
+                        'and owner_id=?', (self.name, consumer_id, owner_id),
+                        True) is None and True
+
+    def pull_message(self, consumer_id, owner_id, block=True, timeout=None):
+        message_id = uuid.uuid4().hex
+        timestamp = time.time()
+        with self.db(commit=True) as curs:
+            curs.execute('select id, data, priority from task where queue=? '
+                         'order by priority desc, id limit 1', (self.name,))
+            result = curs.fetchone()
+            if result is None:
+                return
+            task_id, data, priority = result
+            curs.execute('delete from task where id=?', (task_id,))
+            if curs.rowcount != 1:
+                return
+            curs.execute('insert into unacked '
+                         '(id, queue, consumer_id, owner_id, state, data, '
+                         'priority, timestamp) values (?, ?, ?, ?, ?, ?, ?, ?)',
+                         (message_id, self.name, consumer_id, owner_id,
+                          'running', to_blob(data), priority or 0, timestamp))
+            return {'id': message_id, 'data': to_bytes(data),
+                    'priority': priority}
+
+    def set_message_state(self, message_id, state):
+        with self.db(commit=True) as curs:
+            curs.execute('update unacked set state=? where id=? and queue=?',
+                         (state, message_id, self.name))
+            return curs.rowcount == 1
+
+    def ack_message(self, message_id, owner_id=None):
+        sql = 'delete from unacked where queue=? and id=?'
+        params = [self.name, message_id]
+        if owner_id is not None:
+            sql += ' and owner_id=?'
+            params.append(owner_id)
+        with self.db(commit=True) as curs:
+            curs.execute(sql, params)
+            return curs.rowcount == 1
+
+    def requeue_message(self, message_id, owner_id=None, consumer_id=None,
+                        timestamp=None, data=None):
+        with self.db(commit=True) as curs:
+            sql = ('select data, priority, owner_id from unacked where '
+                   'queue=? and id=?')
+            params = [self.name, message_id]
+            if owner_id is not None:
+                sql += ' and owner_id=?'
+                params.append(owner_id)
+            curs.execute(sql, params)
+            result = curs.fetchone()
+            if result is None:
+                return False
+            _, priority, _ = result
+            curs.execute('insert into task (queue, data, priority) values '
+                         '(?, ?, ?)',
+                         (self.name,
+                          to_blob(data) if data is not None else result[0],
+                          priority or 0))
+            curs.execute('delete from unacked where queue=? and id=?',
+                         (self.name, message_id))
+            return curs.rowcount == 1
+
+    def recover_messages(self, consumer_id, min_age=None, timestamp=None):
+        timestamp = time.time() if timestamp is None else timestamp
+        cutoff = timestamp - (min_age or 0)
+        with self.db(commit=True) as curs:
+            curs.execute('select u.id from unacked u left join consumer c '
+                         'on c.queue=u.queue and c.consumer_id=u.consumer_id '
+                         'where u.queue=? and ('
+                         '(u.consumer_id=? and (c.consumer_id is null or '
+                         'u.timestamp<=?)) or '
+                         '(u.consumer_id<>? and (c.consumer_id is null or '
+                         'c.timestamp<=?)))',
+                         (self.name, consumer_id, cutoff, consumer_id, cutoff))
+            message_ids = [row[0] for row in curs.fetchall()]
+            for message_id in message_ids:
+                curs.execute('select data, priority from unacked where '
+                             'queue=? and id=?', (self.name, message_id))
+                result = curs.fetchone()
+                if result is None:
+                    continue
+                data, priority = result
+                curs.execute('insert into task (queue, data, priority) '
+                             'values (?, ?, ?)',
+                             (self.name, data, priority or 0))
+                curs.execute('delete from unacked where queue=? and id=?',
+                             (self.name, message_id))
+            return len(message_ids)
 
     def queue_size(self):
         return self.sql('select count(id) from task where queue=?',

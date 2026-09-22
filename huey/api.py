@@ -330,6 +330,14 @@ class Huey(object):
         if data is not None:
             return self.deserialize_task(data)
 
+    def pull_message(self, consumer_id, owner_id, block=True, timeout=None):
+        message = self.storage.pull_message(consumer_id, owner_id,
+                                            block=block, timeout=timeout)
+        if message is not None:
+            message['consumer_id'] = consumer_id
+            message['owner_id'] = owner_id
+        return message
+
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
 
@@ -358,7 +366,7 @@ class Huey(object):
         return (utcnow() if self.utc else
                 datetime.datetime.now())
 
-    def execute(self, task, timestamp=None):
+    def execute(self, task, timestamp=None, message=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
 
@@ -373,9 +381,18 @@ class Huey(object):
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
-            return self._execute(task, timestamp)
+            return self._execute(task, timestamp, message)
 
-    def _execute(self, task, timestamp):
+    def _execute(self, task, timestamp, message=None):
+        storage = self.storage if message is not None else None
+        message_id = message['id'] if message is not None else None
+        owner_id = message.get('owner_id') if message is not None else None
+
+        def begin_finalizing():
+            if storage is None:
+                return False
+            return storage.set_message_state(message_id, 'finalizing')
+
         if self._pre_execute:
             try:
                 self._run_pre_execute(task)
@@ -426,51 +443,81 @@ class Huey(object):
         else:
             logger.info('%s executed in %0.3fs', task, duration)
 
-        # Clear the flag if this instance of the task was revoked after it
-        # began executing by destructively reading it's revoke key.
-        if not isinstance(task, PeriodicTask):
-            self.get(task.revoke_id)
+        try:
+            if storage is not None and not begin_finalizing():
+                logger.warning('Message for task %s was requeued by another '
+                               'consumer; skipping completion.', task.id)
+                return
 
-        if self.results and not isinstance(task, PeriodicTask):
-            if exception is not None:
-                error_data = self.build_error_result(task, exception)
-                self.put_result(task.id, Error(error_data))
-            elif task_value is not None or self.store_none:
-                self.put_result(task.id, task_value)
+            # Clear the flag if this instance of the task was revoked after it
+            # began executing by destructively reading it's revoke key.
+            if not isinstance(task, PeriodicTask):
+                self.get(task.revoke_id)
 
-        if self._post_execute:
-            self._run_post_execute(task, task_value, exception)
+            if self.results and not isinstance(task, PeriodicTask):
+                if exception is not None:
+                    error_data = self.build_error_result(task, exception)
+                    self.put_result(task.id, Error(error_data))
+                elif task_value is not None or self.store_none:
+                    self.put_result(task.id, task_value)
 
-        if exception is None:
-            # Task executed successfully, send the COMPLETE signal.
-            self._emit(S.SIGNAL_COMPLETE, task)
+            if self._post_execute:
+                self._run_post_execute(task, task_value, exception)
 
-        if task.on_complete and exception is None:
-            next_task = task.on_complete
-            next_task.extend_data(task_value)
-            self.enqueue(next_task)
-        elif task.on_error and exception is not None:
-            next_task = task.on_error
-            next_task.extend_data(exception)
-            self.enqueue(next_task)
+            if exception is None:
+                # Task executed successfully, send the COMPLETE signal.
+                self._emit(S.SIGNAL_COMPLETE, task)
 
-        if exception is not None and task.retries:
-            self._emit(S.SIGNAL_RETRYING, task)
-            self._requeue_task(task, self._get_timestamp(), retry_eta)
+            if task.on_complete and exception is None:
+                next_task = task.on_complete
+                next_task.extend_data(task_value)
+                self.enqueue(next_task)
+            elif task.on_error and exception is not None:
+                next_task = task.on_error
+                next_task.extend_data(exception)
+                self.enqueue(next_task)
+
+            if exception is not None and task.retries:
+                self._emit(S.SIGNAL_RETRYING, task)
+                self._requeue_task(task, self._get_timestamp(), retry_eta,
+                                  message=message)
+            elif storage is not None:
+                if not storage.ack_message(message_id, owner_id=owner_id):
+                    logger.warning('Unable to ack task %s; it may have been '
+                                   'requeued.', task.id)
+        except KeyboardInterrupt:
+            logger.warning('Interrupted while finalizing task %s.', task.id)
+            raise
 
         return task_value
 
-    def _requeue_task(self, task, timestamp, retry_eta=None):
+    def _requeue_task(self, task, timestamp, retry_eta=None, message=None):
         task.retries -= 1
         logger.info('Requeueing %s, %s retries', task.id, task.retries)
+        if message is not None:
+            storage = self.storage
+            if retry_eta is not None or task.retry_delay:
+                if not storage.set_message_state(message['id'], 'finalizing'):
+                    task.retries += 1
+                    return
+            elif not storage.requeue_message(message['id'],
+                                             owner_id=message.get('owner_id'),
+                                             consumer_id=message.get(
+                                                 'consumer_id'),
+                                             data=self.serialize_task(task)):
+                task.retries += 1
+                return
         if retry_eta is not None:
             task.eta = retry_eta
-            self.add_schedule(task)
         elif task.retry_delay:
             delay = datetime.timedelta(seconds=task.retry_delay)
             task.eta = timestamp + delay
+        if task.eta is not None:
+            if message is not None:
+                storage.ack_message(message['id'],
+                                    owner_id=message.get('owner_id'))
             self.add_schedule(task)
-        else:
+        elif message is None:
             self.enqueue(task)
 
     def _run_pre_execute(self, task):

@@ -22,6 +22,7 @@ config_defaults = (
     ('simple_log', None),
     ('flush_locks', False),
     ('extra_locks', None),
+    ('drain_timeout', None),
 )
 config_keys = [param for param, _ in config_defaults]
 
@@ -69,7 +70,11 @@ class OptionParserHandler(object):
             option('flush_locks', action='store_true', dest='flush_locks',
                    help=('flush all locks when starting consumer.')),
             option(('L', 'extra-locks'), dest='extra_locks',
-                   help=('additional locks to flush, separated by comma.')),
+                    help=('additional locks to flush, separated by comma.')),
+            option(('T', 'drain-timeout'), type='float',
+                   dest='drain_timeout', metavar='SECONDS',
+                   help=('stop claiming tasks and wait this long for active '
+                         'tasks on SIGTERM before requeueing them')),
         )
 
     def get_scheduler_options(self):
