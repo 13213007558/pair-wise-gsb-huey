@@ -3,6 +3,15 @@ Changelog
 
 ## master
 
+* Add optional consumer ``drain_timeout`` (``-T`` / ``--drain-timeout``).
+  When configured, ``SIGTERM`` triggers a graceful drain: workers stop
+  dequeueing new tasks, in-flight tasks are given up to ``drain_timeout``
+  seconds to finish, and any tasks still unacknowledged afterwards are
+  released back to the queue (per storage-backend capabilities). A second
+  ``SIGTERM`` forces an immediate shutdown. ``SqliteStorage`` now tracks
+  claims on dequeued tasks and a new consumer reclaims tasks orphaned by
+  a consumer that is no longer running.
+
 [View commits](https://github.com/coleifer/huey/compare/2.5.3...HEAD)
 
 ## 2.5.3

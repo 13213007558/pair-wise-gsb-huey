@@ -165,6 +165,18 @@ class TestMemoryStorage(StorageTests, BaseTestCase):
         return MemoryHuey(utc=False)
 
 
+def get_redis_version():
+    try:
+        return int(Redis().info()['redis_version'].split('.', 1)[0])
+    except Exception:
+        return 0  # Redis server unavailable.
+
+
+requires_redis = unittest.skipIf(
+    get_redis_version() == 0, 'requires a running redis server')
+
+
+@requires_redis
 class TestRedisStorage(StorageTests, BaseTestCase):
     def get_huey(self):
         return RedisHuey(utc=False)
@@ -180,6 +192,7 @@ class TestRedisStorage(StorageTests, BaseTestCase):
         RedisHuey(host=None, port=None, db=None, url='redis://localhost')
 
 
+@requires_redis
 class TestRedisExpireStorage(StorageTests, BaseTestCase):
     # Note that this does not subclass the StorageTests. This is partly because
     # the functionality should already be covered by the TestRedisStorage, as
@@ -253,10 +266,6 @@ class TestRedisExpireStorage(StorageTests, BaseTestCase):
             r1.reset()
             r3.reset()
         self.assertEqual(self.huey.result_count(), 2)  # r1 and r3 still there.
-
-
-def get_redis_version():
-    return int(Redis().info()['redis_version'].split('.', 1)[0])
 
 
 @unittest.skipIf(get_redis_version() < 5, 'Requires Redis >= 5.0')

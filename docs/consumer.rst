@@ -152,6 +152,16 @@ their default values.
     not be discovered during consumer startup, but you wish to ensure they are
     cleared. Implies ``--flush-locks``.
 
+``-T``, ``--drain-timeout``
+    When the consumer is asked to shut down, stop dequeueing new tasks and
+    wait up to the given number of seconds for in-flight tasks to finish
+    before exiting. Tasks that are still unacknowledged when the timeout
+    expires are released back to the queue (subject to the capabilities of
+    the storage backend), so they can be picked up by another consumer
+    instead of being lost. By default no drain timeout is configured, and
+    ``SIGTERM`` shuts the consumer down immediately. See
+    :ref:`consumer-shutdown` for more details.
+
 ``-s``, ``--scheduler-interval``
     The frequency with which the scheduler should run. By default this will run
     every second, but you can increase the interval to as much as 60 seconds.
@@ -274,6 +284,36 @@ they are currently executing before the process exits.
 
 Alternatively, you can shutdown the consumer using ``SIGTERM`` and any running
 tasks will be interrupted, ensuring the process exits quickly.
+
+Draining in-flight tasks
+^^^^^^^^^^^^^^^^^^^^^^^^^
+
+If you configure a ``drain_timeout`` (``-T``/``--drain-timeout``), then
+``SIGTERM`` triggers a graceful drain instead of an immediate shutdown:
+
+1. The workers and scheduler stop dequeueing new tasks.
+2. The consumer waits up to ``drain_timeout`` seconds for in-flight tasks
+   to finish (their results are persisted as usual).
+3. Any tasks that are still unacknowledged when the timeout expires are
+   released back to the queue, so another consumer can pick them up.
+
+A task that has finished executing and is being finalized (storing its
+result, being re-queued for retry, or running callbacks) is never both
+acknowledged and re-queued. Sending a second ``SIGTERM`` while draining
+forces an immediate shutdown.
+
+How unacknowledged tasks are handled depends on the storage backend:
+
+* ``SqliteStorage`` records a claim (lease) for each dequeued task, which
+  is removed when the task is acknowledged. Claims left behind by a
+  consumer that is no longer running are reclaimed automatically when a
+  new consumer starts up, so orphaned tasks are returned to the queue.
+  Claims held by other, still-running consumers are left alone.
+* ``MemoryStorage`` tracks unacknowledged tasks in the consumer process
+  and re-enqueues them when the consumer drains.
+* ``RedisStorage`` keeps its existing dequeue semantics (``BRPOP``); the
+  consumer re-enqueues any unacknowledged tasks when it drains, but tasks
+  held by a consumer that is killed abruptly are lost, as before.
 
 .. warning::
     Huey does not guarantee at-least-once delivery of messages, and does not do

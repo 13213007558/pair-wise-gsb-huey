@@ -3,6 +3,7 @@ import inspect
 import itertools
 import logging
 import re
+import threading
 import time
 import traceback
 import uuid
@@ -129,6 +130,17 @@ class Huey(object):
         self._registry = Registry()
         self._signal = S.Signal()
         self._tasks_in_flight = set()
+
+        # Tasks that have been dequeued but not yet acknowledged. Maps the
+        # task id to a [task, data, disposing, notified] list, where "data"
+        # is the serialized task exactly as it was dequeued, "disposing" is
+        # set once the task has finished executing and its outcome is being
+        # finalized (result store, retry re-queue, callbacks), and "notified"
+        # indicates an INTERRUPTED signal was already emitted. Guarded by
+        # "_unacked_lock", which also serializes the "disposing" flag against
+        # release_unacked_tasks() so a task is never both acked and re-queued.
+        self._unacked_tasks = {}
+        self._unacked_lock = threading.Lock()
 
     def get_task_wrapper_class(self):
         return TaskWrapper
@@ -328,7 +340,73 @@ class Huey(object):
     def dequeue(self):
         data = self.storage.dequeue()
         if data is not None:
-            return self.deserialize_task(data)
+            task = self.deserialize_task(data)
+            self._track_unacked(task, data)
+            return task
+
+    def _track_unacked(self, task, data):
+        with self._unacked_lock:
+            self._unacked_tasks[task.id] = [task, data, False, False]
+
+    def _mark_task_disposing(self, task):
+        # Called once the task function has finished and its outcome is being
+        # finalized (storing the result, re-queueing for retry, running
+        # callbacks). Tasks in this state are skipped by
+        # release_unacked_tasks(), ensuring a task is never both acknowledged
+        # and re-queued.
+        with self._unacked_lock:
+            entry = self._unacked_tasks.get(task.id)
+            if entry is not None:
+                entry[2] = True
+
+    def _mark_task_interrupted(self, task):
+        # Note that an INTERRUPTED signal was already emitted for this task,
+        # so that release_unacked_tasks() does not emit it a second time.
+        with self._unacked_lock:
+            entry = self._unacked_tasks.get(task.id)
+            if entry is not None:
+                entry[3] = True
+
+    def _ack_task(self, task):
+        with self._unacked_lock:
+            entry = self._unacked_tasks.pop(task.id, None)
+        if entry is not None:
+            try:
+                self.storage.ack(entry[1])
+            except Exception:
+                logger.exception('Error acknowledging task %s', task.id)
+
+    def release_unacked_tasks(self):
+        """
+        Return any tasks that were dequeued but never acknowledged back to
+        the queue. Tasks that finished executing and are being finalized
+        (e.g. writing results or being re-queued for retry) are excluded, so
+        a task is never both acknowledged and re-queued.
+
+        :return: list of tasks that were released back to the queue.
+        """
+        with self._unacked_lock:
+            pending = []
+            for task_id, entry in list(self._unacked_tasks.items()):
+                if not entry[2]:  # Skip tasks that are being finalized.
+                    pending.append(entry)
+                    del self._unacked_tasks[task_id]
+
+        released = []
+        for task, data, _, notified in pending:
+            self._tasks_in_flight.discard(task)
+            if not notified:
+                self._emit(S.SIGNAL_INTERRUPTED, task)
+            try:
+                self.storage.release_task(data, task.priority)
+            except Exception:
+                logger.exception('Error releasing unacknowledged task %s',
+                                 task.id)
+            else:
+                released.append(task)
+                logger.info('Released unacknowledged task %s back to the '
+                            'queue.', task)
+        return released
 
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
@@ -364,12 +442,15 @@ class Huey(object):
 
         if not self.ready_to_run(task, timestamp):
             self.add_schedule(task)
+            self._ack_task(task)
         elif self.is_revoked(task, timestamp, False):
             logger.warning('Task %s was revoked, not executing', task)
             self._emit(S.SIGNAL_REVOKED, task)
+            self._ack_task(task)
         elif task.expires_resolved and task.expires_resolved < timestamp:
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
+            self._ack_task(task)
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
@@ -381,6 +462,7 @@ class Huey(object):
                 self._run_pre_execute(task)
             except CancelExecution:
                 self._emit(S.SIGNAL_CANCELED, task)
+                self._ack_task(task)
                 return
 
         start = time_clock()
@@ -418,6 +500,10 @@ class Huey(object):
         except KeyboardInterrupt:
             logger.warning('Received exit signal, %s did not finish.', task.id)
             self._emit(S.SIGNAL_INTERRUPTED, task)
+            self._mark_task_interrupted(task)
+            # NB: the task is deliberately left unacknowledged, so that it
+            # can be released back to the queue by the consumer (or reclaimed
+            # by a subsequent consumer, if the storage supports it).
             return
         except Exception as exc:
             logger.exception('Unhandled exception in task %s.', task.id)
@@ -425,6 +511,13 @@ class Huey(object):
             self._emit(S.SIGNAL_ERROR, task, exc)
         else:
             logger.info('%s executed in %0.3fs', task, duration)
+
+        # The task function has finished and we are now finalizing the
+        # outcome (storing the result, running callbacks, re-queueing for
+        # retry). Mark the task so a concurrent drain will not release it
+        # back to the queue, which could cause it to be both acked and
+        # re-queued.
+        self._mark_task_disposing(task)
 
         # Clear the flag if this instance of the task was revoked after it
         # began executing by destructively reading it's revoke key.
@@ -458,6 +551,7 @@ class Huey(object):
             self._emit(S.SIGNAL_RETRYING, task)
             self._requeue_task(task, self._get_timestamp(), retry_eta)
 
+        self._ack_task(task)
         return task_value
 
     def _requeue_task(self, task, timestamp, retry_eta=None):

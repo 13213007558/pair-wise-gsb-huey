@@ -17,6 +17,7 @@ config_defaults = (
     ('health_check_interval', 10),
     ('scheduler_interval', 1),
     ('periodic', True),
+    ('drain_timeout', None),
     ('logfile', None),
     ('verbose', None),
     ('simple_log', None),
@@ -70,6 +71,12 @@ class OptionParserHandler(object):
                    help=('flush all locks when starting consumer.')),
             option(('L', 'extra-locks'), dest='extra_locks',
                    help=('additional locks to flush, separated by comma.')),
+            option(('T', 'drain-timeout'), type='float', dest='drain_timeout',
+                   metavar='SECONDS',
+                   help=('when shutting down, stop dequeueing new tasks and '
+                         'wait up to SECONDS for in-flight tasks to finish; '
+                         'unacknowledged tasks are then released back to the '
+                         'queue (default=None, shut down immediately)')),
         )
 
     def get_scheduler_options(self):
@@ -137,6 +144,9 @@ class ConsumerConfig(namedtuple('_ConsumerConfig', config_keys)):
         if 60 % self.scheduler_interval != 0:
             raise ValueError('The scheduler interval must be a factor of 60: '
                              '1, 2, 3, 4, 5, 6, 10, 12, 15, 20, 30, or 60')
+        if self.drain_timeout is not None and self.drain_timeout < 0:
+            raise ValueError('The drain timeout must be greater than or '
+                             'equal to 0.')
 
     @property
     def loglevel(self):

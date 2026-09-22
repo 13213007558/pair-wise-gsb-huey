@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shutil
+import socket
 try:
     import sqlite3
 except ImportError:
@@ -15,6 +16,7 @@ except ImportError:
 import struct
 import threading
 import time
+import uuid
 import warnings
 
 try:
@@ -74,6 +76,57 @@ class BaseStorage(object):
         :return: Opaque binary task data or None if queue is empty.
         """
         raise NotImplementedError
+
+    def ack(self, data):
+        """
+        Acknowledge that a previously-dequeued task has been fully processed
+        (its result stored, or it has been re-queued for retry, etc.).
+
+        :param bytes data: Task data, as originally returned by dequeue().
+        :return: No return value.
+
+        The default implementation is a no-op, since for most backends the
+        dequeue() operation is itself destructive. Backends that implement
+        lease/ack semantics (e.g. SqliteStorage) override this method to
+        finalize the removal of the task.
+        """
+        pass
+
+    def release_task(self, data, priority=None):
+        """
+        Return a dequeued-but-unacknowledged task to the queue. Used when the
+        consumer shuts down (or a worker exits) before the task could be
+        finished.
+
+        :param bytes data: Task data, as originally returned by dequeue().
+        :param float priority: Priority of the task, if supported.
+        :return: No return value.
+
+        The default implementation simply re-enqueues the task.
+        """
+        self.enqueue(data, priority)
+
+    def unacked_owners(self):
+        """
+        Return a list of opaque identifiers corresponding to consumers that
+        hold leases on dequeued-but-unacknowledged tasks. Used to detect
+        tasks orphaned by a consumer that exited without acknowledging or
+        releasing them.
+
+        :return: List of owner identifiers (strings). Empty by default.
+        """
+        return []
+
+    def reclaim_unacked(self, owners):
+        """
+        Return tasks leased by the given owners to the queue. This is used
+        at consumer startup to take over tasks that were dequeued by a
+        consumer that is no longer running.
+
+        :param owners: List of owner identifiers (see unacked_owners()).
+        :return: Number of tasks that were returned to the queue.
+        """
+        return 0
 
     def queue_size(self):
         """
@@ -687,7 +740,14 @@ class SqliteStorage(BaseSqlStorage):
                   'data blob not null, priority real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
-    ddl = [table_kv, table_sched, index_sched, table_task, index_task]
+    table_claim = ('create table if not exists task_claim ('
+                   'id integer not null primary key, queue text not null, '
+                   'data blob not null, priority real not null default 0.0, '
+                   'owner text not null, claimed real not null)')
+    index_claim = ('create index if not exists claim_queue_owner '
+                   'on task_claim (queue, owner)')
+    ddl = [table_kv, table_sched, index_sched, table_task, index_task,
+           table_claim, index_claim]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -722,20 +782,79 @@ class SqliteStorage(BaseSqlStorage):
         conn.execute('pragma synchronous=%s' % (2 if self._fsync else 0))
         return conn
 
+    @property
+    def owner(self):
+        # Opaque identifier for the consumer using this storage instance. Used
+        # to tag dequeued-but-unacknowledged tasks so that a subsequent
+        # consumer can identify (and reclaim) tasks orphaned by a consumer
+        # that is no longer running. The identifier is unique per-process.
+        pid = os.getpid()
+        if getattr(self, '_owner_pid', None) != pid:
+            self._owner_pid = pid
+            self._owner = '%s:%d:%s' % (
+                socket.gethostname(), pid, uuid.uuid4().hex)
+        return self._owner
+
     def enqueue(self, data, priority=None):
         self.sql('insert into task (queue, data, priority) values (?, ?, ?)',
                  (self.name, to_blob(data), priority or 0), commit=True)
 
     def dequeue(self):
         with self.db(commit=True) as curs:
-            curs.execute('select id, data from task where queue = ? '
+            curs.execute('select id, data, priority from task where queue = ? '
                          'order by priority desc, id limit 1', (self.name,))
             result = curs.fetchone()
             if result is not None:
-                tid, data = result
+                tid, data, priority = result
                 curs.execute('delete from task where id = ?', (tid,))
                 if curs.rowcount == 1:
+                    # Record a claim on the dequeued task. The claim is
+                    # finalized by ack() once the task has been processed, or
+                    # released/reclaimed if the consumer exits first.
+                    curs.execute(
+                        'insert into task_claim (queue, data, priority, '
+                        'owner, claimed) values (?, ?, ?, ?, ?)',
+                        (self.name, to_blob(data), priority, self.owner,
+                         time.time()))
                     return to_bytes(data)
+
+    def ack(self, data):
+        self.sql('delete from task_claim where rowid = ('
+                 'select rowid from task_claim where queue = ? and data = ? '
+                 'limit 1)', (self.name, to_blob(data)), commit=True)
+
+    def release_task(self, data, priority=None):
+        # Atomically clear the claim and return the task to the queue.
+        with self.db(commit=True) as curs:
+            curs.execute('delete from task_claim where rowid = ('
+                         'select rowid from task_claim where queue = ? and '
+                         'data = ? limit 1)', (self.name, to_blob(data)))
+            curs.execute('insert into task (queue, data, priority) '
+                         'values (?, ?, ?)',
+                         (self.name, to_blob(data), priority or 0))
+
+    def unacked_owners(self):
+        res = self.sql('select distinct owner from task_claim where queue = ?',
+                       (self.name,), results=True)
+        return [row[0] for row in res]
+
+    def reclaim_unacked(self, owners):
+        reclaimed = 0
+        with self.db(commit=True) as curs:
+            for owner in owners:
+                curs.execute('select data, priority from task_claim where '
+                             'queue = ? and owner = ?', (self.name, owner))
+                rows = curs.fetchall()
+                if not rows:
+                    continue
+                curs.execute('delete from task_claim where queue = ? and '
+                             'owner = ?', (self.name, owner))
+                curs.executemany(
+                    'insert into task (queue, data, priority) '
+                    'values (?, ?, ?)',
+                    [(self.name, data, priority) for data, priority in rows])
+                reclaimed += len(rows)
+        return reclaimed
 
     def queue_size(self):
         return self.sql('select count(id) from task where queue=?',
@@ -752,6 +871,8 @@ class SqliteStorage(BaseSqlStorage):
 
     def flush_queue(self):
         self.sql('delete from task where queue=?', (self.name,), commit=True)
+        self.sql('delete from task_claim where queue=?', (self.name,),
+                 commit=True)
 
     def add_to_schedule(self, data, ts):
         params = (self.name, to_blob(data), to_timestamp(ts))

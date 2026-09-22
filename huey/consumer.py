@@ -2,6 +2,7 @@ import datetime
 import logging
 import os
 import signal
+import socket
 import sys
 import threading
 import time
@@ -258,7 +259,7 @@ class Consumer(object):
                  backoff=1.15, max_delay=10.0, scheduler_interval=1,
                  worker_type=WORKER_THREAD, check_worker_health=True,
                  health_check_interval=10, flush_locks=False,
-                 extra_locks=None):
+                 extra_locks=None, drain_timeout=None):
 
         self._logger = logging.getLogger('huey.consumer')
         if huey.immediate:
@@ -266,12 +267,21 @@ class Consumer(object):
                                  'that has "immediate" mode enabled. This '
                                  'must be disabled before the consumer can '
                                  'be run.')
+        if drain_timeout is not None and drain_timeout < 0:
+            raise ConfigurationError('drain_timeout must be >= 0')
         self.huey = huey
         self.workers = workers  # Number of workers.
         self.periodic = periodic  # Enable periodic task scheduler?
         self.default_delay = initial_delay  # Default queue polling interval.
         self.backoff = backoff  # Exponential backoff factor when queue empty.
         self.max_delay = max_delay  # Maximum interval between polling events.
+
+        # When a drain timeout is specified, SIGTERM (or a graceful shutdown)
+        # will stop the workers from dequeueing new tasks and wait up to this
+        # many seconds for in-flight tasks to finish. Any tasks that are
+        # still unacknowledged afterwards are released back to the queue
+        # (subject to the capabilities of the storage backend).
+        self.drain_timeout = drain_timeout
 
         # Ensure that the scheduler runs at an interval between 1 and 60s.
         self.scheduler_interval = max(min(scheduler_interval, 60), 1)
@@ -298,6 +308,7 @@ class Consumer(object):
         self._received_signal = False
         self._restart = False
         self._graceful = True
+        self._force_shutdown = False
         self.stop_flag = self.environment.get_stop_flag()
 
         # In the event the consumer was killed while running a task that held
@@ -366,6 +377,17 @@ class Consumer(object):
                 self._logger.exception('Process %s died!', name)
             finally:
                 process.shutdown()
+                if (self.worker_type == WORKER_PROCESS and
+                        self.drain_timeout is not None):
+                    # This code runs in the child process, so any tasks it
+                    # dequeued but did not acknowledge are only visible here.
+                    # Release them so they can be picked up by another
+                    # consumer instead of being lost.
+                    released = self.huey.release_unacked_tasks()
+                    if released:
+                        self._logger.info(
+                            '%s released %d unacknowledged task(s) back to '
+                            'the queue.', name, len(released))
         return self.environment.create_process(_run, name)
 
     def start(self):
@@ -400,6 +422,10 @@ class Consumer(object):
 
         self._logger.info('\n'.join(msg))
 
+        # Take over any tasks that were dequeued by a previous consumer that
+        # is no longer running (if the storage backend supports it).
+        self._reclaim_unacked_tasks()
+
         # Start the scheduler and workers.
         self.scheduler.start()
         for _, worker_process in self.worker_threads:
@@ -407,6 +433,53 @@ class Consumer(object):
 
         # Finally set the signal handlers for main process.
         self._set_signal_handlers()
+
+    def _reclaim_unacked_tasks(self):
+        storage = self.huey.storage
+        try:
+            owners = storage.unacked_owners()
+        except Exception:
+            self._logger.exception('Error checking for unacknowledged tasks.')
+            return
+
+        # Only reclaim tasks whose owner is no longer running. Claims held by
+        # live consumers (e.g. another consumer sharing the same queue) are
+        # left alone.
+        dead_owners = [owner for owner in owners
+                       if not self._owner_is_alive(owner)]
+        if not dead_owners:
+            return
+
+        try:
+            reclaimed = storage.reclaim_unacked(dead_owners)
+        except Exception:
+            self._logger.exception('Error reclaiming unacknowledged tasks.')
+        else:
+            if reclaimed:
+                self._logger.warning(
+                    'Reclaimed %d unacknowledged task(s) from %d dead '
+                    'consumer(s): %s', reclaimed, len(dead_owners),
+                    ', '.join(dead_owners))
+
+    def _owner_is_alive(self, owner):
+        # Owner identifiers are of the form "hostname:pid:token". If the
+        # format is unrecognized, or the owner resides on another host, we
+        # conservatively assume it is alive and leave its claims alone.
+        try:
+            host, pid, _ = owner.rsplit(':', 2)
+            pid = int(pid)
+        except (AttributeError, ValueError):
+            return True
+        if host != socket.gethostname() or pid == os.getpid():
+            return True
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except OSError:
+            # Insufficient permissions or unsupported platform: assume alive.
+            return True
+        return True
 
     def stop(self, graceful=False):
         """
@@ -417,18 +490,61 @@ class Consumer(object):
         """
         self.stop_flag.set()
         if graceful:
-            self._logger.info('Shutting down gracefully...')
+            if self.drain_timeout is not None:
+                self._logger.info(
+                    'Draining: no new tasks will be dequeued, waiting up to '
+                    '%0.1fs for in-flight tasks to finish...',
+                    self.drain_timeout)
+            else:
+                self._logger.info('Shutting down gracefully...')
             try:
-                for _, worker_process in self.worker_threads:
-                    worker_process.join()
-                self.scheduler.join()
+                stopped = self._join_processes(self.drain_timeout)
             except KeyboardInterrupt:
                 self._logger.info('Received request to shut down now.')
                 self._restart = False
             else:
-                self._logger.info('All workers have stopped.')
+                if stopped:
+                    self._logger.info('All workers have stopped.')
+                else:
+                    self._logger.warning(
+                        'Timed out or interrupted while waiting for workers '
+                        'to finish.')
         else:
             self._logger.info('Shutting down')
+
+        if self.drain_timeout is not None:
+            # Return any dequeued-but-unacknowledged tasks to the queue, so
+            # they can be picked up by another consumer. Tasks that finished
+            # executing and are being finalized (result store, retry,
+            # callbacks) are excluded, so a task is never both acknowledged
+            # and re-queued.
+            released = self.huey.release_unacked_tasks()
+            if released:
+                self._logger.info('Released %d unacknowledged task(s) back '
+                                  'to the queue.', len(released))
+
+    def _join_processes(self, timeout=None):
+        """
+        Wait for the worker and scheduler processes to exit, returning True
+        if they all stopped. If a timeout is specified, give up once the
+        timeout has expired. A forced shutdown (e.g. a second SIGTERM) also
+        causes an early return.
+        """
+        deadline = None if timeout is None else time_clock() + timeout
+        processes = [process for _, process in self.worker_threads]
+        processes.append(self.scheduler)
+        for process in processes:
+            while self.environment.is_alive(process):
+                if self._force_shutdown:
+                    return False
+                wait = 0.1
+                if deadline is not None:
+                    remaining = deadline - time_clock()
+                    if remaining <= 0:
+                        return False
+                    wait = min(wait, remaining)
+                process.join(wait)
+        return True
 
     def run(self):
         """
@@ -533,15 +649,31 @@ class Consumer(object):
         signal.signal(signal.SIGINT, signal.default_int_handler)
 
     def _handle_stop_signal(self, sig_num, frame):
+        if self._received_signal and not self._restart:
+            # A second SIGTERM indicates we should stop as quickly as
+            # possible, rather than waiting for in-flight tasks to drain.
+            self._logger.info('Received SIGTERM again, forcing shutdown')
+            self._graceful = False
+            self._force_shutdown = True
+            if self.worker_type == WORKER_GREENLET:
+                self._kill_greenlets()
+            return
         self._logger.info('Received SIGTERM')
         self._received_signal = True
         self._restart = False
-        self._graceful = False
-        if self.worker_type == WORKER_GREENLET:
-            def kill_workers():
-                gevent.killall([t for _, t in self.worker_threads],
-                               KeyboardInterrupt)
-            gevent.spawn(kill_workers)
+        # When a drain timeout is configured, SIGTERM triggers a graceful
+        # drain: workers stop dequeueing new tasks and in-flight tasks are
+        # given up to "drain_timeout" seconds to finish. Otherwise the
+        # consumer shuts down immediately.
+        self._graceful = self.drain_timeout is not None
+        if self.worker_type == WORKER_GREENLET and not self._graceful:
+            self._kill_greenlets()
+
+    def _kill_greenlets(self):
+        def kill_workers():
+            gevent.killall([t for _, t in self.worker_threads],
+                           KeyboardInterrupt)
+        gevent.spawn(kill_workers)
 
     def _handle_restart_signal(self, sig_num, frame):
         self._logger.info('Received SIGHUP, will restart')
@@ -560,5 +692,11 @@ class Consumer(object):
             signal.signal(signal.SIGHUP, signal.SIG_IGN)
 
     def _handle_stop_signal_worker(self, sig_num, frame):
+        # When draining, the first SIGTERM is ignored so the worker can
+        # finish its current task; the main process coordinates the drain
+        # using the stop flag. Once the stop flag is set (or draining is
+        # disabled), a TERM interrupts the worker immediately.
+        if self.drain_timeout is not None and not self.stop_flag.is_set():
+            return
         # Raise an interrupt in the subprocess' main loop.
         raise KeyboardInterrupt
