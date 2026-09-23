@@ -345,6 +345,113 @@ For more information:
   enabled have full support for task priorities.
 * :py:meth:`~Huey.task` and :py:meth:`~Huey.periodic_task`
 
+Expiring task results
+---------------------
+
+The result store accumulates different kinds of entries: short-lived
+debugging information (e.g. errors from tasks that will be retried),
+longer-lived business results, group/chord bookkeeping metadata, and
+revocation markers. Huey allows you to configure how long each category
+is retained, using the ``result_store_expiration`` parameter:
+
+.. code-block:: python
+
+    from huey import RedisHuey
+
+    huey = RedisHuey('my-app', result_store_expiration={
+        'default': 86400,     # Fall-back TTL for anything not listed.
+        'complete': 604800,   # Business results: keep for a week.
+        'error': 86400,       # Errors from failed tasks.
+        'retry': 3600,        # Short-term debugging info (will be retried).
+        'group': 86400,       # Group/chord metadata.
+        'revoked': 3600,      # Revocation markers.
+        'pending': None,      # Unfinished/in-progress entries: never expire.
+        'tasks': {
+            # Per-task overrides (scalar or nested per-category dict).
+            'myapp.tasks.generate_report': 2592000,
+            'myapp.tasks.send_email': {'complete': 3600},
+        },
+    })
+
+A single number of seconds (or a ``timedelta``) may be passed instead of a
+dict to apply one TTL to every category. The default, ``None``, disables
+expiration entirely. Individual tasks can also override the policy by
+declaring ``result_ttl`` on the task itself:
+
+.. code-block:: python
+
+    @huey.task(result_ttl=600)
+    def generate_thumbnail(url):
+        # Results for this task expire after 10 minutes.
+        ...
+
+TTL values have the following semantics:
+
+* ``None`` - the entry never expires.
+* ``0`` - the entry expires immediately and is removed by the next cleanup
+  run (Redis cannot apply a zero TTL natively, so the entry may remain
+  visible until cleanup executes).
+* a positive number of seconds / ``timedelta`` - the time-to-live.
+* negative values are rejected with a ``ValueError`` at configuration time.
+
+Expiration is enforced by calling :py:meth:`Huey.cleanup_expired_results`,
+typically from a cron job or a periodic task:
+
+.. code-block:: python
+
+    report = huey.cleanup_expired_results()
+    # {'deleted': [...], 'deleted_count': 3, 'groups_expired': [],
+    #  'scanned': 10, 'skipped_referenced': 2, 'skipped_stale': 0,
+    #  'next_cursor': None, 'done': True}
+
+The cleanup is designed to be safe to run at any time, including
+concurrently with workers and repeatedly:
+
+* It is **idempotent** - running it again (or after a restart) deletes the
+  same entries, and subsequent runs report an empty ``deleted`` list, so
+  the return value is stable and safe for operational retries.
+* It is **reference-aware** - results that are still referenced by a live
+  group (see :py:meth:`Huey.enqueue_group`) are never deleted, and expired
+  group metadata is removed before any member sweep, so a queryable group
+  can never observe its members as missing (which could be mistaken for an
+  empty, falsely-successful group).
+* It cannot **lose updates** - an entry is only deleted if its metadata is
+  unchanged since it was read, so a result that a worker is concurrently
+  writing is never removed.
+* It is **segmentable** - pass ``limit=`` to bound the number of entries
+  examined per call and use the returned ``next_cursor`` to resume.
+  Entries are visited in sorted-key order, so cursors are deterministic
+  and repeatable.
+
+Entries whose metadata is missing or unrecognized (for example, a result
+whose write is still in progress) are treated as ``pending`` and are not
+deleted unless an explicit TTL is configured for that category.
+
+Backend visibility
+^^^^^^^^^^^^^^^^^^
+
+The different storage backends do not make expired entries disappear in
+the same way:
+
+* **Memory** and **SQLite** have no native expiration. Entries remain
+  visible until :py:meth:`~Huey.cleanup_expired_results` runs. Result
+  metadata is written atomically with the result (a lock, or a single
+  transaction, respectively), and compare-and-delete is used so cleanup
+  cannot lose a concurrent worker write.
+* **Redis** (``RedisHuey`` / ``PriorityRedisHuey``) stores results in a
+  hash, which does not support per-field TTLs, so expiration is likewise
+  enforced by the cleanup sweeper. Writes and compare-and-deletes are
+  atomic (transactions / Lua scripts).
+* **Redis with native expiry** (``RedisExpireHuey`` /
+  ``PriorityRedisExpireHuey``) applies the policy TTL (falling back to the
+  storage-level ``expire_time``) using native key expiration. This means
+  an entry may disappear *before* cleanup runs, and native expiry does not
+  honor group references - a member result may expire natively even while
+  its group metadata is still alive. Pass ``expire_time=None`` to disable
+  the storage-level default expiry.
+* **File**, **KyotoTycoon** and the **black-hole** backends do not
+  maintain result metadata; for them the cleanup API is a safe no-op.
+
 Canceling or pausing tasks
 --------------------------
 

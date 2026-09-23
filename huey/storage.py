@@ -29,10 +29,26 @@ except ImportError:
     ConnectionPool = Redis = ConnectionError = TimeoutError = None
 
 from huey.constants import EmptyData
+from huey.expiration import decode_result_meta
+from huey.expiration import encode_result_meta
 from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
 from huey.utils import text_type
 from huey.utils import to_timestamp
+
+
+def _paginate_meta(sorted_items, cursor, limit):
+    """
+    Given (key, raw-meta) pairs sorted by key, return the segment strictly
+    greater than "cursor", along with the cursor for the next segment.
+    """
+    if cursor is not None:
+        sorted_items = [item for item in sorted_items if item[0] > cursor]
+    next_cursor = None
+    if limit is not None and len(sorted_items) > limit:
+        next_cursor = sorted_items[limit - 1][0]
+        sorted_items = sorted_items[:limit]
+    return sorted_items, next_cursor
 
 
 class BaseStorage(object):
@@ -230,6 +246,68 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    # Whether the storage backend keeps result metadata (write timestamps,
+    # result category, group references) alongside results. Backends that do
+    # not support result metadata cannot participate in expiration cleanup;
+    # for them the cleanup APIs are safe no-ops.
+    supports_result_meta = False
+
+    def put_result(self, key, value, meta=None, ttl=None):
+        """
+        Store a task result along with optional metadata.
+
+        :param bytes key: lookup key (typically the task id).
+        :param bytes value: serialized result value.
+        :param dict meta: result metadata (see huey.expiration), which is
+            used by the expiration cleanup to decide when the result may be
+            deleted. Should be written atomically with the value whenever
+            the backend allows it.
+        :param float ttl: optional TTL in seconds, used only by backends
+            with native expiration support. None means "no native expiry"
+            (backend-specific default may still apply).
+        :return: No return value.
+        """
+        self.put_data(key, value, is_result=True)
+        if meta is not None:
+            self.put_result_meta(key, meta)
+
+    def put_result_meta(self, key, meta):
+        """
+        Store metadata for the given result-store key. Metadata-only entries
+        (e.g. group bookkeeping) may not have an associated value.
+        """
+        pass
+
+    def get_result_meta(self, key):
+        """
+        Return the decoded metadata dict for the given key, or None.
+        """
+        return None
+
+    def iter_result_meta(self, cursor=None, limit=None):
+        """
+        Iterate over (key, raw-metadata) pairs in sorted-key order.
+
+        :param cursor: opaque cursor (the last key of the previous segment);
+            only keys greater than the cursor are returned.
+        :param limit: maximum number of items to return, or None for all.
+        :return: (items, next_cursor) where items is a list of (key, raw)
+            tuples and next_cursor is None when iteration is complete.
+        """
+        return ([], None)
+
+    def delete_result_if_matches(self, key, meta):
+        """
+        Atomically delete the result value and metadata for the given key,
+        but only if the currently-stored metadata is identical to "meta"
+        (a dict previously returned by get_result_meta/iter_result_meta).
+        This prevents lost updates when a worker writes a fresh result
+        concurrently with cleanup.
+
+        :return: boolean indicating whether anything was deleted.
+        """
+        return False
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -262,11 +340,14 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
+    supports_result_meta = True
+
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
         self._queue = []
         self._results = {}
+        self._results_meta = {}
         self._schedule = []
         self._lock = threading.RLock()
 
@@ -342,8 +423,37 @@ class MemoryStorage(BaseStorage):
     def result_items(self):
         return dict(self._results)
 
+    def put_result(self, key, value, meta=None, ttl=None):
+        # Write the result and its metadata atomically under the lock so
+        # that cleanup never observes a partially-written result.
+        with self._lock:
+            self._results[key] = value
+            if meta is not None:
+                self._results_meta[key] = encode_result_meta(meta)
+
+    def put_result_meta(self, key, meta):
+        with self._lock:
+            self._results_meta[key] = encode_result_meta(meta)
+
+    def get_result_meta(self, key):
+        return decode_result_meta(self._results_meta.get(key))
+
+    def iter_result_meta(self, cursor=None, limit=None):
+        with self._lock:
+            items = sorted(self._results_meta.items())
+        return _paginate_meta(items, cursor, limit)
+
+    def delete_result_if_matches(self, key, meta):
+        with self._lock:
+            if self._results_meta.get(key) != encode_result_meta(meta):
+                return False
+            self._results.pop(key, None)
+            del self._results_meta[key]
+            return True
+
     def flush_results(self):
         self._results = {}
+        self._results_meta = {}
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -356,10 +466,32 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+# Atomically delete a result and its metadata (both stored as fields in a
+# hash), but only when the stored metadata matches the expected value. This
+# ensures cleanup cannot delete a result that was concurrently re-written
+# by a worker (lost update).
+RESULT_DELETE_LUA = """\
+if redis.call('hget', KEYS[2], ARGV[1]) == ARGV[2] then
+    redis.call('hdel', KEYS[1], ARGV[1])
+    redis.call('hdel', KEYS[2], ARGV[1])
+    return 1
+end
+return 0"""
+
+# Same as above, but for storage layouts that keep results and metadata in
+# standalone keys (e.g. RedisExpireStorage).
+RESULT_DELETE_KEY_LUA = """\
+if redis.call('get', KEYS[2]) == ARGV[1] then
+    redis.call('del', KEYS[1], KEYS[2])
+    return 1
+end
+return 0"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
     redis_client = Redis
+    supports_result_meta = True
 
     def __init__(self, name='huey', blocking=True, read_timeout=1,
                  connection_pool=None, url=None, client_name=None,
@@ -390,12 +522,14 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._del_result = self.conn.register_script(RESULT_DELETE_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
+        self.result_meta_key = 'huey.results.meta.%s' % self.name
 
         if client_name is not None:
             self.conn.client_setname(client_name)
@@ -488,8 +622,37 @@ class RedisStorage(BaseStorage):
     def result_items(self):
         return self.conn.hgetall(self.result_key)
 
+    def put_result(self, key, value, meta=None, ttl=None):
+        # NOTE: Redis hashes do not support per-field expiration, so the
+        # TTL is not applied natively here. Expiration is handled by the
+        # cleanup sweeper (Huey.cleanup_expired_results).
+        if meta is None:
+            self.conn.hset(self.result_key, key, value)
+        else:
+            pipe = self.conn.pipeline()
+            pipe.hset(self.result_key, key, value)
+            pipe.hset(self.result_meta_key, key, encode_result_meta(meta))
+            pipe.execute()
+
+    def put_result_meta(self, key, meta):
+        self.conn.hset(self.result_meta_key, key, encode_result_meta(meta))
+
+    def get_result_meta(self, key):
+        return decode_result_meta(self.conn.hget(self.result_meta_key, key))
+
+    def iter_result_meta(self, cursor=None, limit=None):
+        items = sorted(self.conn.hgetall(self.result_meta_key).items())
+        if isinstance(cursor, str):
+            cursor = cursor.encode('utf8')
+        return _paginate_meta(items, cursor, limit)
+
+    def delete_result_if_matches(self, key, meta):
+        return bool(self._del_result(
+            keys=[self.result_key, self.result_meta_key],
+            args=[key, encode_result_meta(meta)]))
+
     def flush_results(self):
-        self.conn.delete(self.result_key)
+        self.conn.delete(self.result_key, self.result_meta_key)
 
 
 class RedisExpireStorage(RedisStorage):
@@ -501,17 +664,67 @@ class RedisExpireStorage(RedisStorage):
 
         self._expire_time = expire_time
 
-        self.result_prefix = rp = b'huey.r.%s.' % self.name.encode('utf8')
         encode = lambda s: s if isinstance(s, bytes) else s.encode('utf8')
+        self.result_prefix = rp = b'huey.r.%s.' % self.name.encode('utf8')
         self.result_key = lambda k: rp + encode(k)
+        mp = b'huey.rm.%s.' % self.name.encode('utf8')
+        self.result_meta_prefix = mp
+        self.result_meta_key = lambda k: mp + encode(k)
+        self._del_result = self.conn.register_script(RESULT_DELETE_KEY_LUA)
 
     def put_data(self, key, value, is_result=False):
-        if is_result:
+        if is_result and self._expire_time:
             # We only want to expire task result data. If we are storing an
             # important metadata like a revocation key, we need to preserve it.
             self.conn.setex(self.result_key(key), self._expire_time, value)
         else:
             self.conn.set(self.result_key(key), value)
+
+    def put_result(self, key, value, meta=None, ttl=None):
+        # When the expiration policy provides a TTL it takes precedence over
+        # the storage-level default expire_time. A TTL of None means the
+        # policy does not restrict the lifetime, so the storage default is
+        # used. A TTL of 0 cannot be applied natively (Redis requires a
+        # positive expiry), so the result is stored without native expiry
+        # and is removed by the next cleanup pass instead.
+        expire = self._expire_time if ttl is None else ttl
+        pipe = self.conn.pipeline()
+        if expire:
+            pipe.setex(self.result_key(key), int(expire), value)
+        else:
+            pipe.set(self.result_key(key), value)
+        if meta is not None:
+            encoded = encode_result_meta(meta)
+            if expire:
+                pipe.setex(self.result_meta_key(key), int(expire), encoded)
+            else:
+                pipe.set(self.result_meta_key(key), encoded)
+        pipe.execute()
+
+    def put_result_meta(self, key, meta):
+        self.conn.set(self.result_meta_key(key), encode_result_meta(meta))
+
+    def get_result_meta(self, key):
+        return decode_result_meta(self.conn.get(self.result_meta_key(key)))
+
+    def _result_meta_keys(self):
+        return self.conn.scan_iter(match=self.result_meta_prefix + b'*')
+
+    def iter_result_meta(self, cursor=None, limit=None):
+        keys = sorted(self._result_meta_keys())
+        if isinstance(cursor, str):
+            cursor = cursor.encode('utf8')
+        items = []
+        if keys:
+            pfx_len = len(self.result_meta_prefix)
+            for key, raw in zip(keys, self.conn.mget(keys)):
+                items.append((key[pfx_len:], raw))
+        return _paginate_meta(items, cursor, limit)
+
+    def delete_result_if_matches(self, key, meta):
+        return bool(self._del_result(
+            keys=[self.result_key(key), self.result_meta_key(key)],
+            args=[encode_result_meta(meta)]))
 
     def peek_data(self, key):
         pipe = self.conn.pipeline()
@@ -551,6 +764,7 @@ class RedisExpireStorage(RedisStorage):
 
     def flush_results(self):
         keys = list(self._result_keys())
+        keys += list(self._result_meta_keys())
         if keys:
             self.conn.delete(*keys)
 
@@ -674,6 +888,7 @@ class BaseSqlStorage(BaseStorage):
 
 class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
+    supports_result_meta = True
     table_kv = ('create table if not exists kv ('
                 'queue text not null, key text not null, value blob not null, '
                 'primary key(queue, key))')
@@ -687,7 +902,12 @@ class SqliteStorage(BaseSqlStorage):
                   'data blob not null, priority real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
-    ddl = [table_kv, table_sched, index_sched, table_task, index_task]
+
+    table_kv_meta = ('create table if not exists kv_meta ('
+                     'queue text not null, key text not null, '
+                     'meta text not null, primary key(queue, key))')
+    ddl = [table_kv, table_sched, index_sched, table_task, index_task,
+           table_kv_meta]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -834,8 +1054,63 @@ class SqliteStorage(BaseSqlStorage):
                        results=True)
         return dict((k, to_bytes(v)) for k, v in res)
 
+    def put_result(self, key, value, meta=None, ttl=None):
+        # The result and its metadata are written in a single transaction
+        # so cleanup never observes a partially-written result.
+        with self.db(commit=True) as curs:
+            curs.execute('insert or replace into kv (queue, key, value) '
+                         'values (?, ?, ?)', (self.name, key, to_blob(value)))
+            if meta is not None:
+                curs.execute('insert or replace into kv_meta '
+                             '(queue, key, meta) values (?, ?, ?)',
+                             (self.name, key, encode_result_meta(meta)))
+
+    def put_result_meta(self, key, meta):
+        self.sql('insert or replace into kv_meta (queue, key, meta) '
+                 'values (?, ?, ?)',
+                 (self.name, key, encode_result_meta(meta)), commit=True)
+
+    def get_result_meta(self, key):
+        res = self.sql('select meta from kv_meta where queue=? and key=?',
+                       (self.name, key), results=True)
+        return decode_result_meta(res[0][0]) if res else None
+
+    def iter_result_meta(self, cursor=None, limit=None):
+        sql = 'select key, meta from kv_meta where queue=?'
+        params = [self.name]
+        if cursor is not None:
+            sql += ' and key > ?'
+            params.append(cursor)
+        sql += ' order by key'
+        if limit is not None:
+            sql += ' limit ?'
+            params.append(limit + 1)
+        rows = self.sql(sql, params, results=True)
+        next_cursor = None
+        if limit is not None and len(rows) > limit:
+            next_cursor = rows[limit - 1][0]
+            rows = rows[:limit]
+        return ([(key, meta) for key, meta in rows], next_cursor)
+
+    def delete_result_if_matches(self, key, meta):
+        # The check and the delete run in a single exclusive transaction,
+        # so a concurrent worker write cannot be lost.
+        with self.db(commit=True) as curs:
+            curs.execute('select meta from kv_meta where queue=? and key=?',
+                         (self.name, key))
+            row = curs.fetchone()
+            if row is None or row[0] != encode_result_meta(meta):
+                return False
+            curs.execute('delete from kv where queue=? and key=?',
+                         (self.name, key))
+            curs.execute('delete from kv_meta where queue=? and key=?',
+                         (self.name, key))
+            return True
+
     def flush_results(self):
-        self.sql('delete from kv where queue=?', (self.name,), True)
+        with self.db(commit=True) as curs:
+            curs.execute('delete from kv where queue=?', (self.name,))
+            curs.execute('delete from kv_meta where queue=?', (self.name,))
 
 
 class FileStorage(BaseStorage):

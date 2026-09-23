@@ -697,6 +697,20 @@ Huey object
             When you create a task pipeline, however, it is necessary to
             enqueue the pipeline once it has been set up.
 
+
+    .. py:method:: enqueue_group(tasks, group_id=None)
+
+        :param list tasks: list of :py:class:`Task` instances to enqueue.
+        :param str group_id: optional explicit group id.
+        :returns: :py:class:`ResultGroup` with a ``group_id`` attribute.
+
+        Enqueue a group of tasks as a unit, recording group metadata in the
+        result store. While the group metadata is alive, the expiration
+        cleanup will not delete the results of the group's members, so a
+        queryable group can never observe its members as missing. The group
+        metadata itself expires according to the ``"group"`` category of
+        the ``result_store_expiration`` policy.
+
     .. py:method:: revoke(task, revoke_until=None, revoke_once=False)
 
         .. seealso:: Use :py:meth:`Result.revoke` instead.
@@ -882,6 +896,27 @@ Huey object
 
         :returns: a dict of task-id to the serialized result data for all
             key/value pairs in the result store.
+
+
+    .. py:method:: cleanup_expired_results(now=None, limit=None, cursor=None)
+
+        :param now: reference timestamp (defaults to the current time); may
+            be a unix timestamp or a ``datetime``.
+        :param int limit: maximum number of entries to examine in this call.
+        :param cursor: opaque cursor returned by a previous call.
+        :returns: a dict with the keys ``deleted`` (sorted list of deleted
+            result keys), ``deleted_count``, ``groups_expired``,
+            ``scanned``, ``skipped_referenced``, ``skipped_stale``,
+            ``next_cursor`` and ``done``.
+
+        Delete expired entries from the result store, honoring the
+        per-category and per-task TTLs configured with the
+        ``result_store_expiration`` parameter. The cleanup is idempotent
+        (repeated calls return a stable, empty report once nothing is left
+        to delete), reference-aware (results referenced by a live group are
+        preserved), safe against lost updates with concurrently-writing
+        workers, and segmentable via ``limit``/``cursor``. See
+        :ref:`guide` for details and backend-specific notes.
 
     .. py:method:: __len__()
 

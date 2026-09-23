@@ -1,7 +1,21 @@
 Changelog
 =========
 
+
 ## master
+
+* Add support for expiring task results and result-store metadata using
+  per-category and per-task TTLs, configured with the new
+  ``result_store_expiration`` parameter. Categories distinguish completed,
+  error, retry, group/chord metadata, revoked and pending entries.
+* Add ``Huey.cleanup_expired_results()``, an idempotent, cursor-segmented
+  cleanup API that is safe to run concurrently with workers (no lost
+  updates) and preserves results that are still referenced by a live
+  group.
+* Add ``Huey.enqueue_group()`` for enqueueing a group of tasks while
+  recording group metadata in the result store.
+* ``RedisExpireHuey`` now accepts ``expire_time=None`` to disable the
+  storage-level default result expiration.
 
 [View commits](https://github.com/coleifer/huey/compare/2.5.3...HEAD)
 
