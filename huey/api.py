@@ -23,6 +23,10 @@ from huey.exceptions import ResultTimeout
 from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
+from huey.expiration import CleanupReport
+from huey.expiration import ExpirationPolicy
+from huey.expiration import ResultKind
+from huey.expiration import ResultMetadata
 from huey.registry import Registry
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
@@ -64,6 +68,10 @@ class Huey(object):
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend when immediate-mode is enabled.
+    :param result_expiration: an ExpirationPolicy (or dict of result kind ->
+        TTL in seconds) controlling how long results, errors, group metadata,
+        revocation markers and pending placeholders are retained. Expired
+        entries are removed by calling cleanup_results().
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -89,7 +97,7 @@ class Huey(object):
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
                  immediate=False, serializer=None, compression=False,
                  use_zlib=False, immediate_use_memory=True, always_eager=None,
-                 storage_class=None, **storage_kwargs):
+                 storage_class=None, result_expiration=None, **storage_kwargs):
         if always_eager is not None:
             warnings.warn('"always_eager" parameter is deprecated, use '
                           '"immediate" instead', DeprecationWarning)
@@ -106,6 +114,15 @@ class Huey(object):
         self.results = results
         self.store_none = store_none
         self.utc = utc
+        if result_expiration is None or isinstance(result_expiration,
+                                                   ExpirationPolicy):
+            self.expiration_policy = result_expiration
+        elif isinstance(result_expiration, dict):
+            self.expiration_policy = ExpirationPolicy(**result_expiration)
+        else:
+            raise ValueError('result_expiration must be an ExpirationPolicy '
+                             'or a dict of kind -> TTL, got %r'
+                             % (result_expiration,))
         self._immediate = immediate
         self.immediate_use_memory = immediate_use_memory
         if serializer is None:
@@ -311,6 +328,17 @@ class Huey(object):
             self.execute(task)
         else:
             self.storage.enqueue(self.serialize_task(task), task.priority)
+            if (self.results and self.expiration_policy is not None
+                    and not isinstance(task, PeriodicTask)):
+                # Record a placeholder so that unfinished results have
+                # their own expiration policy. The placeholder is replaced
+                # when the task's result (or error) is stored.
+                # Requeued tasks already have metadata (e.g. retry state),
+                # which must be preserved.
+                if self.storage.get_result_metadata(task.id) is None:
+                    self.storage.put_result_metadata(
+                        task.id, ResultMetadata(task.id, ResultKind.PENDING,
+                                                task.name))
 
         if not self.results:
             return
@@ -333,9 +361,44 @@ class Huey(object):
     def put(self, key, data):
         return self.storage.put_data(key, self.serializer.serialize(data))
 
-    def put_result(self, key, data):
-        return self.storage.put_data(key, self.serializer.serialize(data),
-                                     is_result=True)
+    def put_result(self, key, data, kind=ResultKind.COMPLETE, task_name=None,
+                   references=()):
+        """
+        Store a task result along with the metadata used for expiration.
+
+        :param key: result-store key (typically the task id).
+        :param data: result value (will be serialized).
+        :param kind: a ResultKind value classifying the result.
+        :param task_name: task name, used to resolve per-task TTLs.
+        :param references: keys this result references (group members).
+        :return: True if the result was stored, False if the configured TTL
+            is zero, in which case the result is not retained at all.
+        """
+        serialized = self.serializer.serialize(data)
+        if self.expiration_policy is None:
+            # No expiration policy: store the result without recording any
+            # metadata, exactly as older versions did.
+            return self.storage.put_data(key, serialized, is_result=True)
+
+        ttl = self.expiration_policy.ttl_for(kind, task_name)
+        if ttl == 0:
+            # A TTL of zero means the result is not retained. Remove any
+            # previously-stored value (e.g. from an earlier retry).
+            self.delete(key)
+            return False
+        metadata = ResultMetadata(key, kind, task_name,
+                                  references=references)
+        self.storage.put_result_data(key, serialized, metadata, expire=ttl)
+        return True
+
+    def put_group(self, group_id, task_ids, data=None):
+        """
+        Store group/chord summary metadata referencing the given member
+        task ids. Member results referenced by an unexpired group will not
+        be removed by cleanup_results(), even if their own TTL has elapsed.
+        """
+        return self.put_result('g:%s' % group_id, data, kind=ResultKind.GROUP,
+                               references=tuple(task_ids))
 
     def put_if_empty(self, key, data):
         return self.storage.put_if_empty(key, self.serializer.serialize(data))
@@ -352,6 +415,7 @@ class Huey(object):
             return self.serializer.deserialize(data)
 
     def delete(self, key):
+        self.storage.delete_result_metadata(key)
         return self.storage.delete_data(key)
 
     def _get_timestamp(self):
@@ -434,9 +498,11 @@ class Huey(object):
         if self.results and not isinstance(task, PeriodicTask):
             if exception is not None:
                 error_data = self.build_error_result(task, exception)
-                self.put_result(task.id, Error(error_data))
+                kind = ResultKind.RETRY if task.retries else ResultKind.ERROR
+                self.put_result(task.id, Error(error_data), kind=kind,
+                                task_name=task.name)
             elif task_value is not None or self.store_none:
-                self.put_result(task.id, task_value)
+                self.put_result(task.id, task_value, task_name=task.name)
 
         if self._post_execute:
             self._run_post_execute(task, task_value, exception)
@@ -521,7 +587,12 @@ class Huey(object):
             task_class = task_class.task_class
         if revoke_until is not None:
             revoke_until = normalize_time(revoke_until, utc=self.utc)
-        self.put(self._task_key(task_class, 'rt'), (revoke_until, revoke_once))
+        key = self._task_key(task_class, 'rt')
+        self.put(key, (revoke_until, revoke_once))
+        if self.expiration_policy is not None:
+            self.storage.put_result_metadata(
+                key,
+                ResultMetadata(key, ResultKind.REVOKED, task_class.__name__))
 
     def restore_all(self, task_class):
         if isinstance(task_class, TaskWrapper):
@@ -532,6 +603,10 @@ class Huey(object):
         if revoke_until is not None:
             revoke_until = normalize_time(revoke_until, utc=self.utc)
         self.put(task.revoke_id, (revoke_until, revoke_once))
+        if self.expiration_policy is not None:
+            self.storage.put_result_metadata(
+                task.revoke_id,
+                ResultMetadata(task.revoke_id, ResultKind.REVOKED, task.name))
 
     def restore(self, task):
         # Return value indicates whether the task was in fact revoked.
@@ -644,6 +719,87 @@ class Huey(object):
 
     def result_count(self):
         return self.storage.result_store_size()
+
+    def cleanup_results(self, limit=None, cursor=None, now=None):
+        """
+        Delete expired entries from the result store, according to the
+        configured expiration policy.
+
+        The cleanup is safe to run while workers are executing tasks:
+
+        * entries are removed with a conditional delete, so a result that
+          is rewritten by a worker after the scan began is not lost,
+        * members referenced by an unexpired group are never deleted,
+        * expired groups are deleted before their members, so readers
+          never observe a group whose members have already been removed,
+        * unfinished (pending) results are kept until their own TTL
+          elapses.
+
+        The operation is idempotent: repeating a call (optionally with the
+        returned cursor, e.g. after a restart) continues or finishes the
+        same cleanup without error, and repeated calls against an
+        unchanged store return equal CleanupReport values.
+
+        :param int limit: maximum number of entries to examine; use with
+            the returned cursor to perform segmented cleanups.
+        :param cursor: continuation token from a previous CleanupReport.
+        :param float now: unix timestamp to compare against (for testing).
+        :return: CleanupReport describing what was examined and deleted.
+        """
+        policy = self.expiration_policy
+        if policy is None:
+            policy = ExpirationPolicy()
+        if now is None:
+            now = time.time()
+
+        items = self.storage.result_metadata_items()
+
+        # Results referenced by an unexpired group must be kept, even if
+        # their own TTL has already elapsed.
+        live_references = set()
+        for key, metadata in items.items():
+            if (metadata.kind == ResultKind.GROUP
+                    and not policy.is_expired(metadata, now)):
+                live_references.update(metadata.references)
+
+        keys = sorted(key for key in items
+                      if cursor is None or key > cursor)
+        if limit is not None:
+            keys, remaining = keys[:limit], keys[limit:]
+        else:
+            remaining = ()
+
+        scanned = deleted = skipped_referenced = skipped_pending = 0
+        expired_groups = []
+        expired = []
+        for key in keys:
+            scanned += 1
+            metadata = items[key]
+            if key in live_references:
+                skipped_referenced += 1
+                continue
+            if not policy.is_expired(metadata, now):
+                if metadata.kind == ResultKind.PENDING:
+                    skipped_pending += 1
+                continue
+            if metadata.kind == ResultKind.GROUP:
+                expired_groups.append((key, metadata))
+            else:
+                expired.append((key, metadata))
+
+        # Delete expired groups first so that a concurrent reader never
+        # observes a group summary whose members have already been removed
+        # (which could be mistaken for a partially-successful group).
+        for key, metadata in expired_groups + expired:
+            if self.storage.delete_result_if_unmodified(
+                    key, metadata.timestamp):
+                deleted += 1
+
+        # The cursor is only set when unexamined entries remain, so a
+        # segmented cleanup converges to cursor=None when complete.
+        next_cursor = keys[-1] if (remaining and keys) else None
+        return CleanupReport(scanned, deleted, skipped_referenced,
+                             skipped_pending, next_cursor)
 
     def __len__(self):
         return self.pending_count()

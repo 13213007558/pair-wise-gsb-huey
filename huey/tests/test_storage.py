@@ -29,6 +29,19 @@ from huey.tests.base import BaseTestCase
 from huey.tests.base import TRAVIS
 
 
+def get_redis_version():
+    try:
+        return int(Redis().info()['redis_version'].split('.', 1)[0])
+    except Exception:
+        # Redis is not available (e.g. no server running), in which case
+        # the Redis-backed tests will be skipped.
+        return 0
+
+
+REDIS_VERSION = get_redis_version()
+redis_required = unittest.skipIf(REDIS_VERSION < 1, 'Redis is not available')
+
+
 class StorageTests(object):
     destructive_reads = True
 
@@ -165,6 +178,7 @@ class TestMemoryStorage(StorageTests, BaseTestCase):
         return MemoryHuey(utc=False)
 
 
+@redis_required
 class TestRedisStorage(StorageTests, BaseTestCase):
     def get_huey(self):
         return RedisHuey(utc=False)
@@ -180,6 +194,7 @@ class TestRedisStorage(StorageTests, BaseTestCase):
         RedisHuey(host=None, port=None, db=None, url='redis://localhost')
 
 
+@redis_required
 class TestRedisExpireStorage(StorageTests, BaseTestCase):
     # Note that this does not subclass the StorageTests. This is partly because
     # the functionality should already be covered by the TestRedisStorage, as
@@ -255,11 +270,7 @@ class TestRedisExpireStorage(StorageTests, BaseTestCase):
         self.assertEqual(self.huey.result_count(), 2)  # r1 and r3 still there.
 
 
-def get_redis_version():
-    return int(Redis().info()['redis_version'].split('.', 1)[0])
-
-
-@unittest.skipIf(get_redis_version() < 5, 'Requires Redis >= 5.0')
+@unittest.skipIf(REDIS_VERSION < 5, 'Requires Redis >= 5.0')
 class TestPriorityRedisStorage(TestRedisStorage):
     def get_huey(self):
         return PriorityRedisHuey(utc=False)

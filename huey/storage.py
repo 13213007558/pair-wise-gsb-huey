@@ -30,6 +30,7 @@ except ImportError:
 
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
+from huey.expiration import ResultMetadata
 from huey.utils import FileLock
 from huey.utils import text_type
 from huey.utils import to_timestamp
@@ -41,9 +42,15 @@ class BaseStorage(object):
     """
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
+    # Does the storage engine expire result data by itself (e.g. Redis key
+    # TTLs)? When False, expiration is handled by Huey.cleanup_results().
+    supports_native_expiration = False
 
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
+        # Fallback in-memory metadata store, used by backends that do not
+        # provide their own persistent metadata implementation.
+        self._result_metadata = {}
 
     def close(self):
         """
@@ -148,7 +155,7 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, expire=None):
         """
         Store an arbitrary key/value pair.
 
@@ -156,6 +163,9 @@ class BaseStorage(object):
         :param bytes value: value
         :param bool is_result: indicate if we are storing a (volatile) task
             result versus metadata like a task revocation key or lock.
+        :param float expire: optional TTL (seconds) for result data. Ignored
+            by storage engines without native expiration support; expiry is
+            then handled by Huey.cleanup_results() instead.
         :return: No return value.
         """
         raise NotImplementedError
@@ -230,6 +240,71 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def put_result_data(self, key, value, metadata=None, expire=None):
+        """
+        Store a result value along with its expiration metadata. Backends
+        that support transactions should implement this atomically so that
+        a concurrent cleanup cannot observe or delete a partially-updated
+        record.
+
+        :param bytes key: lookup key
+        :param bytes value: value
+        :param ResultMetadata metadata: bookkeeping record for the result.
+        :param float expire: optional TTL (seconds), see put_data().
+        :return: No return value.
+        """
+        self.put_data(key, value, is_result=True, expire=expire)
+        if metadata is not None:
+            self.put_result_metadata(key, metadata)
+
+    def put_result_metadata(self, key, metadata):
+        """
+        Store expiration metadata for the given key.
+
+        :param bytes key: lookup key
+        :param ResultMetadata metadata: bookkeeping record.
+        :return: No return value.
+        """
+        self._result_metadata[key] = metadata
+
+    def get_result_metadata(self, key):
+        """
+        :return: ResultMetadata for the given key, or None.
+        """
+        return self._result_metadata.get(key)
+
+    def delete_result_metadata(self, key):
+        """
+        Delete the expiration metadata for the given key, if it exists.
+
+        :return: No return value.
+        """
+        self._result_metadata.pop(key, None)
+
+    def result_metadata_items(self):
+        """
+        :return: dict mapping keys to ResultMetadata for all tracked keys.
+        """
+        return dict(self._result_metadata)
+
+    def delete_result_if_unmodified(self, key, timestamp):
+        """
+        Atomically delete the result and metadata for the given key, but
+        only if the metadata timestamp still matches the given value. This
+        conditional delete prevents cleanup from removing a result that a
+        worker rewrote after the cleanup scan began (lost update).
+
+        :param bytes key: lookup key
+        :param float timestamp: expected metadata timestamp.
+        :return: boolean indicating whether anything was deleted.
+        """
+        metadata = self.get_result_metadata(key)
+        if metadata is None or metadata.timestamp != timestamp:
+            return False
+        self.delete_data(key)
+        self.delete_result_metadata(key)
+        return True
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -252,13 +327,19 @@ class BlackHoleStorage(BaseStorage):
     def schedule_size(self): return 0
     def scheduled_items(self, limit=None): return []
     def flush_schedule(self): pass
-    def put_data(self, key, value, is_result=False): pass
+    def put_data(self, key, value, is_result=False, expire=None): pass
     def peek_data(self, key): return EmptyData
     def pop_data(self, key): return EmptyData
     def has_data_for_key(self, key): return False
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
+    def put_result_data(self, key, value, metadata=None, expire=None): pass
+    def put_result_metadata(self, key, metadata): pass
+    def get_result_metadata(self, key): return None
+    def delete_result_metadata(self, key): pass
+    def result_metadata_items(self): return {}
+    def delete_result_if_unmodified(self, key, timestamp): return False
 
 
 class MemoryStorage(BaseStorage):
@@ -324,14 +405,34 @@ class MemoryStorage(BaseStorage):
     def flush_schedule(self):
         self._schedule = []
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, expire=None):
+        # MemoryStorage has no native expiration; the expire parameter is
+        # accepted for interface compatibility and expiry is handled by
+        # Huey.cleanup_results().
         self._results[key] = value
+
+    def put_result_data(self, key, value, metadata=None, expire=None):
+        with self._lock:
+            self._results[key] = value
+            if metadata is not None:
+                self._result_metadata[key] = metadata
+
+    def delete_result_if_unmodified(self, key, timestamp):
+        with self._lock:
+            metadata = self._result_metadata.get(key)
+            if metadata is None or metadata.timestamp != timestamp:
+                return False
+            self._results.pop(key, None)
+            del self._result_metadata[key]
+            return True
 
     def peek_data(self, key):
         return self._results.get(key, EmptyData)
 
     def pop_data(self, key):
-        return self._results.pop(key, EmptyData)
+        with self._lock:
+            self._result_metadata.pop(key, None)
+            return self._results.pop(key, EmptyData)
 
     def has_data_for_key(self, key):
         return key in self._results
@@ -344,6 +445,7 @@ class MemoryStorage(BaseStorage):
 
     def flush_results(self):
         self._results = {}
+        self._result_metadata = {}
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -355,6 +457,38 @@ local res = redis.call('zrangebyscore', KEYS[1], '-inf', unix_ts)
 if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res then
     return res
 end"""
+
+# Atomically delete a result and its expiration metadata, but only when the
+# metadata timestamp still matches the value seen by the cleanup scan. This
+# prevents a lost update when a worker rewrites the result concurrently.
+# KEYS[1] = result hash key, KEYS[2] = metadata hash key,
+# ARGV[1] = result key, ARGV[2] = expected timestamp.
+DELETE_RESULT_LUA = """\
+local raw = redis.call('hget', KEYS[2], ARGV[1])
+if raw then
+    local meta = cjson.decode(raw)
+    if meta['timestamp'] == tonumber(ARGV[2]) then
+        redis.call('hdel', KEYS[1], ARGV[1])
+        redis.call('hdel', KEYS[2], ARGV[1])
+        return 1
+    end
+end
+return 0"""
+
+# Variant for RedisExpireStorage, where each result is a standalone key.
+# KEYS[1] = result key, KEYS[2] = metadata hash key,
+# ARGV[1] = result key, ARGV[2] = expected timestamp.
+DELETE_RESULT_KEY_LUA = """\
+local raw = redis.call('hget', KEYS[2], ARGV[1])
+if raw then
+    local meta = cjson.decode(raw)
+    if meta['timestamp'] == tonumber(ARGV[2]) then
+        redis.call('del', KEYS[1])
+        redis.call('hdel', KEYS[2], ARGV[1])
+        return 1
+    end
+end
+return 0"""
 
 
 class RedisStorage(BaseStorage):
@@ -396,6 +530,8 @@ class RedisStorage(BaseStorage):
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
+        self.meta_key = 'huey.results.meta.%s' % self.name
+        self._delete_result = self.conn.register_script(DELETE_RESULT_LUA)
 
         if client_name is not None:
             self.conn.client_setname(client_name)
@@ -458,8 +594,42 @@ class RedisStorage(BaseStorage):
     def flush_schedule(self):
         self.conn.delete(self.schedule_key)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, expire=None):
+        # Hash-based Redis storage has no native per-result expiration; the
+        # expire parameter is accepted for interface compatibility and
+        # expiry is handled by Huey.cleanup_results().
         self.conn.hset(self.result_key, key, value)
+
+    def put_result_data(self, key, value, metadata=None, expire=None):
+        pipe = self.conn.pipeline()
+        pipe.hset(self.result_key, key, value)
+        if metadata is not None:
+            pipe.hset(self.meta_key, key, json.dumps(metadata.serialize()))
+        pipe.execute()
+
+    def put_result_metadata(self, key, metadata):
+        self.conn.hset(self.meta_key, key, json.dumps(metadata.serialize()))
+
+    def get_result_metadata(self, key):
+        raw = self.conn.hget(self.meta_key, key)
+        if raw is not None:
+            return ResultMetadata.deserialize(key, json.loads(raw))
+
+    def delete_result_metadata(self, key):
+        self.conn.hdel(self.meta_key, key)
+
+    def result_metadata_items(self):
+        accum = {}
+        for key, raw in self.conn.hgetall(self.meta_key).items():
+            if isinstance(key, bytes):
+                key = key.decode('utf8')
+            accum[key] = ResultMetadata.deserialize(key, json.loads(raw))
+        return accum
+
+    def delete_result_if_unmodified(self, key, timestamp):
+        n = self._delete_result(keys=[self.result_key, self.meta_key],
+                                args=[key, repr(timestamp)])
+        return n == 1
 
     def peek_data(self, key):
         pipe = self.conn.pipeline()
@@ -473,7 +643,8 @@ class RedisStorage(BaseStorage):
         pipe.hexists(self.result_key, key)
         pipe.hget(self.result_key, key)
         pipe.hdel(self.result_key, key)
-        exists, val, n = pipe.execute()
+        pipe.hdel(self.meta_key, key)
+        exists, val = pipe.execute()[:2]
         return EmptyData if not exists else val
 
     def has_data_for_key(self, key):
@@ -490,28 +661,54 @@ class RedisStorage(BaseStorage):
 
     def flush_results(self):
         self.conn.delete(self.result_key)
+        self.conn.delete(self.meta_key)
 
 
 class RedisExpireStorage(RedisStorage):
     # Redis storage subclass that adds expiration to task result values. Since
     # the Redis server handles deleting our results after the expiration time,
     # this storage layer will not delete the results when they are read.
+    supports_native_expiration = True
+
     def __init__(self, name='huey', expire_time=86400, *args, **kwargs):
         super(RedisExpireStorage, self).__init__(name, *args, **kwargs)
 
         self._expire_time = expire_time
+        self._delete_result = self.conn.register_script(DELETE_RESULT_KEY_LUA)
 
         self.result_prefix = rp = b'huey.r.%s.' % self.name.encode('utf8')
         encode = lambda s: s if isinstance(s, bytes) else s.encode('utf8')
         self.result_key = lambda k: rp + encode(k)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, expire=None):
         if is_result:
             # We only want to expire task result data. If we are storing an
             # important metadata like a revocation key, we need to preserve it.
-            self.conn.setex(self.result_key(key), self._expire_time, value)
+            if expire is None:
+                expire = self._expire_time
+            if expire <= 0:
+                # A TTL of zero means the result is not retained at all.
+                return
+            self.conn.psetex(self.result_key(key), int(expire * 1000), value)
         else:
             self.conn.set(self.result_key(key), value)
+
+    def put_result_data(self, key, value, metadata=None, expire=None):
+        if expire is None:
+            expire = self._expire_time
+        if expire <= 0:
+            # A TTL of zero means the result is not retained at all.
+            return
+        pipe = self.conn.pipeline()
+        pipe.psetex(self.result_key(key), int(expire * 1000), value)
+        if metadata is not None:
+            pipe.hset(self.meta_key, key, json.dumps(metadata.serialize()))
+        pipe.execute()
+
+    def delete_result_if_unmodified(self, key, timestamp):
+        n = self._delete_result(keys=[self.result_key(key), self.meta_key],
+                                args=[key, repr(timestamp)])
+        return n == 1
 
     def peek_data(self, key):
         pipe = self.conn.pipeline()
@@ -526,7 +723,11 @@ class RedisExpireStorage(RedisStorage):
     pop_data = peek_data
 
     def delete_data(self, key):
-        return self.conn.delete(self.result_key(key))
+        pipe = self.conn.pipeline()
+        pipe.delete(self.result_key(key))
+        pipe.hdel(self.meta_key, key)
+        n, _ = pipe.execute()
+        return n
 
     def has_data_for_key(self, key):
         return self.conn.exists(self.result_key(key)) != 0
@@ -553,6 +754,7 @@ class RedisExpireStorage(RedisStorage):
         keys = list(self._result_keys())
         if keys:
             self.conn.delete(*keys)
+        self.conn.delete(self.meta_key)
 
 
 class RedisPriorityQueue(object):
@@ -687,7 +889,13 @@ class SqliteStorage(BaseSqlStorage):
                   'data blob not null, priority real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
-    ddl = [table_kv, table_sched, index_sched, table_task, index_task]
+    table_kv_meta = ('create table if not exists kv_meta ('
+                     'queue text not null, key text not null, '
+                     'kind text not null, task text, '
+                     'timestamp real not null, refs text not null, '
+                     'primary key(queue, key))')
+    ddl = [table_kv, table_sched, index_sched, table_task, index_task,
+           table_kv_meta]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -789,9 +997,65 @@ class SqliteStorage(BaseSqlStorage):
     def flush_schedule(self):
         self.sql('delete from schedule where queue = ?', (self.name,), True)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, expire=None):
+        # Sqlite has no native row expiration; the expire parameter is
+        # accepted for interface compatibility and expiry is handled by
+        # Huey.cleanup_results().
         self.sql('insert or replace into kv (queue, key, value) '
                  'values (?, ?, ?)', (self.name, key, to_blob(value)), True)
+
+    def _insert_metadata(self, curs, key, metadata):
+        curs.execute(
+            'insert or replace into kv_meta '
+            '(queue, key, kind, task, timestamp, refs) '
+            'values (?, ?, ?, ?, ?, ?)',
+            (self.name, key, metadata.kind, metadata.task_name,
+             metadata.timestamp, json.dumps(list(metadata.references))))
+
+    def put_result_data(self, key, value, metadata=None, expire=None):
+        with self.db(commit=True) as curs:
+            curs.execute('insert or replace into kv (queue, key, value) '
+                         'values (?, ?, ?)',
+                         (self.name, key, to_blob(value)))
+            if metadata is not None:
+                self._insert_metadata(curs, key, metadata)
+
+    def put_result_metadata(self, key, metadata):
+        with self.db(commit=True) as curs:
+            self._insert_metadata(curs, key, metadata)
+
+    def get_result_metadata(self, key):
+        res = self.sql('select kind, task, timestamp, refs from kv_meta '
+                       'where queue = ? and key = ?', (self.name, key),
+                       results=True)
+        if res:
+            kind, task, timestamp, refs = res[0]
+            return ResultMetadata(key, kind, task, timestamp,
+                                  json.loads(refs))
+
+    def delete_result_metadata(self, key):
+        self.sql('delete from kv_meta where queue = ? and key = ?',
+                 (self.name, key), True)
+
+    def result_metadata_items(self):
+        res = self.sql('select key, kind, task, timestamp, refs from kv_meta '
+                       'where queue = ?', (self.name,), results=True)
+        return dict((key, ResultMetadata(key, kind, task, timestamp,
+                                         json.loads(refs)))
+                    for key, kind, task, timestamp, refs in res)
+
+    def delete_result_if_unmodified(self, key, timestamp):
+        with self.db(commit=True) as curs:
+            curs.execute('select timestamp from kv_meta where queue = ? '
+                         'and key = ?', (self.name, key))
+            row = curs.fetchone()
+            if row is None or row[0] != timestamp:
+                return False
+            curs.execute('delete from kv where queue = ? and key = ?',
+                         (self.name, key))
+            curs.execute('delete from kv_meta where queue = ? and key = ?',
+                         (self.name, key))
+            return True
 
     def peek_data(self, key):
         res = self.sql('select value from kv where queue = ? and key = ?',
@@ -806,7 +1070,10 @@ class SqliteStorage(BaseSqlStorage):
             if result is not None:
                 curs.execute('delete from kv where queue=? and key=?',
                              (self.name, key))
-                if curs.rowcount == 1:
+                n = curs.rowcount
+                curs.execute('delete from kv_meta where queue=? and key=?',
+                             (self.name, key))
+                if n == 1:
                     return to_bytes(result[0])
             return EmptyData
 
@@ -836,6 +1103,7 @@ class SqliteStorage(BaseSqlStorage):
 
     def flush_results(self):
         self.sql('delete from kv where queue=?', (self.name,), True)
+        self.sql('delete from kv_meta where queue=?', (self.name,), True)
 
 
 class FileStorage(BaseStorage):
@@ -994,7 +1262,11 @@ class FileStorage(BaseStorage):
         prefix_filename = itertools.chain(prefix, (checksum,))
         return os.path.join(self.result_path, *prefix_filename)
 
-    def put_data(self, key, value, is_result=False):
+    def put_data(self, key, value, is_result=False, expire=None):
+        # FileStorage has no native expiration; the expire parameter is
+        # accepted for interface compatibility and expiry is handled by
+        # Huey.cleanup_results(). Note that result metadata is tracked in
+        # memory only and does not survive a restart.
         if isinstance(key, text_type):
             key = key.encode('utf8')
 
@@ -1040,6 +1312,7 @@ class FileStorage(BaseStorage):
                 _, value = self._unpack_result(fh.read())
 
             os.unlink(filename)
+            self._result_metadata.pop(key, None)
 
         # If file is corrupt or has been tampered with, return EmptyData.
         return value if value is not None else EmptyData
@@ -1063,3 +1336,4 @@ class FileStorage(BaseStorage):
 
     def flush_results(self):
         self._flush_dir(self.result_path)
+        self._result_metadata = {}

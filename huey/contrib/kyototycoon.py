@@ -73,8 +73,11 @@ class KyotoTycoonStorage(BaseStorage):
     def prefix_key(self, key):
         return '%s.%s' % (self.qname, decode(key))
 
-    def put_data(self, key, value, is_result=False):
-        xt = self.expire_time if is_result else None
+    def put_data(self, key, value, is_result=False, expire=None):
+        if is_result:
+            xt = self.expire_time if expire is None else expire
+        else:
+            xt = None
         self.kt.set(self.prefix_key(key), value, self._db, expire_time=xt)
 
     def peek_data(self, key):

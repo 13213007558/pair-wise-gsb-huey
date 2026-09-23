@@ -14,3 +14,6 @@ from huey.api import SqliteHuey
 from huey.api import crontab
 from huey.exceptions import CancelExecution
 from huey.exceptions import RetryTask
+from huey.expiration import CleanupReport
+from huey.expiration import ExpirationPolicy
+from huey.expiration import ResultKind

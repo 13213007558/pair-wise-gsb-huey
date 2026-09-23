@@ -116,6 +116,7 @@ Table of contents
    installation
    guide
    consumer
+   expiration
    imports
    shared_resources
    signals
@@ -135,4 +136,3 @@ Indices and tables
 * :ref:`genindex`
 * :ref:`modindex`
 * :ref:`search`
-

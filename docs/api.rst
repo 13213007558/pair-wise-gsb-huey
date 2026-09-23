@@ -151,7 +151,7 @@ Implementations of :py:class:`Huey` which handle task and result persistence.
 Huey object
 -----------
 
-.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, storage_kwargs)
+.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, result_expiration=None, storage_kwargs)
 
     :param str name: the name of the task queue, e.g. your application's name.
     :param bool results: whether to store task results.
@@ -166,6 +166,10 @@ Huey object
     :param bool use_zlib: use zlib for compression instead of gzip.
     :param bool immediate_use_memory: automatically switch to a local in-memory
         storage backend whenever immediate-mode is enabled.
+    :param result_expiration: an :py:class:`ExpirationPolicy` (or a dict of
+        result kind -> TTL in seconds) controlling how long results, errors,
+        group metadata, revocation markers and pending placeholders are
+        retained. See :ref:`expiration`.
     :param storage_kwargs: arbitrary keyword arguments that will be passed to
         the storage backend for additional configuration.
 
@@ -883,6 +887,34 @@ Huey object
         :returns: a dict of task-id to the serialized result data for all
             key/value pairs in the result store.
 
+    .. py:method:: cleanup_results(limit=None, cursor=None, now=None)
+
+        :param int limit: maximum number of entries to examine; combine
+            with the returned cursor to perform segmented cleanups.
+        :param cursor: continuation token from a previous
+            :py:class:`CleanupReport`.
+        :param float now: unix timestamp to compare entry timestamps
+            against (defaults to the current time).
+        :returns: a :py:class:`CleanupReport` describing what was
+            examined and deleted.
+
+        Delete expired entries from the result store according to the
+        configured expiration policy. The cleanup is idempotent and safe
+        to run concurrently with workers: entries are removed with a
+        conditional delete (no lost updates), results referenced by an
+        unexpired group are kept, and expired groups are deleted before
+        their members. See :ref:`expiration` for details.
+
+    .. py:method:: put_group(group_id, task_ids, data=None)
+
+        :param str group_id: identifier for the group.
+        :param task_ids: list of member task ids the group references.
+        :param data: optional summary data to store for the group.
+
+        Store group/chord summary metadata referencing the given member
+        task results. Members referenced by an unexpired group are not
+        removed by :py:meth:`Huey.cleanup_results`.
+
     .. py:method:: __len__()
 
         Return the number of items currently in the queue.
@@ -1478,6 +1510,54 @@ Exceptions
     General exception raised by :py:class:`Result` handles when reading the
     result of a task that failed due to an error.
 
+Expiration
+----------
+
+Tools for expiring task results and cleaning up the result store. See
+:ref:`expiration` for an overview.
+
+.. py:class:: ExpirationPolicy(default=None, task_ttls=None, **kind_ttls)
+
+    :param default: fallback TTL (seconds) for kinds without an explicit
+        setting; ``None`` means entries never expire.
+    :param dict task_ttls: mapping of task name -> mapping of kind -> TTL,
+        overriding the per-kind defaults.
+    :param kind_ttls: per-kind TTLs, e.g. ``complete=86400, error=300``.
+
+    Maps result kinds (and optionally individual tasks) to TTLs. A TTL of
+    ``None`` means the entry never expires, ``0`` means it expires
+    immediately (zero-TTL results are not retained at all), and negative
+    values raise ``ValueError``.
+
+    .. py:method:: set_ttl(kind, ttl)
+
+        Set the TTL for the given :py:class:`ResultKind`.
+
+    .. py:method:: set_task_ttl(task_name, kind, ttl)
+
+        Set a per-task TTL override for the given kind.
+
+    .. py:method:: ttl_for(kind, task_name=None)
+
+        Resolve the effective TTL, preferring a per-task override, then
+        the per-kind setting, then the policy default.
+
+.. py:class:: ResultKind
+
+    Classification for data stored in the result store. Available kinds:
+    ``COMPLETE``, ``ERROR``, ``RETRY``, ``GROUP``,
+    ``REVOKED`` and ``PENDING``.
+
+.. py:class:: ResultMetadata(key, kind, task_name=None, timestamp=None, references=())
+
+    Bookkeeping record stored alongside a result-store key.
+
+.. py:class:: CleanupReport(scanned, deleted, skipped_referenced, skipped_pending, cursor)
+
+    Result of a :py:meth:`Huey.cleanup_results` call. The report is a
+    plain value object; repeated cleanup calls against an unchanged store
+    return equal reports.
+
 Storage
 -------
 
@@ -1629,3 +1709,28 @@ Huey comes with several built-in storage implementations:
     .. py:method:: result_items()
 
     .. py:method:: flush_results()
+
+    .. py:method:: put_result_data(key, value, metadata=None, expire=None)
+
+        Store a result value along with its expiration metadata. Backends
+        that support transactions implement this atomically.
+
+    .. py:method:: put_result_metadata(key, metadata)
+
+    .. py:method:: get_result_metadata(key)
+
+    .. py:method:: delete_result_metadata(key)
+
+    .. py:method:: result_metadata_items()
+
+    .. py:method:: delete_result_if_unmodified(key, timestamp)
+
+        Atomically delete the result and metadata for the given key, but
+        only if the metadata timestamp still matches. Used by
+        :py:meth:`Huey.cleanup_results` to avoid lost updates.
+
+    .. py:attribute:: supports_native_expiration
+
+        Whether the storage engine expires result data by itself. When
+        ``False``, expiration is handled by
+        :py:meth:`Huey.cleanup_results`.

@@ -3,6 +3,14 @@ Changelog
 
 ## master
 
+* Add support for per-result-type and per-task result expiration via the new
+  `result_expiration` parameter (`ExpirationPolicy`). Results, errors,
+  retry state, group/chord metadata, revocation markers and pending
+  placeholders each get their own TTL, and expired entries are removed by the
+  new idempotent `Huey.cleanup_results()` API, which supports cursor-based
+  segmented cleanups and is safe to run concurrently with workers. See the
+  "Result expiration and cleanup" docs for details and per-backend notes.
+
 [View commits](https://github.com/coleifer/huey/compare/2.5.3...HEAD)
 
 ## 2.5.3
