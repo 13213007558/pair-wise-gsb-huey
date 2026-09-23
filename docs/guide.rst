@@ -161,6 +161,37 @@ comma, for example:
     # Runs every 10 minutes between 9a and 11a, and 4p-6p.
     crontab(minute='*/10', hour='9-11,16-18')
 
+Schedules can also use fixed UTC-aligned intervals and explicit bounds:
+
+.. code-block:: python
+
+    import datetime
+    from zoneinfo import ZoneInfo
+
+    start = datetime.datetime(2026, 1, 1, 2, 0, tzinfo=ZoneInfo('Asia/Shanghai'))
+
+    @huey.periodic_task(interval_seconds=900, start_time=start,
+                        timezone='Asia/Shanghai')
+    def every_fifteen_minutes():
+        pass
+
+The scheduler persists the last enqueued occurrence as a UTC instant. This
+cursor is independent of one-off task ETA values and retry schedules, and is
+claimed atomically, so multiple scheduler processes cannot enqueue the same
+occurrence. Cron-like rules are matched in their configured timezone and then
+mapped to UTC; DST gaps generate no message and repeated wall-clock times can
+generate their distinct UTC occurrences.
+
+Naive ``start_time`` and ``end_time`` values use ``timezone``, defaulting to
+UTC. Existing task messages without timezone metadata continue to deserialize
+with their previous meaning. If you maintained a custom external ``last_run``
+store on an older Huey version, convert old default values as naive UTC, old
+``utc=False`` values in the worker's local zone, and then write the equivalent
+UTC epoch microseconds. Huey's built-in state uses the 12-byte format
+``b'hp2\0'`` followed by big-endian unsigned microseconds; plain numeric
+legacy values are read as a migration aid, but new writes should use the
+versioned format.
+
 For more information see the following API documentation:
 
 * :py:meth:`~Huey.periodic_task`

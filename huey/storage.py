@@ -32,7 +32,7 @@ from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.utils import FileLock
 from huey.utils import text_type
-from huey.utils import to_timestamp
+from huey.utils import to_timestamp_utc
 
 
 class BaseStorage(object):
@@ -42,8 +42,9 @@ class BaseStorage(object):
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
 
-    def __init__(self, name='huey', **storage_kwargs):
+    def __init__(self, name='huey', utc=True, **storage_kwargs):
         self.name = name
+        self.utc = utc
 
     def close(self):
         """
@@ -240,6 +241,19 @@ class BaseStorage(object):
         self.flush_schedule()
         self.flush_results()
 
+    def read_periodic_task(self, key):
+        return self.peek_data(key)
+
+    def claim_periodic_task(self, key, previous, value):
+        if previous is not EmptyData:
+            current = self.peek_data(key)
+            if current != previous:
+                return False
+        elif self.has_data_for_key(key):
+            return False
+        self.put_data(key, value)
+        return True
+
 
 class BlackHoleStorage(BaseStorage):
     def enqueue(self, data, priority=None): pass
@@ -259,6 +273,8 @@ class BlackHoleStorage(BaseStorage):
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
+    def read_periodic_task(self, key): return EmptyData
+    def claim_periodic_task(self, key, previous, value): return False
 
 
 class MemoryStorage(BaseStorage):
@@ -268,6 +284,7 @@ class MemoryStorage(BaseStorage):
         self._queue = []
         self._results = {}
         self._schedule = []
+        self._periodic = {}
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -345,6 +362,22 @@ class MemoryStorage(BaseStorage):
     def flush_results(self):
         self._results = {}
 
+    def read_periodic_task(self, key):
+        with self._lock:
+            return self._periodic.get(key, EmptyData)
+
+    def claim_periodic_task(self, key, previous, value):
+        with self._lock:
+            current = self._periodic.get(key, EmptyData)
+            if current != previous:
+                return False
+            self._periodic[key] = value
+            return True
+
+    def flush_all(self):
+        super(MemoryStorage, self).flush_all()
+        self._periodic = {}
+
 
 # A custom lua script to pass to redis that will read tasks from the schedule
 # and atomically pop them from the sorted set and return them. It won't return
@@ -356,14 +389,23 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+PERIODIC_CLAIM_LUA = """\
+local current = redis.call('hget', KEYS[1], ARGV[1])
+if current == ARGV[2] or (not current and ARGV[2] == '') then
+    redis.call('hset', KEYS[1], ARGV[1], ARGV[3])
+    return 1
+end
+return 0"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
     redis_client = Redis
 
-    def __init__(self, name='huey', blocking=True, read_timeout=1,
+    def __init__(self, name='huey', blocking=True, read_timeout=1, utc=True,
                  connection_pool=None, url=None, client_name=None,
                  **connection_params):
+        super(RedisStorage, self).__init__(name, utc=utc)
 
         if Redis is None:
             raise ConfigurationError('"redis" python module not found, cannot '
@@ -390,12 +432,14 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._claim_periodic = self.conn.register_script(PERIODIC_CLAIM_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
+        self.periodic_key = 'huey.periodic.%s' % self.name
 
         if client_name is not None:
             self.conn.client_setname(client_name)
@@ -407,7 +451,7 @@ class RedisStorage(BaseStorage):
         return re.sub('[^a-z0-9]', '', name)
 
     def convert_ts(self, ts):
-        return time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
+        return to_timestamp_utc(ts, self.utc)
 
     def enqueue(self, data, priority=None):
         if priority:
@@ -490,6 +534,19 @@ class RedisStorage(BaseStorage):
 
     def flush_results(self):
         self.conn.delete(self.result_key)
+
+    def read_periodic_task(self, key):
+        return self.conn.hget(self.periodic_key, key) or EmptyData
+
+    def claim_periodic_task(self, key, previous, value):
+        expected = b'' if previous is EmptyData else previous
+        result = self._claim_periodic(
+            keys=[self.periodic_key], args=[key, expected, value])
+        return bool(result)
+
+    def flush_all(self):
+        super(RedisStorage, self).flush_all()
+        self.conn.delete(self.periodic_key)
 
 
 class RedisExpireStorage(RedisStorage):
@@ -691,7 +748,7 @@ class SqliteStorage(BaseSqlStorage):
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
-                 **kwargs):
+                 utc=True, **kwargs):
         self.filename = filename
         self._cache_mb = cache_mb
         self._fsync = fsync
@@ -710,7 +767,7 @@ class SqliteStorage(BaseSqlStorage):
                 'primary key',
                 'primary key autoincrement')
 
-        super(SqliteStorage, self).__init__(name)
+        super(SqliteStorage, self).__init__(name, utc=utc)
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -754,13 +811,13 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('delete from task where queue=?', (self.name,), commit=True)
 
     def add_to_schedule(self, data, ts):
-        params = (self.name, to_blob(data), to_timestamp(ts))
+        params = (self.name, to_blob(data), to_timestamp_utc(ts, self.utc))
         self.sql('insert into schedule (queue, data, timestamp) '
                  'values (?, ?, ?)', params, commit=True)
 
     def read_schedule(self, ts):
         with self.db(commit=True) as curs:
-            params = (self.name, to_timestamp(ts))
+            params = (self.name, to_timestamp_utc(ts, self.utc))
             curs.execute('select id, data from schedule where '
                          'queue = ? and timestamp <= ?', params)
             id_list, data = [], []
@@ -837,6 +894,32 @@ class SqliteStorage(BaseSqlStorage):
     def flush_results(self):
         self.sql('delete from kv where queue=?', (self.name,), True)
 
+    def read_periodic_task(self, key):
+        res = self.sql('select value from kv where queue=? and key=?',
+                       (self.name, key), results=True)
+        return to_bytes(res[0][0]) if res else EmptyData
+
+    def claim_periodic_task(self, key, previous, value):
+        try:
+            with self.db(commit=True) as curs:
+                if previous is EmptyData:
+                    curs.execute('insert or abort into kv (queue, key, value) '
+                                 'values (?, ?, ?)',
+                                 (self.name, key, to_blob(value)))
+                else:
+                    curs.execute('update kv set value=? where queue=? and '
+                                 'key=? and value=?',
+                                 (to_blob(value), self.name, key,
+                                  to_blob(previous)))
+                    if curs.rowcount != 1:
+                        return False
+        except sqlite3.IntegrityError:
+            return False
+        return True
+
+    def flush_all(self):
+        super(SqliteStorage, self).flush_all()
+
 
 class FileStorage(BaseStorage):
     """
@@ -861,6 +944,7 @@ class FileStorage(BaseStorage):
         self.queue_path = os.path.join(self.path, 'queue')
         self.schedule_path = os.path.join(self.path, 'schedule')
         self.result_path = os.path.join(self.path, 'results')
+        self.periodic_path = os.path.join(self.path, 'periodic')
         self.levels = levels
 
         if use_thread_lock:
@@ -934,7 +1018,7 @@ class FileStorage(BaseStorage):
         self._flush_dir(self.queue_path)
 
     def _timestamp_to_prefix(self, ts):
-        ts = time.mktime(ts.timetuple()) + (ts.microsecond * 1e-6)
+        ts = to_timestamp_utc(ts, self.utc)
         return '%012x' % int(ts * 1000)
 
     def add_to_schedule(self, data, ts):
@@ -985,6 +1069,39 @@ class FileStorage(BaseStorage):
 
     def flush_schedule(self):
         self._flush_dir(self.schedule_path)
+
+    def _periodic_filename(self, key):
+        if isinstance(key, text_type):
+            key = key.encode('utf8')
+        digest = hashlib.sha256(key).hexdigest()
+        return os.path.join(self.periodic_path, digest)
+
+    def read_periodic_task(self, key):
+        filename = self._periodic_filename(key)
+        with self.lock:
+            if not os.path.exists(filename):
+                return EmptyData
+            with open(filename, 'rb') as fh:
+                return fh.read()
+
+    def claim_periodic_task(self, key, previous, value):
+        filename = self._periodic_filename(key)
+        with self.lock:
+            current = EmptyData
+            if os.path.exists(filename):
+                with open(filename, 'rb') as fh:
+                    current = fh.read()
+            if current != previous:
+                return False
+            if not os.path.exists(self.periodic_path):
+                os.makedirs(self.periodic_path)
+            with open(filename, 'wb') as fh:
+                fh.write(value)
+            return True
+
+    def flush_all(self):
+        super(FileStorage, self).flush_all()
+        self._flush_dir(self.periodic_path)
 
     def path_for_key(self, key):
         if isinstance(key, text_type):

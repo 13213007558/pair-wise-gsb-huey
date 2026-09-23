@@ -22,6 +22,7 @@ from huey.constants import WORKER_PROCESS
 from huey.constants import WORKER_THREAD
 from huey.constants import WORKER_TYPES
 from huey.exceptions import ConfigurationError
+from huey.utils import utcnow
 from huey.utils import time_clock
 
 
@@ -142,7 +143,7 @@ class Scheduler(BaseProcess):
     If periodic tasks are enabled, the scheduler will wake up every 60 seconds
     to enqueue any periodic tasks that should be run.
     """
-    periodic_task_seconds = 60
+    periodic_task_seconds = 1
     process_name = 'Scheduler'
 
     def __init__(self, huey, interval, periodic):
@@ -161,7 +162,7 @@ class Scheduler(BaseProcess):
             return
 
         try:
-            task_list = self.huey.read_schedule(now)
+            task_list = self.huey.read_schedule(now, utc=self.huey.utc)
         except Exception:
             self._logger.exception('Error reading schedule.')
         else:
@@ -170,16 +171,17 @@ class Scheduler(BaseProcess):
                 self.huey.enqueue(task)
 
         if self.periodic and self._next_periodic <= time_clock():
-            self._next_periodic += self.periodic_task_seconds
-            self.enqueue_periodic_tasks(now)
+            self._next_periodic = (time_clock() + self.periodic_task_seconds)
+            horizon = utcnow() - datetime.timedelta(
+                seconds=self.periodic_task_seconds) if now is None else None
+            self.enqueue_periodic_tasks(now, horizon=horizon)
 
         self.sleep_for_interval(current, self.interval)
 
-    def enqueue_periodic_tasks(self, now):
+    def enqueue_periodic_tasks(self, now, horizon=None):
         self._logger.debug('Checking periodic tasks')
-        for task in self.huey.read_periodic(now):
+        for task in self.huey.enqueue_due_periodic(now, horizon=horizon):
             self._logger.info('Enqueueing periodic task %s.', task)
-            self.huey.enqueue(task)
 
 
 class Environment(object):

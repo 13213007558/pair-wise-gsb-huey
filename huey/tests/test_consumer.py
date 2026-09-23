@@ -106,10 +106,10 @@ class TestConsumerIntegration(BaseTestCase):
         self.work_on_tasks(consumer, 1)
         self.assertEqual(state, ['p1', 'p2', 'p1'])
 
+        dt = datetime.datetime(2000, 1, 1, 12, 1)
         task_p1.revoke()
         self.schedule_tasks(consumer, dt)
-        self.assertEqual(len(self.huey), 1)  # Enqueued despite being revoked.
-        self.work_on_tasks(consumer, 1)
+        self.assertEqual(len(self.huey), 0)
         self.assertEqual(state, ['p1', 'p2', 'p1'])  # No change, not executed.
 
 

@@ -8,6 +8,7 @@ from huey.api import Huey
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import BaseStorage
+from huey.utils import local_timestamp
 
 
 class BytesBlobField(BlobField):
@@ -16,8 +17,9 @@ class BytesBlobField(BlobField):
 
 
 class SqlStorage(BaseStorage):
-    def __init__(self, name='huey', database=None, **kwargs):
-        super(SqlStorage, self).__init__(name)
+    def __init__(self, name='huey', database=None, utc=True, **kwargs):
+        super(SqlStorage, self).__init__(name, utc=utc)
+        self.utc = utc
 
         if database is None:
             raise ConfigurationError('Use of SqlStorage requires a '
@@ -104,6 +106,11 @@ class SqlStorage(BaseStorage):
             self.database.close()
             self.database.connect()
 
+    def timestamp(self, value):
+        if self.utc or value.tzinfo is not None:
+            return value
+        return local_timestamp(value)
+
     def enqueue(self, data, priority=None):
         self.check_conn()
         self.Task.create(queue=self.name, data=data, priority=priority or 0)
@@ -141,12 +148,13 @@ class SqlStorage(BaseStorage):
 
     def add_to_schedule(self, data, timestamp):
         self.check_conn()
-        self.Schedule.create(queue=self.name, data=data, timestamp=timestamp)
+        self.Schedule.create(queue=self.name, data=data,
+                            timestamp=self.timestamp(timestamp))
 
     def read_schedule(self, timestamp):
         self.check_conn()
         query = (self.schedule(self.Schedule.id, self.Schedule.data)
-                 .where(self.Schedule.timestamp <= timestamp)
+                 .where(self.Schedule.timestamp <= self.timestamp(timestamp))
                  .tuples())
         if self.for_update:
             query = query.for_update(self.for_update)
@@ -239,6 +247,30 @@ class SqlStorage(BaseStorage):
 
     def flush_results(self):
         self.KV.delete().where(self.KV.queue == self.name).execute()
+
+    def read_periodic_task(self, key):
+        self.check_conn()
+        try:
+            kv = self.kv(self.KV.value).where(self.KV.key == key).get()
+        except self.KV.DoesNotExist:
+            return EmptyData
+        return kv.value
+
+    def claim_periodic_task(self, key, previous, value):
+        self.check_conn()
+        with self.database.atomic():
+            if previous is EmptyData:
+                try:
+                    self.KV.insert(queue=self.name, key=key, value=value).execute()
+                except IntegrityError:
+                    return False
+                return True
+            result = (self.KV.update(value=value)
+                      .where((self.KV.queue == self.name) &
+                             (self.KV.key == key) &
+                             (self.KV.value == previous))
+                      .execute())
+            return result == 1
 
 
 SqlHuey = partial(Huey, storage_class=SqlStorage)

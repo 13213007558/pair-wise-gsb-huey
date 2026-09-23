@@ -5,6 +5,7 @@ from huey.tests.test_helpers import *
 from huey.tests.test_immediate import *
 from huey.tests.test_kt_huey import *
 from huey.tests.test_priority import *
+from huey.tests.test_periodic_schedule import *
 from huey.tests.test_registry import *
 from huey.tests.test_serializer import *
 from huey.tests.test_signals import *

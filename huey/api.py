@@ -34,17 +34,239 @@ from huey.storage import RedisExpireStorage
 from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
 from huey.utils import Error
+from huey.utils import aware_to_utc
 from huey.utils import normalize_expire_time
+from huey.utils import normalize_schedule_time
 from huey.utils import normalize_time
 from huey.utils import reraise_as
 from huey.utils import string_type
 from huey.utils import time_clock
-from huey.utils import to_timestamp
+from huey.utils import get_timezone
+from huey.utils import is_naive
+from huey.utils import local_to_utc
+from huey.utils import naive_utc
+from huey.utils import naive_local
+from huey.utils import pack_periodic_state
+from huey.utils import unpack_periodic_state
+from huey.utils import utc
 from huey.utils import utcnow
 
 
 logger = logging.getLogger('huey')
 _sentinel = object()
+
+
+class PeriodicSchedule(object):
+    def __init__(self, validator=None, interval_seconds=None,
+                 start_time=None, end_time=None, timezone=None):
+        self.validator = validator
+        self.interval_seconds = interval_seconds
+        self.start_time = start_time
+        self.end_time = end_time
+        self.timezone = timezone
+
+    @property
+    def interval(self):
+        if self.interval_seconds is None:
+            return None
+        return datetime.timedelta(seconds=self.interval_seconds)
+
+    def resolve(self, default_timezone=None):
+        timezone = get_timezone(self.timezone if self.timezone is not None
+                                else default_timezone)
+        start_time = normalize_schedule_time(self.start_time, timezone)
+        end_time = normalize_schedule_time(self.end_time, timezone)
+        return ResolvedPeriodicSchedule(self.validator,
+                                        self.interval_seconds,
+                                        start_time,
+                                        end_time,
+                                        timezone)
+
+    def validate_datetime(self, timestamp, naive=True, baseline_timezone=None):
+        if self.validator is None:
+            return False
+        schedule = self.resolve()
+        value = self._bound_timestamp(timestamp, schedule, naive,
+                                      baseline_timezone)
+        if value is None:
+            return False
+        return self.validator(value)
+
+    def _bound_timestamp(self, timestamp, schedule, naive,
+                         baseline_timezone):
+        timestamp = schedule.as_local(timestamp, baseline_timezone)
+        if schedule.start_time is not None:
+            if timestamp < schedule.start_time_aware:
+                return None
+        if schedule.end_time is not None:
+            if timestamp > schedule.end_time_aware:
+                return None
+        if naive:
+            return timestamp.replace(tzinfo=None)
+        return timestamp
+
+
+class ResolvedPeriodicSchedule(PeriodicSchedule):
+    def __init__(self, validator, interval_seconds, start_time, end_time,
+                 timezone):
+        super(ResolvedPeriodicSchedule, self).__init__(
+            validator, interval_seconds, start_time, end_time, timezone)
+
+    def resolve(self, default_timezone=None):
+        return self
+
+    @property
+    def start_time_aware(self):
+        if self.start_time is None:
+            return None
+        return self.start_time.replace(tzinfo=utc)
+
+    @property
+    def end_time_aware(self):
+        if self.end_time is None:
+            return None
+        return self.end_time.replace(tzinfo=utc)
+
+    def as_local(self, timestamp, baseline_timezone=None):
+        if is_naive(timestamp):
+            timestamp = timestamp.replace(tzinfo=baseline_timezone or utc)
+        return timestamp.astimezone(self.timezone)
+
+    def as_naive_utc(self, timestamp):
+        if is_naive(timestamp):
+            timestamp = timestamp.replace(tzinfo=self.timezone)
+        return timestamp.astimezone(utc).replace(tzinfo=None)
+
+    def due(self, last_run, now, horizon=None):
+        first_run = last_run is None
+        if last_run is None:
+            last_run = self.initial_last_run(now, horizon)
+        else:
+            last_run = self.normalize_last_run(last_run)
+            if horizon is not None and last_run < horizon:
+                last_run = horizon
+                if self.start_time is not None and last_run < self.start_time:
+                    last_run = self.start_time - self.interval
+        last_run = self.bound_initial(last_run, now)
+        if self.interval_seconds is None and horizon is None:
+            horizon_floor = now.replace(second=0, microsecond=0) - datetime.timedelta(
+                minutes=1)
+            if last_run < horizon_floor:
+                last_run = horizon_floor
+
+        if self.interval_seconds is not None:
+            due = self.interval_due(last_run, now)
+        else:
+            due = self.cron_due(last_run, now, first_run, horizon is not None)
+        return [item for item in due
+                if _periodic_within_bounds(
+                    self, item.replace(tzinfo=utc))]
+
+    def bound_initial(self, value, now):
+        if self.start_time is not None:
+            if self.interval_seconds is not None:
+                interval = self.interval
+                if value < self.start_time:
+                    return self.start_time - interval
+            elif value < self.start_time - datetime.timedelta(minutes=1):
+                return self.start_time - datetime.timedelta(minutes=1)
+        if self.end_time is not None and value > now:
+            return now
+        return value
+
+    def normalize_last_run(self, value):
+        if is_naive(value):
+            return value
+        return value.astimezone(utc).replace(tzinfo=None)
+
+    def initial_last_run(self, now, horizon):
+        if self.interval_seconds is not None:
+            origin = self.start_time or datetime.datetime(1970, 1, 1)
+            if origin > now:
+                return origin - self.interval
+            if horizon is not None and origin > horizon:
+                return origin - self.interval
+            if horizon is not None:
+                return horizon
+            return origin + ((((now - origin) // self.interval) - 1) *
+                             self.interval)
+        reference = horizon if horizon is not None else now
+        lookback = 1 if horizon is not None else 2
+        return reference.replace(second=0, microsecond=0) - datetime.timedelta(
+            minutes=lookback)
+
+    def interval_due(self, last_run, now):
+        interval = self.interval
+        if self.start_time is not None:
+            origin = self.start_time
+            if last_run < origin:
+                next_run = origin
+            else:
+                next_run = origin + (((last_run - origin) // interval) + 1) * interval
+        else:
+            next_run = last_run + interval
+        while next_run <= now:
+            yield next_run
+            next_run += interval
+
+    def cron_due(self, last_run, now, first_run=False, has_horizon=False):
+        start_local = self.as_local(last_run)
+        candidate = self._next_local_minute(start_local)
+        end_local = self.as_local(now)
+        while candidate <= end_local:
+            naive_candidate = candidate.replace(tzinfo=None)
+            if self.validator is None or self.validator(naive_candidate):
+                transitions = self._wall_transitions(naive_candidate)
+                if first_run and not has_horizon and candidate < end_local:
+                    transitions = ()
+                for occurrence in transitions:
+                    run_at = occurrence.astimezone(utc).replace(tzinfo=None)
+                    if last_run < run_at <= now:
+                        yield run_at
+            candidate += datetime.timedelta(minutes=1)
+
+    def _next_local_minute(self, value):
+        candidate = value.replace(second=0, microsecond=0)
+        if getattr(value, 'fold', 0) == 0:
+            return candidate
+        candidate += datetime.timedelta(minutes=1)
+        return candidate
+
+    def _wall_transitions(self, value):
+        first = value.replace(tzinfo=self.timezone)
+        if first.replace(tzinfo=None) != value:
+            return ()
+        normalized = first.astimezone(utc).astimezone(self.timezone)
+        if normalized.replace(tzinfo=None) != value:
+            return ()
+        offset = first.utcoffset()
+        preceding = (first - datetime.timedelta(minutes=61)).utcoffset()
+        if preceding != offset:
+            second = value.replace(tzinfo=_FixedOffset(preceding))
+            return (second, first) if preceding > offset else (first, second)
+        return (first,)
+
+
+class _FixedOffset(datetime.tzinfo):
+    def __init__(self, offset):
+        self.offset = offset
+
+    def utcoffset(self, dt):
+        return self.offset
+
+    def dst(self, dt):
+        return datetime.timedelta(0)
+
+    def tzname(self, dt):
+        return 'fixed-offset'
+
+
+def _periodic_within_bounds(schedule, timestamp):
+    if schedule.start_time_aware is not None and timestamp < schedule.start_time_aware:
+        return False
+    if schedule.end_time_aware is not None and timestamp > schedule.end_time_aware:
+        return False
+    return True
 
 
 class Huey(object):
@@ -87,9 +309,9 @@ class Huey(object):
                           'global_registry')
 
     def __init__(self, name='huey', results=True, store_none=False, utc=True,
-                 immediate=False, serializer=None, compression=False,
-                 use_zlib=False, immediate_use_memory=True, always_eager=None,
-                 storage_class=None, **storage_kwargs):
+                 timezone=None, immediate=False, serializer=None,
+                 compression=False, use_zlib=False, immediate_use_memory=True,
+                 always_eager=None, storage_class=None, **storage_kwargs):
         if always_eager is not None:
             warnings.warn('"always_eager" parameter is deprecated, use '
                           '"immediate" instead', DeprecationWarning)
@@ -106,6 +328,7 @@ class Huey(object):
         self.results = results
         self.store_none = store_none
         self.utc = utc
+        self.timezone = timezone
         self._immediate = immediate
         self.immediate_use_memory = immediate_use_memory
         if serializer is None:
@@ -153,7 +376,14 @@ class Huey(object):
             Storage = RedisStorage
         else:
             Storage = self.storage_class
-        return Storage(self.name, **kwargs)
+        try:
+            return Storage(self.name, utc=self.utc, **kwargs)
+        except TypeError as exc:
+            if "unexpected keyword argument 'utc'" not in str(exc):
+                raise
+            storage = Storage(self.name, **kwargs)
+            storage.utc = self.utc
+            return storage
 
     @property
     def immediate(self):
@@ -175,6 +405,7 @@ class Huey(object):
              name=None, expires=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
+            schedule_huey = self
             return TaskWrapper(
                 self,
                 func.func if isinstance(func, TaskWrapper) else func,
@@ -187,13 +418,54 @@ class Huey(object):
                 **kwargs)
         return decorator
 
-    def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
+    def periodic_task(self, validate_datetime=None, retries=0, retry_delay=0,
                       priority=None, context=False, name=None, expires=None,
-                      **kwargs):
+                      interval_seconds=None, seconds=None,
+                      interval=None, period=None, period_seconds=None,
+                      periodic_seconds=None, schedule=None, cron=None,
+                      start_time=None, end_time=None, start=None, end=None,
+                      timezone=None, **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
+            schedule_huey = self
+            validator = validate_datetime
+            if validator is None:
+                validator = schedule if schedule is not None else cron
+            interval_candidates = [value for value in (
+                interval_seconds, seconds, interval, period, period_seconds,
+                periodic_seconds) if value is not None]
+            if interval_candidates:
+                selected_interval = interval_candidates[0]
+                if isinstance(selected_interval, datetime.timedelta):
+                    selected_interval = selected_interval.total_seconds()
+            else:
+                selected_interval = None
+            if validator is not None and selected_interval is not None:
+                raise ValueError('A periodic task may use either a cron-like '
+                                 'schedule or a fixed interval, not both.')
+            schedule_kwargs = {
+                'interval_seconds': selected_interval,
+                'start_time': start_time if start_time is not None else start,
+                'end_time': end_time if end_time is not None else end,
+                'timezone': timezone,
+            }
+            if isinstance(validator, PeriodicSchedule):
+                periodic_schedule = validator
+                provided = [key for key, value in schedule_kwargs.items()
+                            if value is not None]
+                if provided:
+                    raise ValueError('Cannot override schedule parameters: %s' %
+                                     ', '.join(provided))
+            else:
+                schedule_kwargs['validator'] = validator
+                periodic_schedule = PeriodicSchedule(**schedule_kwargs)
+
             def method_validate(self, timestamp):
-                return validate_datetime(timestamp)
+                schedule = self.periodic_schedule.resolve(
+                    schedule_huey._schedule_timezone())
+                baseline = None if schedule_huey.utc else get_timezone(False)
+                return schedule.validate_datetime(
+                    timestamp, baseline_timezone=baseline)
 
             return TaskWrapper(
                 self,
@@ -205,6 +477,7 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 validate_datetime=method_validate,
+                periodic_schedule=periodic_schedule,
                 task_base=PeriodicTask,
                 **kwargs)
 
@@ -303,7 +576,7 @@ class Huey(object):
     def enqueue(self, task):
         # Resolve the expiration time when the task is enqueued.
         if task.expires:
-            task.resolve_expires(self.utc)
+            task.resolve_expires(self.utc, self.timezone)
 
         self._emit(S.SIGNAL_ENQUEUED, task)
 
@@ -358,6 +631,29 @@ class Huey(object):
         return (utcnow() if self.utc else
                 datetime.datetime.now())
 
+    def _schedule_timezone(self):
+        if self.timezone is not None:
+            return self.timezone
+        return True if self.utc else False
+
+    def _to_utc_timestamp(self, timestamp=None):
+        if timestamp is None:
+            return self._get_timestamp()
+        if self.utc:
+            return timestamp if is_naive(timestamp) else naive_utc(timestamp)
+        if is_naive(timestamp):
+            return local_to_utc(timestamp)
+        return aware_to_utc(timestamp)
+
+    def _from_utc_timestamp(self, timestamp):
+        if is_naive(timestamp):
+            if self.utc:
+                return timestamp
+            return naive_local(timestamp.replace(tzinfo=utc))
+        if self.utc:
+            return naive_utc(timestamp)
+        return naive_local(timestamp)
+
     def execute(self, task, timestamp=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
@@ -403,7 +699,8 @@ class Huey(object):
             logger.info('Task %s raised RetryTask, retrying.', task.id)
             task.retries += 1
             if exc.eta or exc.delay is not None:
-                retry_eta = normalize_time(exc.eta, exc.delay, self.utc)
+                retry_eta = normalize_time(exc.eta, exc.delay, self.utc,
+                                          self.timezone)
             exception = exc
         except CancelExecution as exc:
             if exc.retry or (exc.retry is None and task.retries):
@@ -520,7 +817,8 @@ class Huey(object):
         if isinstance(task_class, TaskWrapper):
             task_class = task_class.task_class
         if revoke_until is not None:
-            revoke_until = normalize_time(revoke_until, utc=self.utc)
+            revoke_until = normalize_time(revoke_until, utc=self.utc,
+                                          timezone=self.timezone)
         self.put(self._task_key(task_class, 'rt'), (revoke_until, revoke_once))
 
     def restore_all(self, task_class):
@@ -530,7 +828,8 @@ class Huey(object):
 
     def revoke(self, task, revoke_until=None, revoke_once=False):
         if revoke_until is not None:
-            revoke_until = normalize_time(revoke_until, utc=self.utc)
+            revoke_until = normalize_time(revoke_until, utc=self.utc,
+                                          timezone=self.timezone)
         self.put(task.revoke_id, (revoke_until, revoke_once))
 
     def restore(self, task):
@@ -597,13 +896,24 @@ class Huey(object):
     def add_schedule(self, task):
         data = self.serialize_task(task)
         eta = task.eta or datetime.datetime.fromtimestamp(0)
-        self.storage.add_to_schedule(data, eta)
+        if self.utc or is_naive(eta):
+            storage_eta = eta
+        else:
+            storage_eta = aware_to_utc(eta)
+        self.storage.add_to_schedule(data, storage_eta)
         logger.info('Added task %s to schedule, eta %s', task.id, eta)
         self._emit(S.SIGNAL_SCHEDULED, task)
 
-    def read_schedule(self, timestamp=None):
+    def read_schedule(self, timestamp=None, utc=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
+        elif utc:
+            if not is_naive(timestamp):
+                timestamp = aware_to_utc(timestamp)
+        elif is_naive(timestamp):
+            pass
+        else:
+            timestamp = naive_local(timestamp)
         accum = []
         for msg in self.storage.read_schedule(timestamp):
             try:
@@ -619,6 +929,45 @@ class Huey(object):
             timestamp = self._get_timestamp()
         return [task for task in self._registry.periodic_tasks
                 if task.validate_datetime(timestamp)]
+
+    def _periodic_state_key(self, task):
+        return 'periodic:%s:%s' % (self.name, task.name)
+
+    def enqueue_due_periodic(self, timestamp=None, horizon=None):
+        now = self._to_utc_timestamp(timestamp)
+        enqueue = []
+        for task in self._registry.periodic_tasks:
+            schedule = task.periodic_schedule.resolve(
+                self._schedule_timezone())
+            key = self._periodic_state_key(task)
+            current = self.storage.read_periodic_task(key)
+            last_run = unpack_periodic_state(current)
+            due = list(schedule.due(last_run, now, horizon))
+            if not due:
+                continue
+            claimed = self.storage.claim_periodic_task(
+                key, current, pack_periodic_state(due[-1]))
+            if not claimed:
+                continue
+            for run_at in due:
+                eta = self._from_utc_timestamp(run_at)
+                periodic = type(task)(
+                    task.args,
+                    task.kwargs,
+                    id=periodic_task_id(task.name, run_at),
+                    eta=eta,
+                    retries=task.retries,
+                    retry_delay=task.retry_delay,
+                    priority=task.priority,
+                    expires=task.expires,
+                    on_complete=task.on_complete,
+                    on_error=task.on_error)
+                periodic.eta = eta
+                enqueue.append(periodic)
+
+        for task in enqueue:
+            self.enqueue(task)
+        return enqueue
 
     def ready_to_run(self, task, timestamp=None):
         if timestamp is None:
@@ -741,9 +1090,10 @@ class Task(object):
     def create_id(self):
         return str(uuid.uuid4())
 
-    def resolve_expires(self, utc=True):
+    def resolve_expires(self, utc=True, timezone=None):
         if self.expires:
-            self.expires_resolved = normalize_expire_time(self.expires, utc)
+            self.expires_resolved = normalize_expire_time(
+                self.expires, utc, timezone)
         return self.expires_resolved
 
     def extend_data(self, data):
@@ -799,6 +1149,8 @@ class Task(object):
 
 
 class PeriodicTask(Task):
+    periodic_schedule = PeriodicSchedule()
+
     def validate_datetime(self, timestamp):
         return False
 
@@ -807,7 +1159,8 @@ class TaskWrapper(object):
     task_base = Task
 
     def __init__(self, huey, func, retries=None, retry_delay=None,
-                 context=False, name=None, task_base=None, **settings):
+                 context=False, name=None, task_base=None,
+                 periodic_schedule=None, **settings):
         self.__doc__ = getattr(func, '__doc__', None)
         self.huey = huey
         self.func = func
@@ -816,17 +1169,21 @@ class TaskWrapper(object):
         self.context = context
         self.name = name
         self.settings = settings
+        self.periodic_schedule = periodic_schedule
         if task_base is not None:
             self.task_base = task_base
 
         # Dynamically create task class and register with Huey instance.
-        self.task_class = self.create_task(func, context, name, **settings)
+        self.task_class = self.create_task(func, context, name,
+                                           periodic_schedule,
+                                           **settings)
         self.huey._registry.register(self.task_class)
 
     def unregister(self):
         return self.huey._registry.unregister(self.task_class)
 
-    def create_task(self, func, context=False, name=None, **settings):
+    def create_task(self, func, context=False, name=None,
+                    periodic_schedule=None, **settings):
         def execute(self):
             args, kwargs = self.data
             if self.context:
@@ -837,7 +1194,8 @@ class TaskWrapper(object):
             'context': context,
             'execute': execute,
             '__module__': func.__module__,
-            '__doc__': func.__doc__}
+            '__doc__': func.__doc__,
+            'periodic_schedule': periodic_schedule}
         attrs.update(settings)
 
         if not name:
@@ -871,7 +1229,8 @@ class TaskWrapper(object):
         if kwargs is not None and not isinstance(kwargs, dict):
             raise ValueError('schedule() kwargs argument must be a dict.')
 
-        eta = normalize_time(eta, delay, self.huey.utc)
+        eta = normalize_time(eta, delay, self.huey.utc,
+                             self.huey.timezone)
         task = self.task_class(
             args or (),
             kwargs or {},
@@ -901,7 +1260,8 @@ class TaskWrapper(object):
         if delay is not None and isinstance(delay, datetime.timedelta):
             delay = delay.total_seconds()
         if eta is not None or delay is not None:
-            eta = normalize_time(eta, delay, self.huey.utc)
+            eta = normalize_time(eta, delay, self.huey.utc,
+                                 self.huey.timezone)
 
         return self.task_class(args, kwargs,
                                eta=eta,
@@ -1042,7 +1402,8 @@ class Result(object):
         # and execution_time.
         self.revoke()
         if eta is not None or delay is not None:
-            eta = normalize_time(eta, delay, self.huey.utc)
+            eta = normalize_time(eta, delay, self.huey.utc,
+                                 self.huey.timezone)
         if preserve_pipeline:
             on_complete = self.task.on_complete
             on_error = self.task.on_error
@@ -1095,6 +1456,11 @@ class ResultGroup(object):
 
 dash_re = re.compile(r'(\d+)-(\d+)')
 every_re = re.compile(r'\*\/(\d+)')
+
+
+def periodic_task_id(name, run_at):
+    return str(uuid.uuid5(uuid.NAMESPACE_URL, 'huey:%s:%s' % (
+        name, run_at.isoformat())))
 
 
 def crontab(minute='*', hour='*', day='*', month='*', day_of_week='*', strict=False):

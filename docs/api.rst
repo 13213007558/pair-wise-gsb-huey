@@ -151,13 +151,17 @@ Implementations of :py:class:`Huey` which handle task and result persistence.
 Huey object
 -----------
 
-.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, storage_kwargs)
+.. py:class:: Huey(name='huey', results=True, store_none=False, utc=True, timezone=None, immediate=False, serializer=None, compression=False, use_zlib=False, immediate_use_memory=True, storage_kwargs)
 
     :param str name: the name of the task queue, e.g. your application's name.
     :param bool results: whether to store task results.
     :param bool store_none: whether to store ``None`` in the result store.
     :param bool utc: use UTC internally, convert naive datetimes from local
         time to UTC (if local time is other than UTC).
+    :param timezone: default ``tzinfo`` or IANA timezone name for naive
+        periodic schedule bounds. Periodic schedules always persist their
+        last-run cursor as a UTC instant, so the value is independent of the
+        worker host timezone.
     :param bool immediate: useful for debugging; causes tasks to be executed
         synchronously in the application.
     :param Serializer serializer: serializer implementation for tasks and
@@ -382,11 +386,19 @@ Huey object
         For more information, see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
 
-    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, **kwargs)
+    .. py:method:: periodic_task(validate_datetime=None, retries=0, retry_delay=0, priority=None, context=False, name=None, expires=None, interval_seconds=None, start_time=None, end_time=None, timezone=None, **kwargs)
 
         :param function validate_datetime: function which accepts a
             ``datetime`` instance and returns whether the task should be
             executed at the given time.
+        :param int interval_seconds: run at fixed UTC-aligned intervals. This
+            cannot be combined with a cron-like ``validate_datetime``.
+        :param datetime start_time: earliest occurrence. Naive datetimes use
+            ``timezone`` (default UTC); aware datetimes use their own offset.
+        :param datetime end_time: latest occurrence, with the same timezone
+            rules as ``start_time``.
+        :param timezone: ``tzinfo`` or IANA timezone name used when matching
+            cron-like wall-clock times and interpreting naive boundaries.
         :param int retries: number of times to retry the function if an
             unhandled exception occurs when it is executed.
         :param int retry_delay: number of seconds to wait in-between retries.
@@ -414,6 +426,24 @@ Huey object
         decorated function should execute at that time or not. The consumer
         will send a datetime to the function once per minute, giving it the
         same granularity as the ``cron``.
+
+        Periodic scheduling state is stored separately from task messages,
+        retry ETA values and one-off schedules. The persisted cursor is a
+        versioned UTC timestamp, so restarting a scheduler on a host configured
+        for UTC or another IANA zone produces the same due messages. Fixed
+        intervals are calculated from UTC instants; cron-like schedules are
+        matched in their configured zone and mapped back to UTC, including
+        DST gaps and repeated wall-clock times.
+
+        Upgrading from older Huey releases: old messages without timezone data
+        continue to deserialize unchanged. If you externally persisted a custom
+        periodic ``last_run`` value, migrate it before starting the new
+        scheduler. Built-in state is ``b'hp2\0'`` followed by big-endian
+        unsigned UTC epoch microseconds; plain numeric legacy values are also
+        read as a migration aid. Values created with ``utc=True`` (the
+        default) are naive UTC, while values created with ``utc=False`` use
+        the worker's old local zone. Delete the key to intentionally begin
+        again from the current scheduler time.
 
         For simplicity, there is a special function :py:func:`crontab`, which
         can be used to quickly specify intervals at which a function should

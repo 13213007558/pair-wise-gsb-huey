@@ -8,6 +8,7 @@ from huey.api import Huey
 from huey.constants import EmptyData
 from huey.storage import BaseStorage
 from huey.utils import decode
+from huey.utils import to_timestamp_utc
 
 
 class KyotoTycoonStorage(BaseStorage):
@@ -15,8 +16,8 @@ class KyotoTycoonStorage(BaseStorage):
 
     def __init__(self, name='huey', host='127.0.0.1', port=1978, db=None,
                  timeout=None, max_age=3600, queue_db=None, client=None,
-                 blocking=False, result_expire_time=None):
-        super(KyotoTycoonStorage, self).__init__(name)
+                 blocking=False, result_expire_time=None, utc=True):
+        super(KyotoTycoonStorage, self).__init__(name, utc=utc)
         if client is None:
             client = KyotoTycoon(host, port, timeout, db, serializer=KT_NONE,
                                  max_age=max_age)
@@ -53,7 +54,7 @@ class KyotoTycoonStorage(BaseStorage):
         return self.q.clear()
 
     def convert_ts(self, ts):
-        return int(time.mktime(ts.timetuple()))
+        return int(to_timestamp_utc(ts, self.utc))
 
     def add_to_schedule(self, data, ts):
         self.s.add(data, self.convert_ts(ts))

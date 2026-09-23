@@ -5,6 +5,16 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/2.5.3...HEAD)
 
+* Persist periodic scheduler cursors as explicit UTC instants and claim them
+  atomically, preventing duplicate or missed due messages across restarts,
+  clock rollback and multiple scheduler processes.
+* Evaluate cron-like schedules in their configured `ZoneInfo`, map DST gaps
+  and repeated wall-clock times to UTC, and keep fixed-interval schedules
+  aligned to UTC.
+* Interpret stored naive schedule timestamps consistently as UTC by default in
+  Redis, SQLite and file storage. Old messages remain readable without changing
+  their payload; legacy periodic cursors are read as documented.
+
 ## 2.5.3
 
 This release adds the oft-requested `SIGNAL_ENQUEUED`. This signal, of
