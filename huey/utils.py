@@ -19,6 +19,14 @@ else:
                 .now(datetime.timezone.utc)
                 .replace(tzinfo=None))
 
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    try:
+        from backports.zoneinfo import ZoneInfo
+    except ImportError:
+        ZoneInfo = None
+
 
 Error = namedtuple('Error', ('metadata',))
 
@@ -82,6 +90,68 @@ def local_to_utc(dt):
     Converts a naive local datetime.datetime in UTC time zone.
     """
     return datetime.datetime(*time.gmtime(time.mktime(dt.timetuple()))[:6])
+
+
+def get_timezone(tz):
+    """
+    Resolve a timezone specifier into a datetime.tzinfo instance.
+
+    Accepts None (returned as-is), an existing tzinfo instance, or a
+    string IANA timezone name (e.g. "Asia/Shanghai") which is resolved
+    using zoneinfo.ZoneInfo. The special name "UTC" is always available,
+    even when zoneinfo is not installed.
+    """
+    if tz is None or isinstance(tz, datetime.tzinfo):
+        return tz
+    elif isinstance(tz, string_type):
+        if tz.upper() in ('UTC', 'Z'):
+            return _UTC
+        if ZoneInfo is None:
+            raise ValueError('zoneinfo is not available, cannot resolve '
+                             'timezone %r - install tzdata or use Python '
+                             '3.9+' % (tz,))
+        return ZoneInfo(tz)
+    raise ValueError('invalid timezone specifier: %r' % (tz,))
+
+
+def to_utc(dt, default_tz=None):
+    """
+    Convert a naive or aware datetime into an aware UTC datetime.
+
+    Naive datetimes are interpreted in default_tz (a tzinfo instance, or
+    None for the system local timezone). Aware datetimes are converted
+    directly. The return value is always an aware datetime in UTC, providing
+    a consistent baseline for comparison regardless of the host timezone.
+    """
+    if is_naive(dt):
+        if default_tz is None:
+            # Interpret the naive datetime as system local time.
+            ts = time.mktime(dt.timetuple()) + dt.microsecond * 1e-6
+            return datetime.datetime.fromtimestamp(ts, _UTC)
+        return dt.replace(tzinfo=default_tz).astimezone(_UTC)
+    return dt.astimezone(_UTC)
+
+
+def format_utc(dt):
+    """
+    Format an aware datetime as an ISO-8601 string in UTC. The output is
+    deterministic and independent of the host timezone, so persisted values
+    are byte-identical no matter where the process runs.
+    """
+    return dt.astimezone(_UTC).isoformat()
+
+
+def parse_isotime(data):
+    """
+    Parse an ISO-8601 datetime string (or bytes). Returns a datetime which is
+    naive when the input carries no timezone offset (legacy data), and aware
+    otherwise. The interpretation of naive values is left to the caller.
+    """
+    if isinstance(data, bytes):
+        data = data.decode('utf8')
+    if data.endswith('Z') or data.endswith('z'):
+        data = data[:-1] + '+00:00'
+    return datetime.datetime.fromisoformat(data)
 
 
 def normalize_expire_time(expires, utc=True):

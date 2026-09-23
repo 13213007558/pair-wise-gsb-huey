@@ -30,7 +30,8 @@ class SqlStorage(BaseStorage):
             # Treat database argument as a URL connection string.
             self.database = db_url_connect(database)
 
-        self.KV, self.Schedule, self.Task = self.create_models()
+        self.KV, self.Schedule, self.Task, self.SchedulerState = \
+            self.create_models()
         self.create_tables()
 
         # Check for FOR UPDATE SKIP LOCKED support.
@@ -76,15 +77,24 @@ class SqlStorage(BaseStorage):
 
         Task.add_index(Task.priority.desc(), Task.id)
 
-        return (KV, Schedule, Task)
+        class SchedulerState(Base):
+            queue = CharField()
+            key = CharField()
+            value = BytesBlobField()
+            class Meta:
+                primary_key = CompositeKey('queue', 'key')
+
+        return (KV, Schedule, Task, SchedulerState)
 
     def create_tables(self):
         with self.database:
-            self.database.create_tables([self.KV, self.Schedule, self.Task])
+            self.database.create_tables([self.KV, self.Schedule, self.Task,
+                                         self.SchedulerState])
 
     def drop_tables(self):
         with self.database:
-            self.database.drop_tables([self.KV, self.Schedule, self.Task])
+            self.database.drop_tables([self.KV, self.Schedule, self.Task,
+                                       self.SchedulerState])
 
     def close(self):
         return self.database.close()
@@ -239,6 +249,41 @@ class SqlStorage(BaseStorage):
 
     def flush_results(self):
         self.KV.delete().where(self.KV.queue == self.name).execute()
+
+    def scheduler_state(self, *columns):
+        return (self.SchedulerState.select(*columns)
+                .where(self.SchedulerState.queue == self.name))
+
+    def get_scheduler_state(self, key):
+        self.check_conn()
+        try:
+            state = (self.scheduler_state(self.SchedulerState.value)
+                     .where(self.SchedulerState.key == key).get())
+        except self.SchedulerState.DoesNotExist:
+            return EmptyData
+        else:
+            return state.value
+
+    def set_scheduler_state(self, key, data, expected):
+        self.check_conn()
+        State = self.SchedulerState
+        if expected is EmptyData:
+            try:
+                with self.database.atomic():
+                    State.insert(queue=self.name, key=key,
+                                 value=data).execute()
+            except IntegrityError:
+                return False
+            return True
+        # Atomic compare-and-swap: the update only succeeds when the
+        # currently-stored value matches the expected value.
+        n = (State
+             .update(value=data)
+             .where((State.queue == self.name) &
+                    (State.key == key) &
+                    (State.value == expected))
+             .execute())
+        return n == 1
 
 
 SqlHuey = partial(Huey, storage_class=SqlStorage)

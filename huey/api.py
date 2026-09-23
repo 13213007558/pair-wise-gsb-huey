@@ -24,6 +24,12 @@ from huey.exceptions import RetryTask
 from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.registry import Registry
+from huey.schedules import CronSchedule
+from huey.schedules import IntervalSchedule
+from huey.schedules import Schedule
+from huey.schedules import dash_re
+from huey.schedules import every_re
+from huey.schedules import interval
 from huey.serializer import Serializer
 from huey.storage import BlackHoleStorage
 from huey.storage import FileStorage
@@ -37,8 +43,13 @@ from huey.utils import Error
 from huey.utils import normalize_expire_time
 from huey.utils import normalize_time
 from huey.utils import reraise_as
+from huey.utils import _UTC
+from huey.utils import format_utc
+from huey.utils import is_naive
+from huey.utils import parse_isotime
 from huey.utils import string_type
 from huey.utils import time_clock
+from huey.utils import to_utc
 from huey.utils import to_timestamp
 from huey.utils import utcnow
 
@@ -192,8 +203,15 @@ class Huey(object):
                       **kwargs):
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
+            if isinstance(validate_datetime, Schedule):
+                schedule = validate_datetime
+                validate_fn = schedule.validate_datetime
+            else:
+                schedule = None
+                validate_fn = validate_datetime
+
             def method_validate(self, timestamp):
-                return validate_datetime(timestamp)
+                return validate_fn(timestamp)
 
             return TaskWrapper(
                 self,
@@ -205,6 +223,7 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 validate_datetime=method_validate,
+                schedule=schedule,
                 task_base=PeriodicTask,
                 **kwargs)
 
@@ -620,6 +639,100 @@ class Huey(object):
         return [task for task in self._registry.periodic_tasks
                 if task.validate_datetime(timestamp)]
 
+    def _get_timestamp_utc(self, timestamp=None):
+        # Coerce a timestamp (None, naive or aware) onto the comparable
+        # UTC baseline. Naive timestamps follow the same rule used
+        # everywhere else: UTC when self.utc, otherwise local time.
+        if timestamp is None:
+            timestamp = self._get_timestamp()
+        if is_naive(timestamp):
+            return to_utc(timestamp, _UTC if self.utc else None)
+        return timestamp.astimezone(_UTC)
+
+    def _get_schedule_default_tz(self):
+        # Default timezone for periodic schedules that do not specify one
+        # explicitly. UTC when self.utc, otherwise None, which schedules
+        # interpret as the system local timezone.
+        return _UTC if self.utc else None
+
+    def _periodic_state_key(self, task):
+        task_str = self._registry.task_to_string(type(task))
+        return 'huey.periodic.%s' % task_str
+
+    def _serialize_last_run(self, dt):
+        # Serialized in a fixed UTC format so the persisted bytes are
+        # identical no matter which timezone the host runs in.
+        return format_utc(dt).encode('utf8')
+
+    def _parse_last_run(self, data, key):
+        try:
+            dt = parse_isotime(data)
+        except (TypeError, ValueError):
+            logger.warning('Unreadable scheduler state for %s: %r',
+                           key, data)
+            return None
+        if is_naive(dt):
+            # Legacy data without timezone information. Interpret it using
+            # the same rule as naive timestamps elsewhere so the existing
+            # meaning is preserved: UTC when self.utc, else local time.
+            return to_utc(dt, _UTC if self.utc else None)
+        return dt.astimezone(_UTC)
+
+    def due_periodic(self, timestamp=None):
+        """
+        Return the periodic tasks that are due to be enqueued at the given
+        timestamp, claiming each due occurrence by atomically updating the
+        persisted last-run state. At most one message is generated per
+        task, even after restarts, clock rollbacks, long downtime, or when
+        multiple scheduler processes race: only the scheduler that wins
+        the compare-and-swap on the last-run state enqueues the task.
+
+        Periodic tasks whose validate function is a plain callable
+        (rather than a huey.schedules.Schedule) fall back to the legacy
+        per-tick validation and do not persist last-run state.
+        """
+        now = self._get_timestamp_utc(timestamp)
+        default_tz = self._get_schedule_default_tz()
+        due = []
+        for task in self._registry.periodic_tasks:
+            schedule = getattr(task, 'schedule', None)
+            if schedule is None:
+                if timestamp is None:
+                    timestamp = self._get_timestamp()
+                if task.validate_datetime(timestamp):
+                    due.append(task)
+                continue
+
+            key = self._periodic_state_key(task)
+            raw = self.storage.get_scheduler_state(key)
+            last_run = None if raw is EmptyData else \
+                    self._parse_last_run(raw, key)
+
+            if last_run is None:
+                occurrence = schedule.initial_occurrence(now, default_tz)
+                # Record a baseline so a restart does not re-evaluate the
+                # initial policy, and so missed occurrences are only ever
+                # claimed going forward.
+                new_state = occurrence if occurrence is not None else now
+            else:
+                occurrence = schedule.due_occurrence(last_run, now,
+                                                     default_tz)
+                new_state = occurrence
+
+            if new_state is None:
+                continue
+
+            # Atomically claim the occurrence. The expected value is the
+            # exact byte string previously read (or EmptyData), so legacy
+            # and foreign data is only ever replaced by the scheduler
+            # that observed it.
+            if self.storage.set_scheduler_state(
+                    key, self._serialize_last_run(new_state), raw):
+                if occurrence is not None:
+                    due.append(task)
+
+        return due
+
     def ready_to_run(self, task, timestamp=None):
         if timestamp is None:
             timestamp = self._get_timestamp()
@@ -799,6 +912,8 @@ class Task(object):
 
 
 class PeriodicTask(Task):
+    schedule = None
+
     def validate_datetime(self, timestamp):
         return False
 
@@ -1093,15 +1208,15 @@ class ResultGroup(object):
                 yield r.get()
 
 
-dash_re = re.compile(r'(\d+)-(\d+)')
-every_re = re.compile(r'\*\/(\d+)')
 
 
-def crontab(minute='*', hour='*', day='*', month='*', day_of_week='*', strict=False):
+def crontab(minute='*', hour='*', day='*', month='*', day_of_week='*',
+            strict=False, tz=None, start=None, end=None):
     """
-    Convert a "crontab"-style set of parameters into a test function that will
-    return True when the given datetime matches the parameters set forth in
-    the crontab.
+    Convert a crontab-style set of parameters into a schedule that matches
+    the wall-clock times described by the crontab fields. The returned
+    schedule is callable and, when called with a datetime, returns True
+    when the datetime matches the parameters set forth in the crontab.
 
     For day-of-week, 0=Sunday and 6=Saturday.
 
@@ -1111,79 +1226,23 @@ def crontab(minute='*', hour='*', day='*', month='*', day_of_week='*', strict=Fa
     m-n = run every time m..n
     m,n = run on m and n
 
-    The strict parameter will cause crontab to raise a ValueError if an input
-    does not match a supported crontab input format. This provides backwards
-    compatibility.
+    The strict parameter will cause crontab to raise a ValueError if an
+    input does not match a supported crontab input format. This provides
+    backwards compatibility.
+
+    The tz parameter specifies the timezone whose wall-clock is matched
+    against the cron fields (a tzinfo instance or an IANA name such as
+    "Asia/Shanghai"). When not given, the Huey instance's default timezone
+    is used (UTC when the instance uses utc=True, otherwise the system
+    local timezone).
+
+    The start and end parameters bound the schedule: no occurrences are
+    generated before start or after end. Both accept naive or aware
+    datetimes; naive values are interpreted in tz (default UTC).
     """
-    validation = (
-        ('m', month, range(1, 13)),
-        ('d', day, range(1, 32)),
-        ('w', day_of_week, range(8)), # 0-6, but also 7 for Sunday.
-        ('H', hour, range(24)),
-        ('M', minute, range(60))
-    )
-    cron_settings = []
-
-    for (date_str, value, acceptable) in validation:
-        settings = set([])
-
-        if isinstance(value, int):
-            value = str(value)
-
-        for piece in value.split(','):
-            if piece == '*':
-                settings.update(acceptable)
-                continue
-
-            if piece.isdigit():
-                piece = int(piece)
-                if piece not in acceptable:
-                    raise ValueError('%d is not a valid input' % piece)
-                elif date_str == 'w':
-                    piece %= 7
-                settings.add(piece)
-                continue
-
-            dash_match = dash_re.match(piece)
-            if dash_match:
-                lhs, rhs = map(int, dash_match.groups())
-                if lhs not in acceptable or rhs not in acceptable:
-                    raise ValueError('%s is not a valid input' % piece)
-                elif date_str == 'w':
-                    lhs %= 7
-                    rhs %= 7
-                settings.update(range(lhs, rhs + 1))
-                continue
-
-            # Handle stuff like */3, */6.
-            every_match = every_re.match(piece)
-            if every_match:
-                if date_str == 'w':
-                    raise ValueError('Cannot perform this kind of matching'
-                                     ' on day-of-week.')
-                interval = int(every_match.groups()[0])
-                settings.update(acceptable[::interval])
-                continue
-
-            # Older versions of Huey would, at this point, ignore the unmatched piece.
-            if strict:
-                raise ValueError('%s is not a valid input' % piece)
-
-        cron_settings.append(sorted(list(settings)))
-
-    def validate_date(timestamp):
-        _, m, d, H, M, _, w, _, _ = timestamp.timetuple()
-
-        # fix the weekday to be sunday=0
-        w = (w + 1) % 7
-
-        for (date_piece, selection) in zip((m, d, w, H, M), cron_settings):
-            if date_piece not in selection:
-                return False
-
-        return True
-
-    return validate_date
+    return CronSchedule(minute=minute, hour=hour, day=day, month=month,
+                        day_of_week=day_of_week, strict=strict, tz=tz,
+                        start=start, end=end)
 
 
 def _unsupported(name, library):

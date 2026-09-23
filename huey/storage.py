@@ -230,6 +230,31 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def get_scheduler_state(self, key):
+        """
+        Return the persisted scheduler state (e.g. a periodic task's last
+        run timestamp) for the given key, or EmptyData if no state exists.
+
+        :param str key: state key.
+        :return: bytes or EmptyData.
+        """
+        raise NotImplementedError
+
+    def set_scheduler_state(self, key, data, expected):
+        """
+        Atomically replace the scheduler state for the given key, but only
+        when the currently-stored value equals expected. Pass EmptyData as
+        expected to require that no state currently exists. This
+        compare-and-swap operation must be atomic so that multiple
+        scheduler processes cannot enqueue duplicate periodic tasks.
+
+        :param str key: state key.
+        :param bytes data: new state value.
+        :param expected: expected current value (bytes) or EmptyData.
+        :return: boolean indicating whether the state was updated.
+        """
+        raise NotImplementedError
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -259,6 +284,8 @@ class BlackHoleStorage(BaseStorage):
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
+    def get_scheduler_state(self, key): return EmptyData
+    def set_scheduler_state(self, key, data, expected): return True
 
 
 class MemoryStorage(BaseStorage):
@@ -268,6 +295,7 @@ class MemoryStorage(BaseStorage):
         self._queue = []
         self._results = {}
         self._schedule = []
+        self._scheduler_state = {}
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -345,6 +373,20 @@ class MemoryStorage(BaseStorage):
     def flush_results(self):
         self._results = {}
 
+    def get_scheduler_state(self, key):
+        return self._scheduler_state.get(key, EmptyData)
+
+    def set_scheduler_state(self, key, data, expected):
+        with self._lock:
+            current = self._scheduler_state.get(key, EmptyData)
+            if expected is EmptyData:
+                if current is not EmptyData:
+                    return False
+            elif current is EmptyData or current != expected:
+                return False
+            self._scheduler_state[key] = data
+            return True
+
 
 # A custom lua script to pass to redis that will read tasks from the schedule
 # and atomically pop them from the sorted set and return them. It won't return
@@ -355,6 +397,20 @@ local res = redis.call('zrangebyscore', KEYS[1], '-inf', unix_ts)
 if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res then
     return res
 end"""
+
+
+# Lua script implementing an atomic compare-and-swap on a hash field, used
+# to persist scheduler state (periodic task last-run timestamps) without
+# races between multiple scheduler processes. An empty string is used as
+# the sentinel for "no value currently stored" (state values are never
+# empty).
+SCHEDULER_STATE_CAS_LUA = """\
+local cur = redis.call('hget', KEYS[1], ARGV[1])
+if (cur == false and ARGV[2] == '') or (cur and cur == ARGV[2]) then
+    redis.call('hset', KEYS[1], ARGV[1], ARGV[3])
+    return 1
+end
+return 0"""
 
 
 class RedisStorage(BaseStorage):
@@ -390,12 +446,14 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._state_cas = self.conn.register_script(SCHEDULER_STATE_CAS_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.error_key = 'huey.errors.%s' % self.name
+        self.scheduler_state_key = 'huey.scheduler.%s' % self.name
 
         if client_name is not None:
             self.conn.client_setname(client_name)
@@ -490,6 +548,15 @@ class RedisStorage(BaseStorage):
 
     def flush_results(self):
         self.conn.delete(self.result_key)
+
+    def get_scheduler_state(self, key):
+        val = self.conn.hget(self.scheduler_state_key, key)
+        return EmptyData if val is None else val
+
+    def set_scheduler_state(self, key, data, expected):
+        sentinel = '' if expected is EmptyData else expected
+        return bool(self._state_cas(keys=[self.scheduler_state_key],
+                                    args=[key, sentinel, data]))
 
 
 class RedisExpireStorage(RedisStorage):
@@ -687,7 +754,11 @@ class SqliteStorage(BaseSqlStorage):
                   'data blob not null, priority real not null default 0.0)')
     index_task = ('create index if not exists task_priority_id on task '
                   '(priority desc, id asc)')
-    ddl = [table_kv, table_sched, index_sched, table_task, index_task]
+    table_scheduler = ('create table if not exists scheduler ('
+                       'queue text not null, key text not null, '
+                       'value blob not null, primary key(queue, key))')
+    ddl = [table_kv, table_sched, index_sched, table_task, index_task,
+           table_scheduler]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=False, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -837,6 +908,29 @@ class SqliteStorage(BaseSqlStorage):
     def flush_results(self):
         self.sql('delete from kv where queue=?', (self.name,), True)
 
+    def get_scheduler_state(self, key):
+        res = self.sql('select value from scheduler where queue=? and key=?',
+                       (self.name, key), results=True)
+        return to_bytes(res[0][0]) if res else EmptyData
+
+    def set_scheduler_state(self, key, data, expected):
+        if expected is EmptyData:
+            try:
+                with self.db(commit=True) as curs:
+                    curs.execute('insert or abort into scheduler '
+                                 '(queue, key, value) values (?, ?, ?)',
+                                 (self.name, key, to_blob(data)))
+            except sqlite3.IntegrityError:
+                return False
+            return True
+        with self.db(commit=True) as curs:
+            # Atomic compare-and-swap: the update only succeeds when the
+            # currently-stored value matches the expected value.
+            curs.execute('update scheduler set value=? where queue=? and '
+                         'key=? and value=?',
+                         (to_blob(data), self.name, key, to_blob(expected)))
+            return curs.rowcount == 1
+
 
 class FileStorage(BaseStorage):
     """
@@ -861,6 +955,7 @@ class FileStorage(BaseStorage):
         self.queue_path = os.path.join(self.path, 'queue')
         self.schedule_path = os.path.join(self.path, 'schedule')
         self.result_path = os.path.join(self.path, 'results')
+        self.scheduler_path = os.path.join(self.path, 'scheduler')
         self.levels = levels
 
         if use_thread_lock:
@@ -1063,3 +1158,40 @@ class FileStorage(BaseStorage):
 
     def flush_results(self):
         self._flush_dir(self.result_path)
+
+    def path_for_scheduler_key(self, key):
+        if isinstance(key, text_type):
+            key = key.encode('utf8')
+        checksum = hashlib.md5(key).hexdigest()
+        prefix = checksum[:self.levels]
+        prefix_filename = itertools.chain(prefix, (checksum,))
+        return os.path.join(self.scheduler_path, *prefix_filename)
+
+    def get_scheduler_state(self, key):
+        filename = self.path_for_scheduler_key(key)
+        if not os.path.exists(filename):
+            return EmptyData
+        with open(filename, 'rb') as fh:
+            return fh.read()
+
+    def set_scheduler_state(self, key, data, expected):
+        filename = self.path_for_scheduler_key(key)
+        with self.lock:
+            if os.path.exists(filename):
+                with open(filename, 'rb') as fh:
+                    current = fh.read()
+            else:
+                current = EmptyData
+
+            if expected is EmptyData:
+                if current is not EmptyData:
+                    return False
+            elif current is EmptyData or current != expected:
+                return False
+
+            dirname = os.path.dirname(filename)
+            if not os.path.exists(dirname):
+                os.makedirs(dirname)
+            with open(filename, 'wb') as fh:
+                fh.write(data)
+            return True

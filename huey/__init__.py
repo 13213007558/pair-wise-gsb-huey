@@ -12,5 +12,6 @@ from huey.api import RedisExpireHuey
 from huey.api import RedisHuey
 from huey.api import SqliteHuey
 from huey.api import crontab
+from huey.api import interval
 from huey.exceptions import CancelExecution
 from huey.exceptions import RetryTask

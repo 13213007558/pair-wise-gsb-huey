@@ -177,7 +177,7 @@ class Scheduler(BaseProcess):
 
     def enqueue_periodic_tasks(self, now):
         self._logger.debug('Checking periodic tasks')
-        for task in self.huey.read_periodic(now):
+        for task in self.huey.due_periodic(now):
             self._logger.info('Enqueueing periodic task %s.', task)
             self.huey.enqueue(task)
 
