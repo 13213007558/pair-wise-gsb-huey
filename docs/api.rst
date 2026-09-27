@@ -973,17 +973,27 @@ Huey object
             # Flush discovered locks AND the context-manager lock:
             huey.flush_locks('db-backup')  # Clears both.
 
-    .. py:method:: rate_limit(name, limit, per, retry=True)
+    .. py:method:: rate_limit(name=None, limit=None, per=None, retry=True, key=None)
 
-        :param str name: Name to use for the rate-limiter.
+        :param str name: Name to use for the rate-limiter. When used as a task
+            decorator without an explicit name, the task class is used.
         :param int limit: Maximum invocations in the given window.
         :param int per: Size of rate-limiting window in seconds.
         :param bool retry: Automatically reschedule rate-limited tasks to run
             at beginning of next rate-limit window.
+        :param key: Static key value or callable receiving the task arguments
+            and returning a stable caller/resource key.
         :returns: :py:class:`RateLimit` instance, which can be used as a
             decorator or context-manager.
 
         Simple fixed-window rate-limiting for tasks.
+
+        When no explicit ``key`` is supplied, the limit is scoped to the task
+        class. A callable ``key`` makes it possible to scope the limit using
+        stable user-provided parameters, for example ``key=lambda account_id:
+        account_id``. Dynamic key values are serialized deterministically and
+        hashed before being sent to storage; unused high-cardinality keys are
+        removed when their fixed window expires.
 
         When a task fails due to being rate-limited, it will be automatically
         rescheduled to run at the start of the next window when ``retry=True`` or
@@ -1591,7 +1601,7 @@ Huey object
 
         :returns: boolean whether lock is currently being held.
 
-.. py:class:: RateLimit(huey, name, limit, per, retry=True)
+.. py:class:: RateLimit(huey, name=None, limit=None, per=None, retry=True, key=None)
 
     This class should not be instantiated directly, but is instead returned by
     :py:meth:`Huey.rate_limit`. This object implements a context-manager or
@@ -1620,6 +1630,7 @@ Huey object
     :param int per: Size of rate-limiting window in seconds.
     :param bool retry: Automatically reschedule rate-limited tasks to run
         at beginning of next rate-limit window.
+    :param key: Static key value or callable receiving task arguments.
     :returns: :py:class:`RateLimit` instance, which can be used as a
         decorator or context-manager.
 
@@ -2474,7 +2485,9 @@ Huey comes with several built-in storage implementations:
 .. py:class:: MemoryStorage()
 
     In-memory storage engine for use when testing or developing. Designed for
-    use with :ref:`immediate mode <immediate>`.
+    use with :ref:`immediate mode <immediate>`. Its locks and rate-limit
+    counters are process-local, so it does not provide cross-process
+    coordination for multiple independently-started consumers.
 
 
 .. py:class:: BlackHoleStorage()
@@ -2485,4 +2498,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

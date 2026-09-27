@@ -1044,6 +1044,18 @@ Equivalent example using a context-manager instead of a decorator:
         with huey.rate_limit('data-sync', limit=10, per=60, retry=False):
             service.apply_updates(data)
 
+To limit each caller independently, derive the key from stable task
+parameters. With the following decorator all calls from one account share a
+counter, while different accounts have independent windows:
+
+.. code-block:: python
+
+    @huey.task()
+    @huey.rate_limit('per-account', limit=10, per=60,
+                     key=lambda account_id, action: account_id)
+    def update_account(account_id, action):
+        service.apply(account_id, action)
+
 See :py:meth:`Huey.rate_limit` for API documentation.
 
 Task pipelines

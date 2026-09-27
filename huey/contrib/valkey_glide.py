@@ -11,6 +11,8 @@ from huey.api import RedisHuey
 from huey.constants import EmptyData
 from huey.exceptions import ConfigurationError
 from huey.storage import RedisStorage
+from huey.storage import RATE_LIMIT_LUA
+from huey.storage import RATE_LIMIT_FLUSH_LUA
 from huey.storage import SCHEDULE_POP_LUA
 
 
@@ -35,12 +37,15 @@ class ValkeyGlideStorage(RedisStorage):
             self.conn = GlideClient.create(config)
 
         self._pop = Script(SCHEDULE_POP_LUA)
+        self._rate_limit = Script(RATE_LIMIT_LUA)
+        self._flush_rate_limits = Script(RATE_LIMIT_FLUSH_LUA)
 
         self.name = self.clean_name(name)
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.counter_key = 'huey.counters.%s' % self.name
+        self.rate_limit_prefix = b'huey.rl.%s.' % self.name.encode('utf8')
         # Result notification uses a blocking BLPOP, which glide does not
         # support well -- fall back to polling for results.
         self.notify_prefix = 'huey.notify.%s.' % self.name
@@ -122,6 +127,43 @@ class ValkeyGlideStorage(RedisStorage):
 
     def delete_counter(self, key):
         self.conn.hdel(self.counter_key, [key])
+
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        if expires_at is None or ttl is None:
+            raise ValueError('expires_at and ttl are required')
+        result = self.conn.invoke_script(
+            self._rate_limit,
+            keys=[self.rate_limit_key(key)],
+            args=[str(window), str(limit), str(ttl)])
+        return bool(int(result[0])), int(result[1])
+
+    def reset_rate_limit(self, key):
+        return self.conn.delete([self.rate_limit_key(key)]) != 0
+
+    def peek_rate_limit(self, key, window=None):
+        state = self.conn.get(self.rate_limit_key(key))
+        if state is None:
+            return 0
+        stored_window, count = state.split(b':', 1)
+        if window is not None and int(stored_window) != window:
+            return 0
+        return int(count)
+
+    def rate_limit_size(self):
+        keys = []
+        cursor = b'0'
+        while True:
+            cursor, batch = self.conn.scan(
+                cursor=cursor, match=self.rate_limit_prefix + b'*', count=500)
+            keys.extend(batch)
+            if cursor in (b'0', 0, '0'):
+                break
+        return len(keys)
+
+    def flush_rate_limits(self):
+        pattern = self.rate_limit_prefix + b'*'
+        return int(self.conn.invoke_script(self._flush_rate_limits,
+                                           keys=[], args=[pattern]))
 
     def flush_counters(self):
         self.conn.delete([self.counter_key])

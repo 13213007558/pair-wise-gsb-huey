@@ -1,6 +1,7 @@
 import asyncio
 import datetime
 import inspect
+import threading
 import time
 
 from huey.api import ChordResult
@@ -2667,6 +2668,17 @@ class TestTaskLocking(BaseTestCase):
 
 
 class TestRateLimit(BaseTestCase):
+    def execute_at(self, task=None, timestamp=None):
+        if task is None:
+            task = self.huey.dequeue()
+            self.assertTrue(task is not None)
+        return self.huey.execute(task, timestamp=timestamp)
+
+    def scheduled_eta(self):
+        scheduled = self.huey.scheduled()
+        self.assertEqual(len(scheduled), 1)
+        return scheduled[0].eta
+
     def test_rate_limit(self):
         rl = self.huey.rate_limit('test', limit=3, per=60)
         for _ in range(3):
@@ -2810,6 +2822,150 @@ class TestRateLimit(BaseTestCase):
         self.assertEqual(task.retries, 1)  # Task retries decremented.
         self.assertEqual(task.retry_delay, 10)  # Task retains retry delay.
         self.huey.storage.flush_schedule()
+
+    def test_window_boundary_retry_eta_virtual_time(self):
+        @self.huey.task()
+        @self.huey.rate_limit('bounded', limit=1, per=10)
+        def bounded(n):
+            return n
+
+        bounded(1)
+        bounded(2)
+        base = datetime.datetime(2026, 1, 1, 12, 0, 3)
+        self.assertEqual(self.execute_at(timestamp=base), 1)
+        self.assertTrue(self.execute_at(timestamp=base) is None)
+
+        eta = self.scheduled_eta()
+        self.assertEqual(eta, datetime.datetime(2026, 1, 1, 12, 0, 10))
+        before_eta = eta - datetime.timedelta(seconds=1)
+        self.assertEqual(self.huey.read_schedule(before_eta), [])
+        [scheduled] = self.huey.read_schedule(eta)
+        self.assertEqual(scheduled.eta, eta)
+        self.assertEqual(self.execute_at(scheduled, eta), 2)
+
+    def test_key_from_caller_parameter(self):
+        @self.huey.task()
+        @self.huey.rate_limit('by-caller', limit=1, per=10,
+                              key=lambda caller, action=None: caller)
+        def action(caller, action=None):
+            return caller, action
+
+        action('a', 'x')
+        action('a', 'y')
+        action('b', 'x')
+        base = datetime.datetime(2026, 1, 1)
+        self.assertEqual(self.execute_at(timestamp=base), ('a', 'x'))
+        self.assertTrue(self.execute_at(timestamp=base) is None)
+        self.assertEqual(self.execute_at(timestamp=base), ('b', 'x'))
+        self.assertEqual(self.huey.scheduled_count(), 1)
+
+        task = self.huey.scheduled()[0]
+        next_base = datetime.datetime(2026, 1, 1, 0, 0, 10)
+        self.assertEqual(self.execute_at(task, next_base), ('a', 'y'))
+
+    def test_concurrent_consumers_no_overissue(self):
+        @self.huey.task()
+        @self.huey.rate_limit('concurrent-task', limit=5, per=10)
+        def limited(n):
+            return n
+
+        tasks = [limited.s(n) for n in range(20)]
+        for task in tasks:
+            self.huey.enqueue(task)
+
+        completed, errors = [], []
+        start = threading.Barrier(8)
+        base = datetime.datetime(2026, 1, 1)
+
+        def consume():
+            start.wait()
+            while True:
+                task = self.huey.dequeue()
+                if task is None:
+                    return
+                value = self.huey.execute(task, timestamp=base)
+                (completed if value is not None else errors).append(value)
+
+        threads = [threading.Thread(target=consume) for _ in range(8)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(10)
+
+        self.assertEqual(len(completed), 5)
+        self.assertEqual(len(errors), 15)
+        self.assertEqual(self.huey.scheduled_count(), 15)
+        self.assertEqual(
+            len(self.huey.storage._rate_limits), 1)
+
+    def test_failure_retry_consumes_next_window_permit(self):
+        started = threading.Event()
+        release = threading.Event()
+        outcomes = []
+
+        @self.huey.task(retries=3, retry_delay=10)
+        @self.huey.rate_limit('failing', limit=1, per=10)
+        def failing():
+            started.set()
+            release.wait(1)
+            outcomes.append('started')
+            raise RuntimeError('boom')
+
+        tasks = [failing.s(), failing.s()]
+        for task in tasks:
+            self.huey.enqueue(task)
+        first = datetime.datetime(2026, 1, 1)
+
+        def run(task):
+            self.huey.execute(task, timestamp=first)
+
+        threads = [threading.Thread(target=run, args=(task,))
+                   for task in tasks]
+        for thread in threads: thread.start()
+        self.assertTrue(started.wait(1))
+        release.set()
+        for thread in threads: thread.join(10)
+
+        self.assertEqual(outcomes, ['started'])
+        self.assertEqual(self.huey.scheduled_count(), 2)
+        etas = sorted(task.eta for task in self.huey.scheduled())
+        self.assertEqual(etas, [first + datetime.timedelta(seconds=10),
+                                first + datetime.timedelta(seconds=10)])
+
+    def test_retry_eta_is_monotonic(self):
+        @self.huey.task()
+        @self.huey.rate_limit('monotonic', limit=1, per=10)
+        def limited():
+            return True
+
+        limited()
+        base = datetime.datetime(2026, 1, 1)
+        self.assertTrue(self.execute_at(timestamp=base) is True)
+        limited()
+        victim = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(victim, timestamp=base) is None)
+        first_eta = self.scheduled_eta()
+        previous_eta = first_eta
+
+        for _ in range(2):
+            [victim] = self.huey.read_schedule(previous_eta)
+            self.huey.storage.flush_schedule()
+            blocker = limited.s()
+            self.huey.enqueue(blocker)
+            self.assertEqual(
+                self.execute_at(timestamp=previous_eta), True)
+            self.assertTrue(self.huey.execute(victim,
+                                               timestamp=previous_eta) is None)
+            eta = self.scheduled_eta()
+            self.assertGreaterEqual(eta, previous_eta)
+            previous_eta = eta
+
+    def test_high_cardinality_ttl_cleanup(self):
+        rl = self.huey.rate_limit(limit=1, per=10)
+        for caller in range(100):
+            rl.acquire(key=caller, now=0)
+        self.assertEqual(self.huey.storage.rate_limit_size(), 100)
+
+        rl.acquire(key='trigger', now=20)
+        self.assertEqual(self.huey.storage.rate_limit_size(), 1)
 
 
 class TestHueyAPIs(BaseTestCase):

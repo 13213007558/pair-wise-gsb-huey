@@ -31,9 +31,11 @@ class SqlStorage(BaseStorage):
             # Treat database argument as a URL connection string.
             self.database = db_url_connect(database)
 
-        self.KV, self.Schedule, self.Task, self.Counter = self.create_models()
+        (self.KV, self.Schedule, self.Task, self.Counter,
+         self.RateLimit) = self.create_models()
         if create_tables:
             self.create_tables()
+        self.migrate_schema()
 
         # Check for FOR UPDATE SKIP LOCKED support.
         if isinstance(self.database, PostgresqlDatabase):
@@ -85,12 +87,29 @@ class SqlStorage(BaseStorage):
             class Meta:
                 primary_key = CompositeKey('queue', 'key')
 
-        return (KV, Schedule, Task, Counter)
+        class RateLimit(Base):
+            queue = CharField()
+            key = CharField()
+            window = BigIntegerField()
+            value = IntegerField()
+            expires = BigIntegerField()
+            granted = BooleanField(default=False)
+            class Meta:
+                primary_key = CompositeKey('queue', 'key')
+
+        return (KV, Schedule, Task, Counter, RateLimit)
 
     def create_tables(self):
         with self.database:
             self.database.create_tables([self.KV, self.Schedule, self.Task,
-                                         self.Counter])
+                                         self.Counter, self.RateLimit])
+
+    def migrate_schema(self):
+        columns = self.database.get_columns(self.RateLimit._meta.table_name)
+        if columns and 'granted' not in {column.name for column in columns}:
+            self.database.execute_sql(
+                'alter table %s add column granted boolean not null default '
+                '0' % self.RateLimit._meta.table_name)
 
     def initialize_schema(self):
         # Shared entrypoint for the create_huey_tables management command.
@@ -99,7 +118,7 @@ class SqlStorage(BaseStorage):
     def drop_tables(self):
         with self.database:
             self.database.drop_tables([self.KV, self.Schedule, self.Task,
-                                       self.Counter])
+                                       self.Counter, self.RateLimit])
 
     def close(self):
         return self.database.close()
@@ -293,6 +312,75 @@ class SqlStorage(BaseStorage):
             self.Counter.delete().where(
                 (self.Counter.queue == self.name) &
                 (self.Counter.key == key)).execute()
+
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        if expires_at is None:
+            raise ValueError('expires_at is required')
+        self.check_conn()
+        expires = int(expires_at)
+        with self.database.atomic():
+            expired = (self.RateLimit
+                        .select(self.RateLimit.queue, self.RateLimit.key)
+                        .where((self.RateLimit.queue == self.name) &
+                               (self.RateLimit.expires <=
+                                int(expires_at - ttl)))
+                        .limit(500)
+                        .tuples())
+            for expired_queue, expired_key in expired:
+                self.RateLimit.delete().where(
+                    (self.RateLimit.queue == expired_queue) &
+                    (self.RateLimit.key == expired_key)).execute()
+
+            self.RateLimit.insert(
+                queue=self.name, key=key, window=window, value=1,
+                expires=expires, granted=True).on_conflict(
+                    conflict_target=(self.RateLimit.queue,
+                                     self.RateLimit.key),
+                    update={self.RateLimit.window: window,
+                            self.RateLimit.expires: expires,
+                            self.RateLimit.value: Case(None, (
+                                ((self.RateLimit.window == window) &
+                                 (self.RateLimit.value < limit),
+                                 self.RateLimit.value + 1),
+                                (self.RateLimit.window == window,
+                                 self.RateLimit.value)), 1),
+                            self.RateLimit.granted:
+                            (self.RateLimit.window == window) &
+                            (self.RateLimit.value < limit)}).execute()
+            record = (self.RateLimit
+                      .select(self.RateLimit.value, self.RateLimit.granted)
+                      .where((self.RateLimit.queue == self.name) &
+                             (self.RateLimit.key == key))
+                      .get())
+        return bool(record.granted), record.value
+
+    def reset_rate_limit(self, key):
+        self.check_conn()
+        return bool(self.RateLimit.delete().where(
+            (self.RateLimit.queue == self.name) &
+            (self.RateLimit.key == key)).execute())
+
+    def peek_rate_limit(self, key, window=None):
+        self.check_conn()
+        query = self.RateLimit.select(self.RateLimit.value).where(
+            (self.RateLimit.queue == self.name) &
+            (self.RateLimit.key == key))
+        if window is not None:
+            query = query.where(self.RateLimit.window == window)
+        try:
+            return query.get().value
+        except self.RateLimit.DoesNotExist:
+            return 0
+
+    def rate_limit_size(self):
+        self.check_conn()
+        return self.RateLimit.select().where(
+            self.RateLimit.queue == self.name).count()
+
+    def flush_rate_limits(self):
+        self.check_conn()
+        self.RateLimit.delete().where(
+            self.RateLimit.queue == self.name).execute()
 
     def result_store_size(self):
         return self.kv().count()

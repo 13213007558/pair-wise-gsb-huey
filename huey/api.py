@@ -1,8 +1,12 @@
+import calendar
 import copy
 import datetime
+import hashlib
 import inspect
 import itertools
+import json
 import logging
+import math
 import re
 import time
 import traceback
@@ -461,6 +465,7 @@ class Huey(object):
         try:
             self._tasks_in_flight.add(task)
             try:
+                self._acquire_rate_limits(task, timestamp)
                 with self._timeout_context(task):
                     task_value = task.execute()
             finally:
@@ -474,11 +479,14 @@ class Huey(object):
             exception = exc
             self._emit(S.SIGNAL_TIMEOUT, task)
         except RateLimitExceeded as exc:
-            delay = task.retry_delay or exc.delay
+            delay = exc.delay if exc.retry else (task.retry_delay or exc.delay)
             if exc.retry or task.retries:
                 logger.info('Task %s rate-limited on "%s", retrying in %s',
                             task.id, exc.key, delay)
-                retry_eta = normalize_time(None, delay, self.utc)
+                if task.eta is not None and task.eta > timestamp:
+                    retry_eta = task.eta
+                else:
+                    retry_eta = timestamp + datetime.timedelta(seconds=delay)
                 if exc.retry:
                     task.retries += 1
             else:
@@ -566,7 +574,9 @@ class Huey(object):
 
         if exception is not None and task.retries:
             self._emit(S.SIGNAL_RETRYING, task)
-            self._requeue_task(task, self._get_timestamp(), retry_eta)
+            use_timestamp = getattr(task, 'rate_limit', None) is not None
+            self._requeue_task(task, timestamp, retry_eta,
+                               use_execution_timestamp=use_timestamp)
 
         return task_value
 
@@ -599,22 +609,27 @@ class Huey(object):
             callback.extend_data((results,))
             self.enqueue(callback)
 
-    def _requeue_task(self, task, timestamp, retry_eta=None):
+    def _requeue_task(self, task, timestamp, retry_eta=None,
+                      use_execution_timestamp=False):
         task.retries -= 1
         logger.info('Requeueing %s, %s retries', task.id, task.retries)
         if retry_eta is not None:
             task.eta = retry_eta
-            self.add_schedule(task)
         elif task.retry_delay:
-            delay = datetime.timedelta(seconds=task.retry_delay)
-            task.eta = timestamp + delay
+            schedule_time = (timestamp if use_execution_timestamp
+                            else self._get_timestamp())
+        else:
+            self.enqueue(task)
+            return
+
+        if retry_eta is None:
+            task.eta = schedule_time + datetime.timedelta(
+                seconds=task.retry_delay)
             if task.retry_backoff:
                 # Grow the delay for the next attempt. The task is serialized
                 # with the updated value, so it persists across retries.
                 task.retry_delay *= task.retry_backoff
-            self.add_schedule(task)
-        else:
-            self.enqueue(task)
+        self.add_schedule(task)
 
     def _run_pre_execute(self, task):
         for name, callback in self._pre_execute.items():
@@ -818,8 +833,28 @@ class Huey(object):
 
         return flushed
 
-    def rate_limit(self, name, limit, per, retry=True):
-        return RateLimit(self, name, limit, per, retry=retry)
+    def rate_limit(self, name=None, limit=None, per=None, retry=True,
+                   key=None):
+        return RateLimit(self, name, limit, per, retry=retry, key=key)
+
+    def _timestamp_to_epoch(self, timestamp):
+        if timestamp is None:
+            return time.time()
+        if self.utc:
+            return calendar.timegm(timestamp.utctimetuple())
+        return time.mktime(timestamp.timetuple())
+
+    def _acquire_rate_limits(self, task, timestamp):
+        rate_limit = getattr(task, 'rate_limit', None)
+        if rate_limit is None:
+            return
+        if isinstance(rate_limit, (list, tuple)):
+            for item in rate_limit:
+                item.acquire(task, task.args, task.kwargs,
+                             now=self._timestamp_to_epoch(timestamp))
+        else:
+            rate_limit.acquire(task, task.args, task.kwargs,
+                               now=self._timestamp_to_epoch(timestamp))
 
     def _result_handle(self, task):
         return Result(self, task)
@@ -1012,7 +1047,19 @@ class TaskWrapper(object):
         if inspect.iscoroutinefunction(func):
             raise ConfigurationError(
                 'huey does not support async functions. Wrap the coroutine '
-                'with asyncio.run() in a regular function.')
+                                 'with asyncio.run() in a regular function.')
+
+        if 'rate_limit' not in settings:
+            rate_limits = []
+            while hasattr(func, '__huey_wrapped_func__'):
+                rate_limit = getattr(func, '__huey_rate_limit__', None)
+                if rate_limit is not None:
+                    rate_limits.append(rate_limit)
+                func = func.__huey_wrapped_func__
+            if rate_limits:
+                settings['rate_limit'] = rate_limits[0]
+
+        original_func = func
 
         def execute(self):
             args, kwargs = self.data
@@ -1021,7 +1068,7 @@ class TaskWrapper(object):
                 # original data is not polluted (e.g. when the task is
                 # re-serialized for retry).
                 kwargs = dict(kwargs, task=self)
-            return func(*args, **kwargs)
+            return original_func(*args, **kwargs)
 
         attrs = {
             'context': context,
@@ -1150,53 +1197,108 @@ class TaskLock(object):
 
 class RateLimit(object):
     """
-    Utilize the Storage API counter to implement fixed window rate-limit.
+    Fixed-window rate-limit backed by an atomic storage operation.
     """
-    def __init__(self, huey, name, limit, per, retry=True):
+    def __init__(self, huey, name=None, limit=None, per=None, retry=True,
+                 key=None):
+        if limit is None or per is None or limit < 1 or per <= 0:
+            raise ConfigurationError('limit must be positive and per must be '
+                                     'greater than zero')
         self._huey = huey
         self._name = name
         self._limit = limit
         self._per = per
         self._retry = retry
-        self._counter_key = '%s.rl.%s' % (self._huey.name, self._name)
-        self._window_key = '%s.rl.%s.w' % (self._huey.name, self._name)
+        self._key = key
+        self._task_name = None
+
+    def __set_name__(self, owner, name):
+        self._task_name = owner.__name__
+
+    def __get__(self, instance, owner=None):
+        return self
 
     def _current_window(self, now):
-        return int(now) // self._per
+        return math.floor(now / self._per)
 
     def _time_until_reset(self, now):
         window_end = (self._current_window(now) + 1) * self._per
-        return window_end - now
+        return max(window_end - now, 0.0)
 
-    def reset(self):
-        self._huey.delete(self._window_key)
-        self._huey.storage.delete_counter(self._counter_key)
+    def _stable_key_part(self, value):
+        try:
+            return json.dumps(value, sort_keys=True, separators=(',', ':'),
+                              default=repr, ensure_ascii=False)
+        except TypeError:
+            return repr(value)
 
-    def acquire(self):
-        now = time.time()
+    def _base_name(self):
+        return self._name or self._task_name or 'rate-limit'
+
+    def _dynamic_value(self, task=None, args=(), kwargs=None,
+                       override=_sentinel):
+        if override is not _sentinel:
+            return override
+        if self._key is None:
+            return None
+        if self._key is Task:
+            return task
+        if callable(self._key):
+            return self._key(*args, **(kwargs or {}))
+        return self._key
+
+    def _key_parts(self, now, task=None, args=(), kwargs=None,
+                   override=_sentinel):
         window = self._current_window(now)
+        name = self._base_name()
+        value = self._dynamic_value(task, args, kwargs, override)
+        logical_key = name if value is None else '%s:%s' % (
+            name, self._stable_key_part(value))
+        raw_key = '%s:%s:%s' % (self._huey.name, logical_key, window)
+        digest = hashlib.sha256(raw_key.encode('utf-8')).hexdigest()
+        return logical_key, window, digest
 
-        stored = self._huey.get(self._window_key, peek=True)
-        if stored != window:
-            # Window rollover, reset counter and store the new window. If two
-            # workers concurrently hit this, both delete the counter and put
-            # the same window value.
-            self._huey.storage.delete_counter(self._counter_key)
-            self._huey.put(self._window_key, window)
+    def acquire(self, task=None, args=(), kwargs=None, now=None,
+                key=_sentinel):
+        if now is None:
+            now = time.time()
+        logical_key, window, storage_key = self._key_parts(
+            now, task, args, kwargs, key)
+        expires_at = float((window + 1) * self._per)
+        ttl = max(expires_at - now, 1e-9)
+        allowed, count = self._huey.storage.acquire_rate_limit(
+            storage_key, window, self._limit, expires_at=expires_at,
+            ttl=ttl)
+        if not allowed:
+            raise RateLimitExceeded(logical_key, self._time_until_reset(now),
+                                     retry=self._retry)
 
-        count = self._huey.storage.incr(self._counter_key)
-        if count > self._limit:
-            ttr = self._time_until_reset(now)
-            raise RateLimitExceeded(self._name, ttr, retry=self._retry)
+    def reset(self, task=None, args=(), kwargs=None, now=None,
+              key=_sentinel):
+        if now is None:
+            now = time.time()
+        storage_key = self._key_parts(now, task, args, kwargs, key)[2]
+        return self._huey.storage.reset_rate_limit(storage_key)
 
-    def current_usage(self):
-        return self._huey.storage.incr(self._counter_key, 0)
+    def current_usage(self, task=None, args=(), kwargs=None, now=None,
+                      key=_sentinel):
+        if now is None:
+            now = time.time()
+        _, window, storage_key = self._key_parts(
+            now, task, args, kwargs, key)
+        return self._huey.storage.peek_rate_limit(storage_key, window)
 
     def __call__(self, fn):
         @wraps(fn)
         def inner(*args, **kwargs):
-            with self:
-                return fn(*args, **kwargs)
+            task = args[0] if args and isinstance(args[0], Task) else None
+            if task is not None:
+                self.acquire(task)
+                return fn(*args[1:], **kwargs)
+            self.acquire(args=args, kwargs=kwargs)
+            return fn(*args, **kwargs)
+        inner.__huey_rate_limit__ = self
+        inner.__huey_wrapped_func__ = fn
         return inner
 
     def __enter__(self):

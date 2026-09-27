@@ -58,6 +58,7 @@ requires_redis = unittest.skipIf(REDIS_VERSION == 0, 'requires redis server')
 class StorageTests(object):
     destructive_reads = True
     supports_ttl = True
+    supports_rate_limit_logical_ttl = True
 
     def setUp(self):
         super(StorageTests, self).setUp()
@@ -234,6 +235,49 @@ class StorageTests(object):
         self.assertEqual(self.s.pop_data('k1'), b'test')
         self.assertEqual(self.s.incr('k1'), 4)
 
+    def test_rate_limit_fixed_window(self):
+        allowed = [self.s.acquire_rate_limit(b'rl-10', 1, 2, 10, 10)
+                   for _ in range(3)]
+        self.assertEqual(allowed, [(True, 1), (True, 2), (False, 2)])
+        self.assertEqual(self.s.peek_rate_limit(b'rl-10', 1), 2)
+        self.assertEqual(self.s.peek_rate_limit(b'rl-10', 2), 0)
+
+        allowed = [self.s.acquire_rate_limit(b'rl-20', 2, 2, 20, 10)
+                   for _ in range(2)]
+        self.assertEqual(allowed, [(True, 1), (True, 2)])
+
+        self.assertGreaterEqual(self.s.rate_limit_size(), 1)
+        self.s.reset_rate_limit(b'rl-10')
+        self.assertEqual(self.s.peek_rate_limit(b'rl-10', 1), 0)
+        self.s.flush_rate_limits()
+        self.assertEqual(self.s.rate_limit_size(), 0)
+
+    def test_rate_limit_concurrent(self):
+        nthreads, limit, results = 16, 5, []
+        barrier = threading.Barrier(nthreads)
+
+        def acquire():
+            barrier.wait()
+            results.append(self.s.acquire_rate_limit(
+                b'rl-concurrent', 1, limit, 10, 10)[0])
+
+        threads = [threading.Thread(target=acquire) for _ in range(nthreads)]
+        for thread in threads: thread.start()
+        for thread in threads: thread.join(10)
+
+        self.assertEqual(sum(results), limit)
+        self.assertEqual(self.s.peek_rate_limit(b'rl-concurrent', 1), limit)
+
+    def test_rate_limit_logical_ttl_cleanup(self):
+        if not self.supports_rate_limit_logical_ttl:
+            raise unittest.SkipTest('logical TTL cleanup is not supported')
+        self.s.acquire_rate_limit(b'rl-old', 1, 1, expires_at=10, ttl=10)
+        self.s.acquire_rate_limit(b'rl-new', 3, 1, expires_at=30, ttl=10)
+        self.assertEqual(self.s.rate_limit_size(), 1)
+        self.s.acquire_rate_limit(b'rl-trigger', 3, 1, expires_at=20, ttl=10)
+        self.assertEqual(self.s.rate_limit_size(), 2)
+        self.assertEqual(self.s.peek_rate_limit(b'rl-old', 1), 0)
+
     @slow_test()
     def test_consumer_integration(self):
         @self.huey.task()
@@ -289,6 +333,8 @@ class TestMemoryStorage(StorageTests, BaseTestCase):
 
 @requires_redis
 class TestRedisStorage(StorageTests, BaseTestCase):
+    supports_rate_limit_logical_ttl = False
+
     def get_huey(self):
         return RedisHuey(utc=False)
 
@@ -527,6 +573,7 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
 
     def tearDown(self):
         super(TestSqliteStorage, self).tearDown()
+        self.s.close()
         if os.path.exists('huey_storage.db'):
             os.unlink('huey_storage.db')
 
@@ -543,6 +590,44 @@ class TestSqliteStorage(StorageTests, BaseTestCase):
             huey.storage.close()
             if os.path.exists('huey_ct.db'):
                 os.unlink('huey_ct.db')
+
+    def test_rate_limit_survives_worker_restart(self):
+        self.assertEqual(self.s.acquire_rate_limit(
+            b'persistent', 1, 1, 10, 10), (True, 1))
+        self.s.close()
+
+        restarted = SqliteHuey(filename='huey_storage.db', timeout=3).storage
+        try:
+            self.assertEqual(restarted.acquire_rate_limit(
+                b'persistent', 1, 1, 10, 10), (False, 1))
+            self.assertEqual(restarted.acquire_rate_limit(
+                b'persistent', 2, 1, 20, 10), (True, 1))
+        finally:
+            restarted.close()
+
+    def test_rate_limit_schema_migration(self):
+        self.s.close()
+        filename = 'huey_storage.db'
+        conn = sqlite3.connect(filename)
+        try:
+            conn.execute('drop table rate_limit')
+            conn.execute('create table rate_limit (queue text, key text, '
+                         'window integer, value integer, expires real, '
+                         'primary key(queue, key))')
+            conn.execute('insert into rate_limit values (?, ?, ?, ?, ?)',
+                         (self.s.name, 'old', 1, 1, 10.0))
+            conn.commit()
+        finally:
+            conn.close()
+
+        migrated = SqliteHuey(filename=filename, timeout=3).storage
+        try:
+            self.assertEqual(migrated.acquire_rate_limit(
+                'old', 1, 1, expires_at=10, ttl=10), (False, 1))
+            self.assertEqual(migrated.acquire_rate_limit(
+                'old', 2, 1, expires_at=20, ttl=10), (True, 1))
+        finally:
+            migrated.close()
 
     def test_timeout(self):
         self.assertEqual(self.s._timeout, 3)
@@ -621,6 +706,7 @@ class TestCySqliteStorage(StorageTests, BaseTestCase):
 
     def tearDown(self):
         super(TestCySqliteStorage, self).tearDown()
+        self.s.close()
         if os.path.exists('huey_storage.db'):
             os.unlink('huey_storage.db')
 
@@ -816,6 +902,7 @@ except ImportError:
 @unittest.skipIf(ValkeyGlideHuey is None, 'valkey-glide-sync not installed')
 class TestValkeyGlideStorage(StorageTests, BaseTestCase):
     supports_ttl = False
+    supports_rate_limit_logical_ttl = False
 
     def get_huey(self):
         return ValkeyGlideHuey(utc=False)

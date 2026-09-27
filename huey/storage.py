@@ -3,6 +3,7 @@ import contextlib
 import hashlib
 import heapq
 import itertools
+import math
 import os
 import re
 import shutil
@@ -264,6 +265,27 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        """
+        Atomically acquire one fixed-window rate-limit permit.
+
+        :return: Tuple of (allowed, current count).
+        """
+        count = self.incr(key)
+        return count <= limit, count
+
+    def reset_rate_limit(self, key):
+        raise NotImplementedError
+
+    def peek_rate_limit(self, key):
+        return self.incr(key, 0)
+
+    def rate_limit_size(self):
+        raise NotImplementedError
+
+    def flush_rate_limits(self):
+        raise NotImplementedError
+
     def result_store_size(self):
         """
         :return: Number of key/value pairs in the result store.
@@ -305,6 +327,7 @@ class BaseStorage(object):
         self.flush_schedule()
         self.flush_results()
         self.flush_counters()
+        self.flush_rate_limits()
 
 
 class BlackHoleStorage(BaseStorage):
@@ -325,6 +348,12 @@ class BlackHoleStorage(BaseStorage):
     def put_if_empty(self, key, value, ttl=None): return True
     def incr(self, key, amount=1): return amount
     def delete_counter(self, key): pass
+    def acquire_rate_limit(self, key, window, limit, expires_at=None,
+                           ttl=None): return True, 1
+    def reset_rate_limit(self, key): pass
+    def peek_rate_limit(self, key): return 0
+    def rate_limit_size(self): return 0
+    def flush_rate_limits(self): pass
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
@@ -340,6 +369,8 @@ class MemoryStorage(BaseStorage):
         self._expires = {}
         self._schedule = []
         self._counters = {}
+        self._rate_limits = {}
+        self._rate_limit_expirations = []
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -450,6 +481,55 @@ class MemoryStorage(BaseStorage):
     def flush_counters(self):
         self._counters = {}
 
+    def _cleanup_rate_limits(self, now):
+        while self._rate_limit_expirations:
+            expires_at, key = self._rate_limit_expirations[0]
+            if expires_at > now:
+                break
+            heapq.heappop(self._rate_limit_expirations)
+            state = self._rate_limits.get(key)
+            if state is not None and state[2] <= now:
+                self._rate_limits.pop(key, None)
+
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        with self._lock:
+            cleanup_time = expires_at - ttl if expires_at is not None and ttl else None
+            if cleanup_time is not None:
+                self._cleanup_rate_limits(cleanup_time)
+
+            state = self._rate_limits.get(key)
+            if state is None or state[0] != window:
+                state = [window, 0, expires_at]
+                self._rate_limits[key] = state
+
+            allowed = state[1] < limit
+            if allowed:
+                state[1] += 1
+            state[2] = expires_at
+            if state[1] == 1 and expires_at is not None:
+                heapq.heappush(self._rate_limit_expirations,
+                               (expires_at, key))
+            return allowed, state[1]
+
+    def reset_rate_limit(self, key):
+        with self._lock:
+            self._rate_limits.pop(key, None)
+
+    def peek_rate_limit(self, key, window=None):
+        with self._lock:
+            state = self._rate_limits.get(key)
+            if state is None or (window is not None and state[0] != window):
+                return 0
+            return state[1]
+
+    def rate_limit_size(self):
+        return len(self._rate_limits)
+
+    def flush_rate_limits(self):
+        with self._lock:
+            self._rate_limits = {}
+            self._rate_limit_expirations = []
+
 
 # A custom lua script to pass to redis that will read tasks from the schedule
 # and atomically pop them from the sorted set and return them. It won't return
@@ -460,6 +540,39 @@ local res = redis.call('zrangebyscore', KEYS[1], '-inf', unix_ts)
 if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res then
     return res
 end"""
+
+RATE_LIMIT_LUA = """\
+local state = redis.call('GET', KEYS[1])
+local window = tonumber(ARGV[1])
+local limit = tonumber(ARGV[2])
+local ttl = math.max(1, math.ceil(tonumber(ARGV[3]) * 1000))
+local current_window, count = 0, 0
+if state then
+  current_window, count = string.match(state, '^(%d+):(%d+)$')
+  current_window, count = tonumber(current_window), tonumber(count)
+end
+if current_window ~= window then
+  count = 0
+end
+local allowed = 0
+if count < limit then
+  count = count + 1
+  allowed = 1
+end
+redis.call('SET', KEYS[1], window .. ':' .. count, 'PX', ttl)
+return {allowed, count}"""
+
+RATE_LIMIT_FLUSH_LUA = """\
+local cursor = '0'
+local deleted = 0
+repeat
+  local result = redis.call('SCAN', cursor, 'MATCH', ARGV[1], 'COUNT', 500)
+  cursor = result[1]
+  for _, key in ipairs(result[2]) do
+    deleted = deleted + redis.call('DEL', key)
+  end
+until cursor == '0'
+return deleted"""
 
 
 class RedisStorage(BaseStorage):
@@ -496,12 +609,14 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._rate_limit = self.conn.register_script(RATE_LIMIT_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
         self.queue_key = 'huey.redis.%s' % self.name
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.counter_key = 'huey.counters.%s' % self.name
+        self.rate_limit_prefix = b'huey.rl.%s.' % self.name.encode('utf8')
         self.notify_prefix = 'huey.notify.%s.' % self.name
         self.notify_result = notify_result  # Use result notification.
         self.notify_result_ttl = notify_result_ttl
@@ -511,6 +626,11 @@ class RedisStorage(BaseStorage):
 
         self.blocking = blocking
         self.read_timeout = read_timeout
+
+    def rate_limit_key(self, key):
+        if isinstance(key, str):
+            key = key.encode('utf8')
+        return self.rate_limit_prefix + key
 
     @cached_property
     def redis_version(self):
@@ -672,6 +792,37 @@ class RedisStorage(BaseStorage):
     def delete_counter(self, key):
         self.conn.hdel(self.counter_key, key)
 
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        if expires_at is None or ttl is None:
+            raise ValueError('expires_at and ttl are required')
+        result = self._rate_limit(
+            keys=[self.rate_limit_key(key)],
+            args=[window, limit, ttl])
+        return bool(int(result[0])), int(result[1])
+
+    def reset_rate_limit(self, key):
+        return self.conn.delete(self.rate_limit_key(key)) != 0
+
+    def peek_rate_limit(self, key, window=None):
+        state = self.conn.get(self.rate_limit_key(key))
+        if state is None:
+            return 0
+        stored_window, count = state.split(b':', 1)
+        if window is not None and int(stored_window) != window:
+            return 0
+        return int(count)
+
+    def _rate_limit_keys(self):
+        return self.conn.scan_iter(match=self.rate_limit_prefix + b'*')
+
+    def rate_limit_size(self):
+        return len(list(self._rate_limit_keys()))
+
+    def flush_rate_limits(self):
+        keys = list(self._rate_limit_keys())
+        if keys:
+            self.conn.delete(*keys)
+
     def result_store_size(self):
         return self.conn.hlen(self.result_key)
 
@@ -832,6 +983,10 @@ class BaseSqlStorage(BaseStorage):
         self._conn = None
         if create_tables:
             self.initialize_schema()
+        self._migrate_schema()
+
+    def _migrate_schema(self):
+        pass
 
     def close(self):
         if self._conn is None:
@@ -903,8 +1058,17 @@ class SqliteStorage(BaseSqlStorage):
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
                      'primary key(queue, key))')
+    table_rate_limit = ('create table if not exists rate_limit ('
+                        'id integer not null primary key, '
+                        'queue text not null, key text not null, '
+                        'window integer not null, value integer not null, '
+                        'expires real not null, granted integer not null '
+                        'default 1, unique(queue, key))')
+    index_rate_limit = ('create index if not exists rate_limit_expires '
+                         'on rate_limit (queue, expires)')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
-           table_counter, drop_index_task]
+           table_counter, table_rate_limit, index_rate_limit,
+           drop_index_task]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -929,9 +1093,21 @@ class SqliteStorage(BaseSqlStorage):
                 'primary key autoincrement')
             self.ddl = ddl
 
-        self.to_blob = memoryview
-
         super(SqliteStorage, self).__init__(name, create_tables=create_tables)
+        self.to_blob = memoryview
+        self._migrate_rate_limit_schema()
+
+    def _migrate_rate_limit_schema(self):
+        conn = self._create_connection()
+        try:
+            columns = {row[1] for row in conn.execute(
+                'pragma table_info(rate_limit)').fetchall()}
+            if columns and 'granted' not in columns:
+                conn.execute('alter table rate_limit add column granted '
+                             'integer not null default 1')
+        finally:
+            conn.close()
+        self._conn = None
 
     def _create_connection(self):
         conn = sqlite3.connect(self.filename, timeout=self._timeout,
@@ -1101,6 +1277,58 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
 
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        if expires_at is None:
+            raise ValueError('expires_at is required')
+        with self.db(commit=True) as curs:
+            curs.execute('delete from rate_limit where rowid in ('
+                         'select rowid from rate_limit where queue = ? and '
+                         'expires <= ? order by expires limit 500)',
+                         (self.name, expires_at - ttl))
+            curs.execute('insert into rate_limit (queue, key, window, value, '
+                         'expires, granted) values (?, ?, ?, 0, ?, 1) '
+                         'on conflict (queue, key) do update set '
+                         'window = excluded.window, '
+                         'value = case when rate_limit.window = ? then '
+                         'rate_limit.value else 0 end, '
+                         'expires = excluded.expires, '
+                         'granted = case when rate_limit.window = ? and '
+                         'rate_limit.value < ? then 1 else 0 end',
+                         (self.name, key, window, expires_at, window, window,
+                          limit))
+            curs.execute('update rate_limit set value = value + 1 where '
+                         'queue = ? and key = ? and granted = 1 returning '
+                         'value', (self.name, key))
+            row = curs.fetchone()
+            allowed = row is not None
+            if allowed:
+                value, = row
+            else:
+                curs.execute('select value from rate_limit where queue = ? '
+                             'and key = ?', (self.name, key))
+                value, = curs.fetchone()
+        return allowed, value
+
+    def reset_rate_limit(self, key):
+        self.sql('delete from rate_limit where queue = ? and key = ?',
+                 (self.name, key), commit=True)
+
+    def peek_rate_limit(self, key, window=None):
+        sql = ('select value from rate_limit where queue = ? and key = ?')
+        params = [self.name, key]
+        if window is not None:
+            sql += ' and window = ?'
+            params.append(window)
+        result = self.sql(sql, params, results=True)
+        return result[0][0] if result else 0
+
+    def rate_limit_size(self):
+        return self.sql('select count(*) from rate_limit where queue=?',
+                        (self.name,), results=True)[0][0]
+
+    def flush_rate_limits(self):
+        self.sql('delete from rate_limit where queue=?', (self.name,), True)
+
     def result_store_size(self):
         return self.sql('select count(*) from kv where queue=?', (self.name,),
                         results=True)[0][0]
@@ -1170,6 +1398,7 @@ class PostgresStorage(BaseSqlStorage):
         self.table_schedule = prefix + '_schedule'
         self.table_task = prefix + '_task'
         self.table_counter = prefix + '_counter'
+        self.table_rate_limit = prefix + '_rate_limit'
 
         # Postgres channel names longer than 63 bytes raise "channel name
         # too long" from pg_notify(), which would break every enqueue.
@@ -1201,7 +1430,16 @@ class PostgresStorage(BaseSqlStorage):
 
             'create table if not exists {p}_counter ('
             'queue text not null, key text not null, '
-            'value bigint not null default 0, primary key(queue, key))')]
+            'value bigint not null default 0, primary key(queue, key))',
+
+            'create table if not exists {p}_rate_limit ('
+            'queue text not null, key text not null, '
+            'window bigint not null, value bigint not null, '
+            'expires double precision not null, granted boolean not null '
+            'default true, primary key(queue, key))',
+
+            'create index if not exists {p}_rate_limit_expires '
+            'on {p}_rate_limit (queue, expires)')]
 
         # Do not reuse conns across fork!
         self._inherited = []
@@ -1214,6 +1452,10 @@ class PostgresStorage(BaseSqlStorage):
         self._listen_local = threading.local()
 
         super(PostgresStorage, self).__init__(name, create_tables=create_tables)
+
+    def _migrate_schema(self):
+        self.sql('alter table {} add column if not exists granted boolean '
+                 'not null default true'.format(self.table_rate_limit))
 
     def _connect(self):
         if self.connection is not None:
@@ -1418,6 +1660,53 @@ class PostgresStorage(BaseSqlStorage):
         self.sql('delete from {} where queue = %s and key = %s'.format(
             self.table_counter), (self.name, self._key(key)))
 
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        if expires_at is None:
+            raise ValueError('expires_at is required')
+        with self.db() as curs:
+            curs.execute(
+                'with cleaned as (delete from {t} where ctid in ('
+                'select ctid from {t} where queue = %s and expires <= %s '
+                'order by expires limit 500) returning *), '
+                'changed as ('
+                'insert into {t} (queue, key, window, value, expires, '
+                'granted) values (%s, %s, %s, 1, %s, true) '
+                'on conflict (queue, key) do update set '
+                'window = excluded.window, expires = excluded.expires, '
+                'value = case when {t}.window = %s and {t}.value < %s then '
+                '{t}.value + 1 when {t}.window = %s then {t}.value else 1 '
+                'end, granted = case when {t}.window = %s and {t}.value '
+                '< %s then true else false end returning value, granted) '
+                'select value, granted from changed'.format(
+                    t=self.table_rate_limit),
+                (self.name, expires_at - ttl,
+                 self.name, self._key(key), window, expires_at,
+                 window, limit, window, window, limit))
+            value, allowed = curs.fetchone()
+        return allowed, value
+
+    def reset_rate_limit(self, key):
+        self.sql('delete from {} where queue = %s and key = %s'.format(
+            self.table_rate_limit), (self.name, self._key(key)))
+
+    def peek_rate_limit(self, key, window=None):
+        sql = 'select value from {} where queue = %s and key = %s'.format(
+            self.table_rate_limit)
+        params = [self.name, self._key(key)]
+        if window is not None:
+            sql += ' and window = %s'
+            params.append(window)
+        result = self.sql(sql, params, results=True)
+        return result[0][0] if result else 0
+
+    def rate_limit_size(self):
+        return self.sql('select count(*) from {} where queue = %s'.format(
+            self.table_rate_limit), (self.name,), results=True)[0][0]
+
+    def flush_rate_limits(self):
+        self.sql('delete from {} where queue = %s'.format(
+            self.table_rate_limit), (self.name,))
+
     def result_store_size(self):
         return self.sql('select count(*) from {} where queue = %s'.format(
             self.table_kv), (self.name,), results=True)[0][0]
@@ -1460,6 +1749,7 @@ class FileStorage(BaseStorage):
         self.schedule_path = os.path.join(self.path, 'schedule')
         self.result_path = os.path.join(self.path, 'results')
         self.counter_path = os.path.join(self.path, 'counters')
+        self.rate_limit_path = os.path.join(self.path, 'rate_limits')
         self.levels = levels
 
         if use_thread_lock:
@@ -1664,6 +1954,11 @@ class FileStorage(BaseStorage):
             key = key.encode('utf8')
         return os.path.join(self.counter_path, hashlib.md5(key).hexdigest())
 
+    def _rate_limit_filename(self, key):
+        if isinstance(key, str):
+            key = key.encode('utf8')
+        return os.path.join(self.rate_limit_path, hashlib.md5(key).hexdigest())
+
     def incr(self, key, amount=1):
         filename = self._counter_filename(key)
         with self.lock:
@@ -1684,6 +1979,71 @@ class FileStorage(BaseStorage):
         with self.lock:
             if os.path.exists(filename):
                 os.unlink(filename)
+
+    def _cleanup_rate_limits(self, now):
+        try:
+            entries = list(os.scandir(self.rate_limit_path))
+        except FileNotFoundError:
+            return
+        entries.sort(key=lambda entry: entry.stat().st_mtime)
+        for entry in entries[:500]:
+            expires_at = entry.stat().st_mtime
+            if expires_at > now:
+                break
+            try:
+                os.unlink(entry.path)
+            except FileNotFoundError:
+                pass
+
+    def acquire_rate_limit(self, key, window, limit, expires_at=None, ttl=None):
+        if expires_at is None:
+            raise ValueError('expires_at is required')
+        filename = self._rate_limit_filename(key)
+        with self.lock:
+            if not os.path.exists(self.rate_limit_path):
+                os.makedirs(self.rate_limit_path)
+            self._cleanup_rate_limits(expires_at - ttl)
+
+            stored_window, value = 0, 0
+            if os.path.exists(filename):
+                with open(filename, 'rt') as fh:
+                    stored_window, value, _ = fh.read().split(':', 2)
+                    stored_window, value = int(stored_window), int(value)
+
+            if stored_window != window:
+                value = 0
+            allowed = value < limit
+            if allowed:
+                value += 1
+
+            with open(filename, 'wt') as fh:
+                fh.write('%s:%s:%s' % (window, value, expires_at))
+            os.utime(filename, (expires_at, expires_at))
+            return allowed, value
+
+    def reset_rate_limit(self, key):
+        filename = self._rate_limit_filename(key)
+        with self.lock:
+            if os.path.exists(filename):
+                os.unlink(filename)
+                return True
+            return False
+
+    def peek_rate_limit(self, key, window=None):
+        filename = self._rate_limit_filename(key)
+        if not os.path.exists(filename):
+            return 0
+        with open(filename, 'rt') as fh:
+            stored_window, value, _ = fh.read().split(':', 2)
+        if window is not None and int(stored_window) != window:
+            return 0
+        return int(value)
+
+    def rate_limit_size(self):
+        return len(self._get_sorted_filenames(self.rate_limit_path))
+
+    def flush_rate_limits(self):
+        self._flush_dir(self.rate_limit_path)
 
     def result_store_size(self):
         return sum(len(filenames) for _, _, filenames
