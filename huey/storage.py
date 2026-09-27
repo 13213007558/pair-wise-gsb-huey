@@ -44,6 +44,13 @@ class BaseStorage(object):
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
 
+    # Does the storage backend coordinate state across processes (and
+    # potentially machines)? Rate-limit counters are only meaningful
+    # cluster-wide when this is True. The single-process, in-memory storage
+    # explicitly leaves this False: it must not be treated as providing
+    # cross-process consistency.
+    cross_process = False
+
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
 
@@ -295,6 +302,51 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    def acquire_rate_limit(self, key, limit, window, now=None):
+        """
+        Atomically attempt to acquire a slot for the given key in the
+        current fixed-rate-limit window.
+
+        Implementations must perform the check-and-increment as a single
+        atomic operation, using the backend's native transactional
+        guarantees (e.g. a Lua script for Redis, an upsert within a
+        transaction for SQL databases, or a lock for the process-local
+        in-memory storage).
+
+        :param str key: Rate-limit key.
+        :param int limit: Maximum number of acquisitions allowed per window.
+        :param float window: Window size in seconds. Windows are aligned to
+            the unix epoch, so a window boundary occurs every "window"
+            seconds.
+        :param float now: Current unix timestamp. Defaults to the current
+            time; injectable to allow deterministic testing.
+        :return: 2-tuple of (acquired, retry_after). "acquired" is a
+            boolean indicating whether a slot was obtained. "retry_after"
+            is the number of seconds until the current window expires (0
+            when the slot was acquired).
+        """
+        raise NotImplementedError(
+            'rate-limiting is not supported by this storage backend')
+
+    def prune_rate_limits(self, now=None):
+        """
+        Remove rate-limit window entries that expired at or before "now".
+        Backends with native TTL support (e.g. Redis) may treat this as a
+        no-op, as expired keys are removed automatically.
+
+        :param float now: Current unix timestamp (defaults to current time).
+        :return: Number of expired entries removed.
+        """
+        return 0
+
+    def flush_rate_limits(self):
+        """
+        Remove all rate-limit data.
+
+        :return: No return value.
+        """
+        pass
+
     def flush_all(self):
         """
         Remove all persistent or semi-persistent data.
@@ -305,6 +357,7 @@ class BaseStorage(object):
         self.flush_schedule()
         self.flush_results()
         self.flush_counters()
+        self.flush_rate_limits()
 
 
 class BlackHoleStorage(BaseStorage):
@@ -325,6 +378,8 @@ class BlackHoleStorage(BaseStorage):
     def put_if_empty(self, key, value, ttl=None): return True
     def incr(self, key, amount=1): return amount
     def delete_counter(self, key): pass
+    def acquire_rate_limit(self, key, limit, window, now=None):
+        return True, 0.0
     def result_store_size(self): return 0
     def result_items(self): return {}
     def flush_results(self): pass
@@ -332,6 +387,12 @@ class BlackHoleStorage(BaseStorage):
 
 
 class MemoryStorage(BaseStorage):
+    # Rate-limiting (and all other state) is process-local only. Two
+    # consumers running in different processes do *not* share counters, so
+    # this storage must not be used when cross-process consistency of
+    # rate-limits is required.
+    cross_process = False
+
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
@@ -340,6 +401,7 @@ class MemoryStorage(BaseStorage):
         self._expires = {}
         self._schedule = []
         self._counters = {}
+        self._rate_limits = {}  # key -> [window_id, count, expires]
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -438,6 +500,36 @@ class MemoryStorage(BaseStorage):
         with self._lock:
             self._counters.pop(key, None)
 
+    def acquire_rate_limit(self, key, limit, window, now=None):
+        if now is None:
+            now = time.time()
+        window_id = int(now // window)
+        expires = (window_id + 1) * window
+        with self._lock:
+            entry = self._rate_limits.get(key)
+            if entry is None or entry[0] != window_id:
+                # Window rollover (or new key): reset the counter. Expired
+                # entries are replaced here and can also be reaped in bulk
+                # via prune_rate_limits().
+                entry = self._rate_limits[key] = [window_id, 0, expires]
+            entry[1] += 1
+            count = entry[1]
+        return count <= limit, max(0.0, expires - now)
+
+    def prune_rate_limits(self, now=None):
+        if now is None:
+            now = time.time()
+        with self._lock:
+            expired = [key for key, entry in self._rate_limits.items()
+                       if entry[2] <= now]
+            for key in expired:
+                del self._rate_limits[key]
+        return len(expired)
+
+    def flush_rate_limits(self):
+        with self._lock:
+            self._rate_limits = {}
+
     def result_store_size(self):
         return len(self._results)
 
@@ -461,9 +553,19 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+# Atomically increment a rate-limit counter and, on first use, attach a
+# TTL so that idle / high-cardinality keys are cleaned up by Redis itself.
+RATE_LIMIT_LUA = """\
+local count = redis.call('incr', KEYS[1])
+if count == 1 then
+    redis.call('pexpire', KEYS[1], ARGV[1])
+end
+return count"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
+    cross_process = True  # Counters are shared by all consumers.
     redis_client = Redis
 
     def __init__(self, name='huey', blocking=True, read_timeout=1,
@@ -502,9 +604,11 @@ class RedisStorage(BaseStorage):
         self.schedule_key = 'huey.schedule.%s' % self.name
         self.result_key = 'huey.results.%s' % self.name
         self.counter_key = 'huey.counters.%s' % self.name
+        self.rate_limit_prefix = 'huey.ratelimit.%s.' % self.name
         self.notify_prefix = 'huey.notify.%s.' % self.name
         self.notify_result = notify_result  # Use result notification.
         self.notify_result_ttl = notify_result_ttl
+        self._rate_limit_script = self.conn.register_script(RATE_LIMIT_LUA)
 
         if client_name is not None:
             self.conn.client_setname(client_name)
@@ -672,6 +776,26 @@ class RedisStorage(BaseStorage):
     def delete_counter(self, key):
         self.conn.hdel(self.counter_key, key)
 
+    def acquire_rate_limit(self, key, limit, window, now=None):
+        if now is None:
+            now = time.time()
+        window_id = int(now // window)
+        expires = (window_id + 1) * window
+        # The window id is embedded in the key, so window rollover is
+        # automatic and old windows are reaped by Redis' own TTL machinery
+        # (the Lua script sets the TTL atomically with the increment).
+        rkey = '%s%s.%d' % (self.rate_limit_prefix, key, window_id)
+        ttl_ms = max(1, int(window * 2000))  # Retain for two windows.
+        count = self._rate_limit_script(keys=[rkey], args=[ttl_ms])
+        return count <= limit, max(0.0, expires - now)
+
+    def flush_rate_limits(self):
+        keys = [key for key in
+                self.conn.scan_iter(match=self.rate_limit_prefix + '*',
+                                    count=1000)]
+        if keys:
+            self.conn.delete(*keys)
+
     def result_store_size(self):
         return self.conn.hlen(self.result_key)
 
@@ -822,6 +946,7 @@ class PriorityRedisExpireStorage(RedisPriorityQueue, RedisExpireStorage): pass
 
 
 class BaseSqlStorage(BaseStorage):
+    cross_process = True  # Backed by a shared database.
     begin_sql = 'begin'
     ddl = []
 
@@ -903,8 +1028,14 @@ class SqliteStorage(BaseSqlStorage):
                      'queue text not null, key text not null, '
                      'value integer not null default 0, '
                      'primary key(queue, key))')
+    table_ratelimit = ('create table if not exists ratelimit ('
+                       'queue text not null, key text not null, '
+                       'window_id integer not null, '
+                       'count integer not null, '
+                       'expires real not null, '
+                       'primary key(queue, key))')
     ddl = [table_kv, table_sched, index_sched, table_task, index_task,
-           table_counter, drop_index_task]
+           table_counter, table_ratelimit, drop_index_task]
 
     def __init__(self, name='huey', filename='huey.db', cache_mb=8,
                  fsync=None, journal_mode='wal', timeout=5, strict_fifo=False,
@@ -1101,6 +1232,58 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
 
+    def acquire_rate_limit(self, key, limit, window, now=None):
+        if now is None:
+            now = time.time()
+        window_id = int(now // window)
+        expires = (window_id + 1) * window
+        # The check-and-increment is a single upsert, executed inside a
+        # "begin exclusive" transaction (see db()), so concurrent consumers
+        # cannot over-issue slots for a window.
+        with self.db(commit=True) as curs:
+            if self.sqlite_version_info >= (3, 35, 0):
+                curs.execute(
+                    'insert into ratelimit '
+                    '(queue, key, window_id, count, expires) '
+                    'values (?, ?, ?, 1, ?) '
+                    'on conflict (queue, key) do update set '
+                    'count = case when ratelimit.window_id = excluded.window_id '
+                    'then ratelimit.count + 1 else 1 end, '
+                    'window_id = excluded.window_id, '
+                    'expires = excluded.expires '
+                    'returning count',
+                    (self.name, key, window_id, expires))
+                count, = curs.fetchone()
+            elif self.sqlite_version_info >= (3, 24, 0):
+                curs.execute(
+                    'insert into ratelimit '
+                    '(queue, key, window_id, count, expires) '
+                    'values (?, ?, ?, 1, ?) '
+                    'on conflict (queue, key) do update set '
+                    'count = case when ratelimit.window_id = excluded.window_id '
+                    'then ratelimit.count + 1 else 1 end, '
+                    'window_id = excluded.window_id, '
+                    'expires = excluded.expires',
+                    (self.name, key, window_id, expires))
+                curs.execute('select count from ratelimit '
+                             'where queue = ? and key = ?', (self.name, key))
+                count, = curs.fetchone()
+            else:
+                raise NotImplementedError('SQLite 3.24 or newer is required.')
+
+        return count <= limit, max(0.0, expires - now)
+
+    def prune_rate_limits(self, now=None):
+        if now is None:
+            now = time.time()
+        with self.db(commit=True) as curs:
+            curs.execute('delete from ratelimit where queue = ? and '
+                         'expires <= ?', (self.name, now))
+            return curs.rowcount
+
+    def flush_rate_limits(self):
+        self.sql('delete from ratelimit where queue = ?', (self.name,), True)
+
     def result_store_size(self):
         return self.sql('select count(*) from kv where queue=?', (self.name,),
                         results=True)[0][0]
@@ -1170,6 +1353,7 @@ class PostgresStorage(BaseSqlStorage):
         self.table_schedule = prefix + '_schedule'
         self.table_task = prefix + '_task'
         self.table_counter = prefix + '_counter'
+        self.table_ratelimit = prefix + '_ratelimit'
 
         # Postgres channel names longer than 63 bytes raise "channel name
         # too long" from pg_notify(), which would break every enqueue.
@@ -1201,7 +1385,13 @@ class PostgresStorage(BaseSqlStorage):
 
             'create table if not exists {p}_counter ('
             'queue text not null, key text not null, '
-            'value bigint not null default 0, primary key(queue, key))')]
+            'value bigint not null default 0, primary key(queue, key))',
+
+            'create table if not exists {p}_ratelimit ('
+            'queue text not null, key text not null, '
+            'window_id bigint not null, count bigint not null, '
+            'expires double precision not null, '
+            'primary key(queue, key))')]
 
         # Do not reuse conns across fork!
         self._inherited = []
@@ -1417,6 +1607,40 @@ class PostgresStorage(BaseSqlStorage):
     def delete_counter(self, key):
         self.sql('delete from {} where queue = %s and key = %s'.format(
             self.table_counter), (self.name, self._key(key)))
+
+    def acquire_rate_limit(self, key, limit, window, now=None):
+        if now is None:
+            now = time.time()
+        window_id = int(now // window)
+        expires = (window_id + 1) * window
+        # Single upsert; the connection runs in autocommit mode, so the
+        # statement itself is the transaction and is atomic.
+        with self.db() as curs:
+            curs.execute(
+                'insert into {t} as rl (queue, key, window_id, count, '
+                'expires) values (%s, %s, %s, 1, %s) '
+                'on conflict (queue, key) do update set '
+                'count = case when rl.window_id = excluded.window_id '
+                'then rl.count + 1 else 1 end, '
+                'window_id = excluded.window_id, '
+                'expires = excluded.expires '
+                'returning count'.format(t=self.table_ratelimit),
+                (self.name, self._key(key), window_id, expires))
+            count = curs.fetchone()[0]
+        return count <= limit, max(0.0, expires - now)
+
+    def prune_rate_limits(self, now=None):
+        if now is None:
+            now = time.time()
+        with self.db() as curs:
+            curs.execute(
+                'delete from {} where queue = %s and expires <= %s'.format(
+                    self.table_ratelimit), (self.name, now))
+            return curs.rowcount
+
+    def flush_rate_limits(self):
+        self.sql('delete from {} where queue = %s'.format(
+            self.table_ratelimit), (self.name,))
 
     def result_store_size(self):
         return self.sql('select count(*) from {} where queue = %s'.format(

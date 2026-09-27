@@ -1046,6 +1046,59 @@ Equivalent example using a context-manager instead of a decorator:
 
 See :py:meth:`Huey.rate_limit` for API documentation.
 
+.. _queue-rate-limiting:
+
+Queue-level window rate-limiting
+---------------------------------
+
+While :py:meth:`Huey.rate_limit` throttles code *inside* a running task,
+tasks can also be rate-limited *before* they are executed. When a task is
+declared with ``rate_limit``, the consumer atomically acquires a slot in
+the current fixed window before running it. If the window is full, the
+task is transparently rescheduled for the moment the window expires, and
+runs once the next window opens -- no retries are consumed and no error
+is recorded.
+
+.. code-block:: python
+
+    @huey.task(rate_limit=10, rate_limit_window=60)
+    def sync_user(user_id):
+        # At most 10 invocations per 60s window, across all consumers.
+        service.sync(user_id)
+
+The rate-limit key defaults to the task class, so all instances of the
+task share one window. A static string or a callable that receives the
+task instance (and thus its arguments) can be given with
+``rate_limit_key`` to shard the limit by a caller-provided parameter:
+
+.. code-block:: python
+
+    @huey.task(rate_limit=5, rate_limit_window=60,
+               rate_limit_key=lambda task: 'user:%s' % task.args[0])
+    def sync_user(user_id):
+        # Each user_id gets an independent limit of 5 per 60s window.
+        service.sync(user_id)
+
+Notes:
+
+* Windows are aligned to the unix epoch and recover automatically: a
+  deferred task is scheduled for the window boundary, and its retry eta
+  never moves backwards.
+* The check-and-increment is atomic per storage backend (a Lua script
+  for Redis, an upsert in a transaction for SQLite/Postgres), so
+  multiple consumers cannot over-issue slots, and counters survive
+  worker restarts. Failed tasks that are retried also consume window
+  slots, so retries cannot exceed the limit either.
+* Rate-limit keys carry a TTL and are cleaned up after the window
+  expires (natively by Redis, or via
+  :py:meth:`BaseStorage.prune_rate_limits`), so high-cardinality keys
+  do not accumulate.
+* The in-memory storage is process-local only (``cross_process`` is
+  ``False``): it does **not** coordinate limits across processes. Use
+  Redis, SQLite or Postgres storage for multi-consumer rate-limiting.
+* Tasks without ``rate_limit`` are unaffected and perform no additional
+  storage operations.
+
 Task pipelines
 --------------
 

@@ -354,7 +354,7 @@ Huey object
             # ... later ...
             consumer.stop(graceful=True)
 
-    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: task(retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, rate_limit=None, rate_limit_window=60, rate_limit_key=None, **kwargs)
 
         :param int retries: number of times to retry the function if an
             unhandled exception occurs when it is executed.
@@ -385,6 +385,16 @@ Huey object
             ``gevent.Timeout``. When using with threads it is necessary to use
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
+        :param int rate_limit: maximum number of times the task may be
+            executed per fixed time window, across all consumers. When the
+            window is full the task is deferred until the window expires.
+            Defaults to ``None`` (no limit). See
+            :ref:`queue-rate-limiting`.
+        :param float rate_limit_window: size of the rate-limit window in
+            seconds. Defaults to 60.
+        :param rate_limit_key: ``None`` (limit shared per task class), a
+            string, or a callable that accepts the task instance and
+            returns a string, e.g. to shard the limit by a task argument.
         :param kwargs: arbitrary key/value arguments that are passed to the
             :py:class:`TaskWrapper` instance.
         :returns: a :py:class:`TaskWrapper` that wraps the decorated function
@@ -444,7 +454,7 @@ Huey object
         revocation, etc.), see :py:class:`TaskWrapper`, :py:class:`Task`,
         and :py:class:`Result`.
 
-    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, **kwargs)
+    .. py:method:: periodic_task(validate_datetime, retries=0, retry_delay=0, retry_backoff=0, priority=None, context=False, name=None, expires=None, timeout=None, rate_limit=None, rate_limit_window=60, rate_limit_key=None, **kwargs)
 
         :param function validate_datetime: function which accepts a
             ``datetime`` instance and returns whether the task should be
@@ -2485,4 +2495,3 @@ Huey comes with several built-in storage implementations:
 
 .. autoclass:: huey.storage.BaseStorage
    :members:
-

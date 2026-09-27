@@ -1,3 +1,4 @@
+import calendar
 import copy
 import datetime
 import inspect
@@ -172,7 +173,11 @@ class Huey(object):
         return Consumer(self, **options)
 
     def task(self, retries=0, retry_delay=0, retry_backoff=0, priority=None,
-             context=False, name=None, expires=None, timeout=None, **kwargs):
+             context=False, name=None, expires=None, timeout=None,
+             rate_limit=None, rate_limit_window=60, rate_limit_key=None,
+             **kwargs):
+        self._validate_rate_limit(rate_limit, rate_limit_window,
+                                  rate_limit_key)
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             return TaskWrapper(
@@ -186,12 +191,18 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_rate_limit=rate_limit,
+                default_rate_limit_window=rate_limit_window,
+                default_rate_limit_key=rate_limit_key,
                 **kwargs)
         return decorator
 
     def periodic_task(self, validate_datetime, retries=0, retry_delay=0,
                       retry_backoff=0, priority=None, context=False, name=None,
-                      expires=None, timeout=None, **kwargs):
+                      expires=None, timeout=None, rate_limit=None,
+                      rate_limit_window=60, rate_limit_key=None, **kwargs):
+        self._validate_rate_limit(rate_limit, rate_limit_window,
+                                  rate_limit_key)
         TaskWrapper = self.task_wrapper_class
         def decorator(func):
             def method_validate(self, timestamp):
@@ -208,11 +219,32 @@ class Huey(object):
                 default_priority=priority,
                 default_expires=expires,
                 default_timeout=timeout,
+                default_rate_limit=rate_limit,
+                default_rate_limit_window=rate_limit_window,
+                default_rate_limit_key=rate_limit_key,
                 validate_datetime=method_validate,
                 task_base=PeriodicTask,
                 **kwargs)
 
         return decorator
+
+    def _validate_rate_limit(self, rate_limit, rate_limit_window,
+                             rate_limit_key):
+        if rate_limit is None:
+            return
+        if not isinstance(rate_limit, int) or rate_limit < 1:
+            raise ConfigurationError(
+                'rate_limit must be a positive integer, got %r' % rate_limit)
+        if not rate_limit_window or rate_limit_window <= 0:
+            raise ConfigurationError(
+                'rate_limit_window must be a positive number of seconds, '
+                'got %r' % rate_limit_window)
+        if rate_limit_key is not None and not (
+                callable(rate_limit_key) or
+                isinstance(rate_limit_key, str)):
+            raise ConfigurationError(
+                'rate_limit_key must be None, a string, or a callable that '
+                'accepts the task instance and returns a string')
 
     def context_task(self, obj, as_argument=False, **kwargs):
         def context_decorator(fn):
@@ -435,10 +467,65 @@ class Huey(object):
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
             self._abort_chord_member(task, SKIPPED)
+        elif not self._acquire_rate_limit(task, timestamp):
+            pass  # Rate-limited: task rescheduled for the next window.
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
             return self._execute(task, timestamp)
+
+    def _acquire_rate_limit(self, task, timestamp):
+        limit = type(task).default_rate_limit
+        if not limit:
+            # No rate-limit configured: behavior is unchanged for ordinary
+            # tasks (no storage round-trip is performed).
+            return True
+
+        window = type(task).default_rate_limit_window
+        key = self._rate_limit_key(task)
+        now = self._timestamp_to_unix(timestamp)
+        acquired, retry_after = self.storage.acquire_rate_limit(
+            key, limit, window, now)
+        if acquired:
+            return True
+
+        # Defer the task until the window expires. The retry eta is
+        # monotonic: it can never move earlier than the eta the task
+        # already carried.
+        retry_unix = now + retry_after
+        if task.eta is not None:
+            retry_unix = max(retry_unix, self._timestamp_to_unix(task.eta))
+        task.eta = self._unix_to_timestamp(retry_unix)
+        logger.info('Task %s rate-limited on %s, will retry at %s.',
+                    task.id, key, task.eta)
+        self.add_schedule(task)
+        self._emit(S.SIGNAL_RATE_LIMITED, task)
+        return False
+
+    def _rate_limit_key(self, task):
+        key_source = type(task).default_rate_limit_key
+        if key_source is None:
+            # Default: the limit is shared by all instances of the class.
+            return self._registry.task_to_string(type(task))
+        if callable(key_source):
+            # User-provided function mapping the task (and its arguments)
+            # to a stable rate-limit key.
+            return str(key_source(task))
+        return str(key_source)
+
+    def _timestamp_to_unix(self, timestamp):
+        if timestamp.tzinfo is not None:
+            return timestamp.timestamp()
+        micros = timestamp.microsecond * 1e-6
+        if self.utc:
+            return calendar.timegm(timestamp.utctimetuple()) + micros
+        return time.mktime(timestamp.timetuple()) + micros
+
+    def _unix_to_timestamp(self, unix_ts):
+        if self.utc:
+            return (datetime.datetime(1970, 1, 1) +
+                    datetime.timedelta(seconds=unix_ts))
+        return datetime.datetime.fromtimestamp(unix_ts)
 
     def _execute(self, task, timestamp):
         if self._pre_execute:
@@ -843,6 +930,9 @@ class Task(object):
     default_retry_delay = 0
     default_retry_backoff = 0
     default_timeout = None
+    default_rate_limit = None
+    default_rate_limit_window = 60
+    default_rate_limit_key = None
 
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
