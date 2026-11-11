@@ -5,6 +5,12 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Fix revoke/retry race: the execution tail no longer deletes an instance
+  revocation flag that was issued while the task was running, so a
+  `revoke_by_id()` (or `revoke_all()`) correctly blocks requeued retries.
+  Only flags already present when the task body started are cleaned up; the
+  start-up snapshot uses a peek so `revoke_once` is not consumed.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

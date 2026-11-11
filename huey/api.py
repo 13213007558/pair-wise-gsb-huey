@@ -443,6 +443,15 @@ class Huey(object):
         retry_eta = None
         task_value = None
 
+        # Snapshot the instance's revocation flag before the task body runs.
+        # A revoke_by_id() arriving while the task is in flight must survive
+        # the cleanup below so a requeued retry is blocked on its next
+        # attempt; only a flag that was already present at start-up is stale
+        # and safe to clear once the instance finishes. A pure peek is used so
+        # that a one-shot (revoke_once) flag is not consumed by the snapshot.
+        revoke_present = (not isinstance(task, PeriodicTask) and
+                          self.storage.has_data_for_key(task.revoke_id))
+
         if task.timeout:
             task._deadline = start + task.timeout
 
@@ -505,7 +514,10 @@ class Huey(object):
 
         # Clear the flag if this instance of the task was revoked after it
         # began executing. Expiring storages implement pop_data as a peek.
-        if not isinstance(task, PeriodicTask):
+        # Only remove a flag that already existed before the task body ran:
+        # a revoke_by_id() issued during execution is a fresh instruction that
+        # must keep blocking any requeued retry instead of being wiped here.
+        if revoke_present:
             self.delete(task.revoke_id)
 
         store = self.results and not isinstance(task, PeriodicTask)

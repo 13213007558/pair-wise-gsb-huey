@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import inspect
 import pickle
+import threading
 import time
 
 from huey.api import ChordResult
@@ -485,6 +486,262 @@ class TestQueue(BaseTestCase):
         task_p.restore()
         self.assertFalse(task_p.is_revoked())
         self.assertFalse(task_p.is_revoked(timestamp=timestamp - second))
+
+    def _revoke_during_execution(self, task_kwargs, body):
+        # Execution barrier: the revocation is stored strictly after the task
+        # body has started and before the execution tail requeues or cleans up.
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        @self.huey.task(**task_kwargs)
+        def task_a(n):
+            calls.append(n)
+            started.set()
+            self.assertTrue(release.wait(5))
+            return body(n)
+
+        result = task_a(1)
+        signals = []
+
+        @self.huey.signal()
+        def collect(signal, task, exc=None):
+            signals.append(signal)
+
+        def driver():
+            self.assertTrue(started.wait(5))
+            self.huey.revoke_by_id(result.id)
+            release.set()
+
+        thread = threading.Thread(target=driver)
+        thread.start()
+        task = self.huey.dequeue()
+        first = self.huey.execute(task)
+        thread.join()
+        return task_a, result, calls, signals, first
+
+    def test_revoke_during_execution_blocks_exception_retry(self):
+        def body(n):
+            raise TestError('boom')
+        task_a, result, calls, signals, first = self._revoke_during_execution(
+            {'retries': 1}, body)
+
+        # The in-flight attempt ran to its end and was requeued, but the fresh
+        # revocation flag must still be present instead of being deleted.
+        self.assertTrue(first is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 1)
+        self.assertTrue(self.huey.is_revoked(result.id))
+
+        # The next attempt is blocked: no second call, revoked signal emitted.
+        before = len(signals)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(signals[before:], ['revoked'])
+
+        # Queue drained, flag retained as an audit record of the revocation.
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(self.huey.is_revoked(result.id))
+
+    def test_revoke_during_execution_blocks_explicit_retry_task(self):
+        def body(n):
+            raise RetryTask()
+        task_a, result, calls, signals, first = self._revoke_during_execution(
+            {'retries': 1}, body)
+
+        self.assertTrue(first is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 1)
+        self.assertTrue(self.huey.is_revoked(result.id))
+
+        before = len(signals)
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(signals[before:], ['revoked'])
+        self.assertEqual(len(self.huey), 0)
+
+    def test_revoke_during_execution_success_keeps_flag(self):
+        task_a, result, calls, signals, first = self._revoke_during_execution(
+            {'retries': 1}, lambda n: n + 1)
+
+        # The started attempt is not interrupted and completes successfully.
+        self.assertEqual(first, 2)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(self.huey.is_revoked(result.id))
+
+        # An explicit restore re-enables a later, clearly recovered instance.
+        self.assertTrue(self.huey.restore_by_id(result.id))
+        self.assertFalse(self.huey.is_revoked(result.id))
+        self.huey.enqueue(result.task)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(calls, [1, 1])
+        self.assertFalse(self.huey.is_revoked(result.id))
+
+    def test_revoke_during_execution_final_failure_keeps_flag(self):
+        def body(n):
+            raise TestError('boom')
+        task_a, result, calls, signals, first = self._revoke_during_execution(
+            {'retries': 0}, body)
+
+        # No retries remain: nothing is requeued, the error is terminal, but
+        # the operator's revocation must not be erased.
+        self.assertTrue(first is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(self.huey.is_revoked(result.id))
+
+    def test_revoke_all_during_execution_blocks_retry(self):
+        # A class-level revoke_all() arriving mid-execution must also block the
+        # requeued retry, and the instance tail must never touch the class key.
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+
+        @self.huey.task(retries=1)
+        def task_a(n):
+            calls.append(n)
+            started.set()
+            self.assertTrue(release.wait(5))
+            raise TestError('boom')
+
+        result = task_a(1)
+
+        def driver():
+            self.assertTrue(started.wait(5))
+            task_a.revoke()
+            release.set()
+
+        thread = threading.Thread(target=driver)
+        thread.start()
+        task = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(task) is None)
+        thread.join()
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 1)
+        # Class-level flag remains and blocks the next attempt.
+        self.assertTrue(task_a.is_revoked())
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(calls, [1])
+        self.assertTrue(task_a.is_revoked())
+
+        # Restoring the class allows a fresh instance to run.
+        self.assertTrue(task_a.restore())
+        self.huey.enqueue(task)
+        self.assertTrue(self.execute_next() is None)  # raises, but runs
+        self.assertEqual(calls, [1, 1])
+
+    def test_revoke_until_during_execution_blocks_retry_until_cutoff(self):
+        # A time-bounded revocation issued mid-execution blocks the retry while
+        # the cutoff is in the future and self-heals once it has passed.
+        started = threading.Event()
+        release = threading.Event()
+        calls = []
+        now = datetime.datetime.now()
+        cutoff = now + datetime.timedelta(hours=1)
+
+        @self.huey.task(retries=1)
+        def task_a(n):
+            calls.append(n)
+            started.set()
+            self.assertTrue(release.wait(5))
+            raise TestError('boom')
+
+        result = task_a(1)
+
+        def driver():
+            self.assertTrue(started.wait(5))
+            self.huey.revoke_by_id(result.id, revoke_until=cutoff)
+            release.set()
+
+        thread = threading.Thread(target=driver)
+        thread.start()
+        task = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(task) is None)
+        thread.join()
+
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 1)
+        self.assertTrue(self.huey.is_revoked(result.id))
+        # The retry is blocked while before the cutoff.
+        self.assertTrue(self.execute_next() is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 0)
+        # After the cutoff the flag reports not-revoked without any peek
+        # consuming it early; a later re-enqueued instance runs normally.
+        self.assertFalse(self.huey.is_revoked(
+            result.id, timestamp=cutoff + datetime.timedelta(seconds=1)))
+
+    def test_revoke_snapshot_does_not_consume_revoke_once(self):
+        # A one-shot revocation must survive peeking checks; only an actual
+        # non-peek revocation check inside execute() consumes it.
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            return n + 1
+
+        result = task_a(1)
+        self.huey.revoke_by_id(result.id, revoke_once=True)
+        # Peeks (including is_revoked with the default peek=True) must not
+        # consume the one-shot flag.
+        self.assertTrue(self.huey.is_revoked(result.id, peek=True))
+        self.assertTrue(self.huey.is_revoked(result.id, peek=True))
+
+        # The consuming check blocks execution and clears the one-shot flag.
+        task = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(task) is None)
+        self.assertEqual(state, [])
+        self.assertFalse(self.huey.is_revoked(result.id))
+
+        # A subsequently re-enqueued instance now runs normally.
+        self.huey.enqueue(task)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(state, [1])
+
+    def test_stale_revoke_flag_predating_execution_is_cleaned_up(self):
+        # A flag already present when the task body starts is treated as stale
+        # by the tail and cleared once the instance actually runs: a recovered
+        # fixed-id task must not stay blocked forever. The flag is re-planted
+        # immediately after the body starts (so the start-up snapshot sees it)
+        # but removed again before the tail cleanup runs.
+        started = threading.Event()
+        release = threading.Event()
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            started.set()
+            self.assertTrue(release.wait(5))
+            return n + 1
+
+        result = task_a(1)
+
+        def driver():
+            self.assertTrue(started.wait(5))
+            # Re-plant a pre-existing flag, then explicitly restore before the
+            # execution tail runs: cleanup must clear the stale marker.
+            self.huey.revoke_by_id(result.id)
+            self.assertTrue(self.huey.is_revoked(result.id))
+            self.assertTrue(self.huey.restore_by_id(result.id))
+            release.set()
+
+        thread = threading.Thread(target=driver)
+        thread.start()
+        task = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(task), 2)
+        thread.join()
+        self.assertEqual(state, [1])
+        self.assertFalse(self.huey.is_revoked(result.id))
+
+        # Re-enqueueing the recovered instance keeps working.
+        self.huey.enqueue(task)
+        self.assertEqual(self.execute_next(), 2)
+        self.assertEqual(state, [1, 1])
+        self.assertFalse(self.huey.is_revoked(result.id))
 
     def test_reschedule(self):
         state = []
@@ -3135,3 +3392,20 @@ class TestCustomErrorMetadata(BaseTestCase):
 
         self.assertEqual(self.huey.result_count(), 0)
         self.assertEqual(len(self.huey), 0)
+
+
+class TestRevokeRaceSqlite(TestQueue):
+    # Runs the full TestQueue suite (including the revoke/retry race
+    # regressions) against the SQLite storage backend.
+    def get_huey(self):
+        from huey.contrib.sql_huey import SqlHuey
+        import os
+        filename = os.path.join(os.environ.get('TMPDIR', '/tmp'),
+                                'huey-revoke-race.db')
+        if os.path.exists(filename):
+            os.unlink(filename)
+        return SqlHuey(database='sqlite:///%s' % filename, utc=False)
+
+    def tearDown(self):
+        super(TestRevokeRaceSqlite, self).tearDown()
+        self.huey.storage.drop_tables()
