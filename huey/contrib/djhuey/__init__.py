@@ -1,4 +1,6 @@
+import copy
 from functools import wraps
+import logging
 import sys
 import traceback
 
@@ -7,6 +9,9 @@ from django.db import close_old_connections
 from django.db import transaction
 
 from huey.utils import load_class
+
+
+logger = logging.getLogger('huey')
 
 
 configuration_message = """
@@ -169,6 +174,45 @@ def on_commit_task(*args, **kwargs):
     the task may not (ever) be enqueued, subject to whether or not the
     transaction actually commits.
 
+    The database connection whose commit the task waits on can be selected
+    with the ``using_db`` decorator argument, which is passed through to
+    ``django.db.transaction.on_commit()`` and defaults to the "default"
+    connection. ``using_db`` is consumed by the decorator itself, so a task
+    function remains free to declare its own ``using`` parameter (or any
+    other argument name) -- call-time arguments are always forwarded to the
+    task unchanged.
+
+    The task's arguments are snapshotted (via ``copy.deepcopy``) at call
+    time, so mutating a mutable argument after the task is called but before
+    the transaction commits will not affect the arguments the task is
+    eventually enqueued with.
+
+    Django's ``transaction.on_commit()`` semantics apply:
+
+    * If no transaction is active on the selected connection, the task is
+      enqueued immediately.
+    * If the transaction is rolled back, the task is silently discarded.
+    * If a savepoint inner to the registration point is rolled back, tasks
+      registered within that savepoint's scope are discarded, while tasks
+      registered in the outer scope are still enqueued on commit.
+
+    Regarding the result handle that is returned:
+
+    * The handle is returned before the task has been enqueued. Until the
+      transaction commits, the handle is simply a placeholder carrying the
+      task ID -- no result data exists, so a non-blocking ``get()`` returns
+      ``None`` and ``is_ready()`` is ``False``.
+    * If the transaction (or savepoint) is rolled back, the task is never
+      enqueued and the handle will *never* resolve: it stays pending
+      indefinitely and no error is attached to it.
+
+    Note that committing the database transaction and writing to the queue
+    are not atomic with respect to one another. If the queue write fails
+    after the transaction has committed, the failure is logged (to the
+    "huey" logger) and re-raised from the commit hook, but the database
+    changes remain committed and the task is lost unless the error is
+    handled by the caller.
+
     Because we have to setup the callback within the bit of code that performs
     the actual enqueueing, we cannot expose the full functionality of the
     TaskWrapper. If you anticipate wanting all these methods, you are probably
@@ -181,15 +225,28 @@ def on_commit_task(*args, **kwargs):
         my_task = task(name='update_data')(update_data)
         my_on_commit_task = on_commit_task(name='update_data_oc')(update_data)
     """
+    using_db = kwargs.pop('using_db', None)
+
     def decorator(fn):
         task_wrapper = task(*args, **kwargs)(close_db(fn))
 
         @wraps(fn)
         def inner(*a, **k):
-            task = task_wrapper.s(*a, **k)
+            # Snapshot the arguments now so that mutations made between the
+            # call and the actual commit are not visible to the task.
+            task = task_wrapper.s(*copy.deepcopy(a), **copy.deepcopy(k))
             def enqueue_on_commit():
-                task_wrapper.huey.enqueue(task)
-            transaction.on_commit(enqueue_on_commit)
+                try:
+                    task_wrapper.huey.enqueue(task)
+                except Exception:
+                    logger.exception(
+                        'Error enqueueing task %s (id=%s) after the "%s" '
+                        'database transaction committed. The transaction '
+                        'committed but the task was not enqueued.',
+                        task.name, task.id,
+                        using_db or 'default')
+                    raise
+            transaction.on_commit(enqueue_on_commit, using=using_db)
             return HUEY._result_handle(task)
         inner.call_local = fn
         return inner

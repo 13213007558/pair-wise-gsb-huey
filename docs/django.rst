@@ -368,9 +368,54 @@ identifier names:
 
     :param args: See :py:meth:`~Huey.task` for supported parameters.
     :param kwargs: See :py:meth:`~Huey.task` for supported parameters.
+        Additionally, ``using_db`` selects the database connection whose
+        commit the task waits on (passed through to
+        ``django.db.transaction.on_commit()``); it defaults to the
+        ``default`` connection.
 
-    Enqueue the decorated function for execution after the transaction commits.
-    If no transaction is active, task will be enqueued immediately.
+    Enqueue the decorated function for execution after the transaction
+    commits. If no transaction is active, task will be enqueued immediately.
+
+    ``using_db`` is consumed by the decorator, so the task function remains
+    free to declare its own ``using`` parameter (or any other argument
+    name) -- call-time arguments are always forwarded to the task unchanged.
+
+    .. code-block:: python
+
+        # Enqueue only after the "audit" database commits.
+        @on_commit_task(using_db='audit')
+        def scan_accounts(accounts, using=None):
+            ...
+
+    The task's arguments are snapshotted (via ``copy.deepcopy``) when the
+    task is called, so mutating a mutable argument after the call but before
+    the commit will not affect the arguments the task is enqueued with.
+
+    Django's ``transaction.on_commit()`` semantics apply to the registered
+    callback:
+
+    * If the transaction is rolled back, the task is silently discarded.
+    * If a savepoint inner to the registration point is rolled back, tasks
+      registered within that savepoint's scope are discarded, while tasks
+      registered in the outer scope are still enqueued on commit.
+
+    The result handle returned by the task call also deserves some care:
+
+    * The handle is returned before the task has been enqueued. Until the
+      transaction commits it is just a placeholder carrying the task ID: no
+      result data exists, a non-blocking ``get()`` returns ``None``, and
+      ``is_ready()`` is ``False``.
+    * If the transaction (or savepoint) is rolled back, the task is never
+      enqueued and the handle will *never* resolve -- it stays pending
+      indefinitely and no error is attached to it.
+
+    .. note::
+        Committing the database transaction and writing to the queue are
+        **not** atomic with respect to one another. If the queue write fails
+        after the transaction has committed, the failure is logged to the
+        ``huey`` logger and re-raised from the commit hook, but the database
+        changes remain committed and the task is lost unless the caller
+        handles the error.
 
 
 .. _django-admin-stats:
