@@ -1214,11 +1214,12 @@ What happens when a :py:class:`chord` is enqueued?
 
 1. All sub-tasks are placed on the queue. Workers begin executing them as they
    are dequeued.
-2. As each sub-task completes (or fails permanently), its return value (or
-   error) is stored and an internal completion counter is atomically
-   incremented.
-3. When the last sub-task is complete, all sub-task results are collected in
-   order. The final callback is then enqueued with the sub-task results.
+2. As each sub-task reaches a *terminal* state (success, permanent failure,
+   revocation, expiry or pre-execute cancellation) its return value (or error)
+   is stored under the member's fixed index and an internal completion count
+   for distinct members is atomically incremented.
+3. When every distinct member has contributed, all member values are collected
+   in order. The final callback is then enqueued with those results.
 4. The callback is executed by a worker and the final result is made available.
 
 .. note::
@@ -1228,6 +1229,50 @@ What happens when a :py:class:`chord` is enqueued?
     that is interrupted by an abrupt consumer shutdown, however, is lost
     (tasks are delivered at-most-once), in which case the callback will not
     fire.
+
+Duplicate delivery and deduplication
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Brokers and consumers may deliver the same member message more than once (a
+redelivered task, or a worker whose acknowledgement was lost). Chord
+completion is therefore deduplicated by **member identity** — the member's
+fixed index in the chord — rather than by the number of completion reports:
+
+* A member contributes at most once. A second success, permanent failure or
+  revocation report for the same member is ignored; it neither increments the
+  completion count nor overwrites the accepted value.
+* A task that is merely retrying has not reached a terminal state, so its
+  failed attempts never claim a completion slot. Only the eventual success or
+  the final failure after retries contributes.
+* When two different terminal results are reported for one member, the **first
+  accepted report wins**; later reports cannot change the value handed to the
+  callback.
+* Pipeline members are covered too: the member identity is attached to the
+  pipeline tail, so a redelivered head or tail still resolves to the same
+  single slot.
+* After the callback has been enqueued a tombstone is kept for a bounded
+  retention period. A completion that arrives late (after finalization) is
+  rejected, so it cannot rebuild a half-empty chord or enqueue the callback a
+  second time.
+
+The claim, count and finalize steps are performed atomically by the storage
+backend. The memory, SQLite, Redis (including expiring and priority variants)
+and Postgres backends advertise this capability
+(``storage.supports_chord_dedup``). A backend that cannot provide the required
+atomicity — notably the file-system storage — raises
+:py:class:`~huey.exceptions.ConfigurationError` when a chord tries to complete
+instead of silently falling back to the unsafe, non-deduplicated behavior.
+
+.. warning::
+    These guarantees concern the *bookkeeping* that decides when the chord is
+    complete. Huey does **not** promise that the callback task's external side
+    effects happen exactly once. Enqueuing the callback is a separate step
+    from marking the chord finalized: if the process crashes in that window,
+    or the callback itself is redelivered after a worker failure, the callback
+    may run more than once. Callback code must be idempotent. What is
+    guaranteed is that duplicate and late member reports cannot trigger an
+    early, under-populated callback, and that the set and ordering of member
+    results is computed from distinct members only.
 
 Enqueueing a :py:class:`chord` returns a :py:class:`ChordResult`:
 

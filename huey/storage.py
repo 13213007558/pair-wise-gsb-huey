@@ -43,6 +43,12 @@ class BaseStorage(object):
     """
     blocking = False  # Does dequeue() block until ready, or should we poll?
     priority = True
+    # Whether the storage provides the atomic primitives required to run a
+    # chord safely under at-least-once message delivery (see the chord_*
+    # methods below). Backends that cannot perform the member-claim and
+    # finalize steps atomically must leave this False so that huey refuses to
+    # run a chord rather than silently counting a redelivered member twice.
+    supports_chord_dedup = False
 
     def __init__(self, name='huey', **storage_kwargs):
         self.name = name
@@ -265,6 +271,64 @@ class BaseStorage(object):
         """
         raise NotImplementedError
 
+    # Chord completion bookkeeping. These methods provide the member-identity
+    # deduplication needed to make chord completion safe when the queue may
+    # redeliver a member task. Three key namespaces are used per chord:
+    #
+    # * the member result keys hold the one accepted terminal value per member
+    # * the member claim keys mark which members have already contributed
+    # * the finalize key is a tombstone that marks the chord as finalized.
+    #
+    # The claim and finalize checks are each performed atomically, so a
+    # redelivered completion (success, permanent failure or revocation) can
+    # contribute at most once, and a completion arriving after finalization
+    # cannot re-create the chord or enqueue the callback a second time.
+
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        """
+        Record the terminal value of one chord member, but only if this member
+        has not already contributed and the chord has not been finalized.
+
+        The membership check, value write and completion count increment must
+        happen atomically. Returns a boolean indicating whether this report was
+        accepted. A False return means either a duplicate report for the same
+        member, or a late report for an already-finalized chord; in both cases
+        the stored value and counter are left untouched.
+        """
+        raise NotImplementedError
+
+    def chord_count(self, finalize_key):
+        """
+        Return the number of distinct members that have contributed, or None if
+        the chord is already finalized (and its bookkeeping has been removed).
+        """
+        raise NotImplementedError
+
+    def chord_finalize(self, finalize_key, ttl=None):
+        """
+        Mark the chord as finalized, atomically. Returns True only for the
+        caller that wins the finalization race; every other caller gets False.
+        Once set, the tombstone causes all further member reports to be
+        rejected until it is cleared.
+        """
+        raise NotImplementedError
+
+    def chord_read_results(self, result_keys):
+        """
+        Non-destructively read the accepted member values in order.
+        """
+        raise NotImplementedError
+
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        """
+        Remove member values and the completion counter for a finalized chord.
+        The claim markers and finalize tombstone are intentionally left in
+        place (for their TTL where supported) so late duplicate completions
+        continue to be rejected.
+        """
+        raise NotImplementedError
+
     def result_store_size(self):
         """
         :return: Number of key/value pairs in the result store.
@@ -309,6 +373,10 @@ class BaseStorage(object):
 
 
 class BlackHoleStorage(BaseStorage):
+    # The black-hole storage is stateless and discards everything, so every
+    # report is trivially accepted exactly once and nothing is ever finalized.
+    supports_chord_dedup = True
+
     def enqueue(self, data, priority=None): pass
     def dequeue(self): pass
     def queue_size(self): return 0
@@ -331,8 +399,25 @@ class BlackHoleStorage(BaseStorage):
     def flush_results(self): pass
     def flush_counters(self): pass
 
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        return True
+    def chord_count(self, finalize_key):
+        return None
+    def chord_finalize(self, finalize_key, ttl=None):
+        return True
+    def chord_read_results(self, result_keys):
+        return {}
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        pass
+
 
 class MemoryStorage(BaseStorage):
+    supports_chord_dedup = True
+    # How long a finalized chord's tombstone is retained so that late,
+    # redelivered completions keep being rejected.
+    chord_tombstone_ttl = 7 * 24 * 60 * 60
+
     def __init__(self, *args, **kwargs):
         super(MemoryStorage, self).__init__(*args, **kwargs)
         self._c = 0  # Counter to ensure FIFO behavior for queue.
@@ -340,6 +425,10 @@ class MemoryStorage(BaseStorage):
         self._results = {}
         self._schedule = []
         self._counters = {}
+        # chord id -> {'claims': set of member indexes, 'count': int,
+        #              'tombstone': monotonic expiry timestamp or None}.
+        # Member values themselves live in the regular result store.
+        self._chords = {}
         self._lock = threading.RLock()
 
     def enqueue(self, data, priority=None):
@@ -437,6 +526,82 @@ class MemoryStorage(BaseStorage):
 
     def flush_counters(self):
         self._counters = {}
+        # Chord bookkeeping lives alongside the counters and must be reset as
+        # well when an application asks for a clean counter store.
+        self._chords = {}
+
+    # The chord keys passed by the api layer are namespaced as
+    # "chord:<cid>:..." so the chord id can always be recovered.
+    def _chord_id(self, key):
+        return key.split(':', 2)[1]
+
+    def _chord_expired(self, state):
+        expiry = state.get('tombstone')
+        return expiry is not None and expiry <= time.monotonic()
+
+    def _get_chord(self, cid):
+        state = self._chords.get(cid)
+        if state is not None and self._chord_expired(state):
+            # An expired tombstone means the storage has forgotten this
+            # chord, so any stray report must start from a clean slate.
+            state = None
+        if state is None:
+            state = {'claims': set(), 'count': 0, 'tombstone': None}
+            self._chords[cid] = state
+        return state
+
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        cid = self._chord_id(claim_key)
+        idx = claim_key.rsplit(':', 1)[1]
+        with self._lock:
+            state = self._get_chord(cid)
+            if state['tombstone'] is not None or idx in state['claims']:
+                # Finalized chord or duplicate report for the same member.
+                return False
+
+            state['claims'].add(idx)
+            state['count'] += 1
+            self._results[result_key] = value
+            return True
+
+    def chord_count(self, finalize_key):
+        cid = self._chord_id(finalize_key)
+        with self._lock:
+            state = self._chords.get(cid)
+            if state is None or self._chord_expired(state):
+                return None
+            # A finalized chord no longer keeps a live completion count; its
+            # tombstone is what late reports consult.
+            if state['tombstone'] is not None:
+                return None
+            return state['count']
+
+    def chord_finalize(self, finalize_key, ttl=None):
+        cid = self._chord_id(finalize_key)
+        ttl = self.chord_tombstone_ttl if ttl is None else ttl
+        with self._lock:
+            state = self._get_chord(cid)
+            if state['tombstone'] is not None:
+                return False
+            state['tombstone'] = time.monotonic() + ttl
+            return True
+
+    def chord_read_results(self, result_keys):
+        with self._lock:
+            return {key: self._results[key] for key in result_keys
+                    if key in self._results}
+
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        cid = self._chord_id(finalize_key)
+        with self._lock:
+            for key in result_keys:
+                self._results.pop(key, None)
+            state = self._chords.get(cid)
+            if state is not None:
+                # Reset the count and drop member values, but keep the claims
+                # and tombstone so late duplicates stay rejected.
+                state['count'] = 0
 
 
 # A custom lua script to pass to redis that will read tasks from the schedule
@@ -449,9 +614,63 @@ if #res and redis.call('zremrangebyscore', KEYS[1], '-inf', unix_ts) == #res the
     return res
 end"""
 
+# Atomically accept one chord member completion only if the member has not
+# contributed yet and the chord has not been finalized. Keys are the result
+# hash, counter hash, claim key, result key and finalize key. Returns the new
+# distinct-member count, or 0 when the report was rejected.
+CHORD_MEMBER_LUA = """\
+local finalize = ARGV[1]
+local claim = ARGV[2]
+local rkey = ARGV[3]
+local rval = ARGV[4]
+if redis.call('hexists', KEYS[1], finalize) == 1 then
+    return 0
+end
+if redis.call('hexists', KEYS[1], claim) == 1 then
+    return 0
+end
+redis.call('hset', KEYS[1], claim, '1')
+redis.call('hset', KEYS[1], rkey, rval)
+return redis.call('hincrby', KEYS[2], finalize, 1)"""
+
+# Atomically write the finalize tombstone unless it already exists. Returns 1
+# when the caller won finalization, 0 otherwise.
+CHORD_FINALIZE_LUA = """\
+if redis.call('hsetnx', KEYS[1], ARGV[1], '1') == 0 then
+    return 0
+end
+return 1"""
+
+# Variants used by RedisExpireStorage, where every key/value pair and counter
+# lives in its own top-level key.
+CHORD_MEMBER_EXPIRE_LUA = """\
+local finalize = ARGV[1]
+local claim = ARGV[2]
+local rkey = ARGV[3]
+local rval = ARGV[4]
+local ttl = tonumber(ARGV[5])
+if redis.call('exists', finalize) == 1 then
+    return 0
+end
+if redis.call('exists', claim) == 1 then
+    return 0
+end
+redis.call('set', claim, '1')
+redis.call('set', rkey, rval, 'ex', ttl)
+return redis.call('incr', KEYS[1])"""
+
+CHORD_FINALIZE_EXPIRE_LUA = """\
+local ttl = tonumber(ARGV[2])
+if redis.call('set', KEYS[1], ARGV[1], 'nx', 'ex', ttl) == false then
+    return 0
+end
+return 1"""
+
 
 class RedisStorage(BaseStorage):
     priority = False  # Use PriorityRedisStorage instead. Requires Redis>=5.0.
+    # All redis backends can run the atomic lua-based chord bookkeeping.
+    supports_chord_dedup = True
     redis_client = Redis
 
     def __init__(self, name='huey', blocking=True, read_timeout=1,
@@ -484,6 +703,8 @@ class RedisStorage(BaseStorage):
         self.conn = self.redis_client(connection_pool=connection_pool)
         self.connection_params = connection_params
         self._pop = self.conn.register_script(SCHEDULE_POP_LUA)
+        self._chord_member = self.conn.register_script(CHORD_MEMBER_LUA)
+        self._chord_finalize = self.conn.register_script(CHORD_FINALIZE_LUA)
 
         self.name = self.clean_name(name) if clean_name else name
         self.queue_key = 'huey.redis.%s' % self.name
@@ -642,6 +863,34 @@ class RedisStorage(BaseStorage):
     def delete_counter(self, key):
         self.conn.hdel(self.counter_key, key)
 
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        count = self._chord_member(
+            keys=[self.result_key, self.counter_key],
+            args=[finalize_key, claim_key, result_key, value])
+        return count != 0
+
+    def chord_count(self, finalize_key):
+        value = self.conn.hget(self.counter_key, finalize_key)
+        return None if value is None else int(value)
+
+    def chord_finalize(self, finalize_key, ttl=None):
+        return bool(self._chord_finalize(keys=[self.result_key],
+                                         args=[finalize_key]))
+
+    def chord_read_results(self, result_keys):
+        values = self.conn.hmget(self.result_key, result_keys)
+        return {k: v for k, v in zip(result_keys, values) if v is not None}
+
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        # Keep the claim markers and finalize tombstone; only member values
+        # and the completion counter are removed.
+        pipe = self.conn.pipeline()
+        if result_keys:
+            pipe.hdel(self.result_key, *result_keys)
+        pipe.hdel(self.counter_key, finalize_key)
+        pipe.execute()
+
     def result_store_size(self):
         return self.conn.hlen(self.result_key)
 
@@ -671,6 +920,11 @@ class RedisExpireStorage(RedisStorage):
         encode = lambda s: s if isinstance(s, bytes) else s.encode('utf8')
         self.result_key = lambda k: rp + encode(k)
         self.counter_key = lambda k: cp + encode(k)
+
+        self._chord_member = self.conn.register_script(
+            CHORD_MEMBER_EXPIRE_LUA)
+        self._chord_finalize = self.conn.register_script(
+            CHORD_FINALIZE_EXPIRE_LUA)
 
     def put_data(self, key, value, is_result=False):
         if is_result:
@@ -713,6 +967,37 @@ class RedisExpireStorage(RedisStorage):
 
     def delete_counter(self, key):
         self.conn.delete(self.counter_key(key))
+
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        ttl = self._expire_time if ttl is None else ttl
+        count = self._chord_member(
+            keys=[self.counter_key(finalize_key)],
+            args=[self.result_key(finalize_key), self.result_key(claim_key),
+                  self.result_key(result_key), value, ttl])
+        return count != 0
+
+    def chord_count(self, finalize_key):
+        value = self.conn.get(self.counter_key(finalize_key))
+        return None if value is None else int(value)
+
+    def chord_finalize(self, finalize_key, ttl=None):
+        ttl = self._expire_time if ttl is None else ttl
+        return bool(self._chord_finalize(
+            keys=[self.result_key(finalize_key)],
+            args=['1', ttl]))
+
+    def chord_read_results(self, result_keys):
+        values = self.conn.mget([self.result_key(k) for k in result_keys])
+        return {k: v for k, v in zip(result_keys, values) if v is not None}
+
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        # Keep the claim markers and finalize tombstone; only member values
+        # and the completion counter are removed.
+        keys = [self.result_key(k) for k in result_keys]
+        keys.append(self.counter_key(finalize_key))
+        if keys:
+            self.conn.delete(*keys)
 
     def _result_keys(self):
         return self.conn.scan_iter(match=self.result_prefix + b'*')
@@ -850,6 +1135,9 @@ class BaseSqlStorage(BaseStorage):
 
 class SqliteStorage(BaseSqlStorage):
     begin_sql = 'begin exclusive'
+    # The exclusive write transaction makes the claim/count/finalize steps
+    # atomic even with multiple threads or processes sharing the database.
+    supports_chord_dedup = True
     integrity_error = getattr(sqlite3, 'IntegrityError', None)
     operational_error = getattr(sqlite3, 'OperationalError', None)
     table_kv = ('create table if not exists kv ('
@@ -1061,6 +1349,66 @@ class SqliteStorage(BaseSqlStorage):
         self.sql('delete from counter where queue = ? and key = ?',
                  (self.name, key), commit=True)
 
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        with self.db(commit=True) as curs:
+            curs.execute('select 1 from kv where queue = ? and key = ?',
+                         (self.name, finalize_key))
+            if curs.fetchone() is not None:
+                return False  # Chord already finalized.
+            curs.execute('select 1 from kv where queue = ? and key = ?',
+                         (self.name, claim_key))
+            if curs.fetchone() is not None:
+                return False  # Duplicate report for the same member.
+            curs.execute('insert into kv (queue, key, value) values (?, ?, ?)',
+                         (self.name, claim_key, self.to_blob(b'1')))
+            curs.execute('insert or replace into kv (queue, key, value) '
+                         'values (?, ?, ?)',
+                         (self.name, result_key, self.to_blob(value)))
+            curs.execute('insert into counter (queue, key, value) '
+                         'values (?, ?, 1) on conflict (queue, key) '
+                         'do update set value = value + 1',
+                         (self.name, finalize_key))
+            return True
+
+    def chord_count(self, finalize_key):
+        res = self.sql('select value from counter where queue = ? and key = ?',
+                       (self.name, finalize_key), results=True)
+        if not res:
+            return None
+        return res[0][0]
+
+    def chord_finalize(self, finalize_key, ttl=None):
+        try:
+            with self.db(commit=True) as curs:
+                curs.execute('insert into kv (queue, key, value) '
+                             'values (?, ?, ?)',
+                             (self.name, finalize_key, self.to_blob(b'1')))
+        except self.integrity_error:
+            return False  # Another worker finalized first.
+        return True
+
+    def chord_read_results(self, result_keys):
+        if not result_keys:
+            return {}
+        return dict(self.sql(
+            'select key, value from kv where queue = ? and key in (%s)' %
+            ','.join('?' * len(result_keys)),
+            (self.name,) + tuple(result_keys), results=True))
+
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        # Member values are removed, but the claim markers and the finalize
+        # tombstone are deliberately retained so a redelivered completion is
+        # still rejected even after the completion counter has been reset.
+        with self.db(commit=True) as curs:
+            for i in range(0, len(result_keys), 500):
+                chunk = result_keys[i:i + 500]
+                curs.execute('delete from kv where queue = ? and key in (%s)' %
+                             ','.join('?' * len(chunk)),
+                             (self.name,) + tuple(chunk))
+            curs.execute('delete from counter where queue = ? and key = ?',
+                         (self.name, finalize_key))
+
     def result_store_size(self):
         return self.sql('select count(*) from kv where queue=?', (self.name,),
                         results=True)[0][0]
@@ -1112,6 +1460,8 @@ class CySqliteStorage(SqliteStorage):
 
 
 class PostgresStorage(BaseSqlStorage):
+    supports_chord_dedup = True
+
     def __init__(self, name='huey', dsn=None, connection=None, blocking=True,
                  read_timeout=1, table_prefix='huey', create_tables=True,
                  **connection_params):
@@ -1358,6 +1708,84 @@ class PostgresStorage(BaseSqlStorage):
     def delete_counter(self, key):
         self.sql('delete from {} where queue = %s and key = %s'.format(
             self.table_counter), (self.name, self._key(key)))
+
+    def chord_member_complete(self, claim_key, result_key, value,
+                              finalize_key, ttl=None):
+        # A single statement (one implicit transaction in autocommit mode)
+        # performs the finalize/duplicate checks, claim, value write and
+        # counter increment. The CTEs short-circuit when the tombstone or an
+        # existing claim is found, so duplicate and late reports have no
+        # effect. Row locks taken by the claim insert serialize concurrent
+        # reports for the same member.
+        query = """\
+        with finalized as (
+            select 1 as present from {kv}
+            where queue = %s and key = %s
+        ), claimed as (
+            insert into {kv} (queue, key, value)
+            select %s, %s, %s
+            where not exists (select 1 from finalized)
+            on conflict do nothing
+            returning 1 as present
+        ), value_written as (
+            insert into {kv} (queue, key, value)
+            select %s, %s, %s
+            where exists (select 1 from claimed)
+            on conflict (queue, key) do update set value = excluded.value
+            returning 1 as present
+        ), counted as (
+            insert into {ct} (queue, key, value)
+            select %s, %s, 1
+            where exists (select 1 from claimed)
+            on conflict (queue, key) do update set value = {ct}.value + 1
+            returning 1 as present
+        )
+        select exists(select 1 from claimed) as accepted""".format(
+            kv=self.table_kv, ct=self.table_counter)
+        with self.db() as curs:
+            curs.execute(query, (
+                self.name, self._key(finalize_key),
+                self.name, self._key(claim_key), b'1',
+                self.name, self._key(result_key), value,
+                self.name, self._key(finalize_key)))
+            return curs.fetchone()[0]
+
+    def chord_count(self, finalize_key):
+        res = self.sql('select value from {} where queue = %s and key = %s'.
+                       format(self.table_counter),
+                       (self.name, self._key(finalize_key)), results=True)
+        if not res:
+            return None
+        return res[0][0]
+
+    def chord_finalize(self, finalize_key, ttl=None):
+        with self.db() as curs:
+            curs.execute('insert into {} (queue, key, value) '
+                         'values (%s, %s, %s) on conflict do nothing'.
+                         format(self.table_kv),
+                         (self.name, self._key(finalize_key), b'1'))
+            return curs.rowcount == 1
+
+    def chord_read_results(self, result_keys):
+        if not result_keys:
+            return {}
+        res = self.sql('select key, value from {} where queue = %s and '
+                       'key = any(%s)'.format(self.table_kv),
+                       (self.name, [self._key(k) for k in result_keys]),
+                       results=True)
+        return dict((k, bytes(v)) for k, v in res)
+
+    def chord_clear(self, claim_keys, result_keys, finalize_key):
+        # Keep the claim markers and finalize tombstone; only member values
+        # and the completion counter are removed.
+        keys = [self._key(k) for k in result_keys]
+        with self.db() as curs:
+            if keys:
+                curs.execute('delete from {} where queue = %s and key = any(%s)'
+                             .format(self.table_kv), (self.name, keys))
+            curs.execute('delete from {} where queue = %s and key = %s'.
+                         format(self.table_counter),
+                         (self.name, self._key(finalize_key)))
 
     def result_store_size(self):
         return self.sql('select count(*) from {} where queue = %s'.format(

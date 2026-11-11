@@ -5,6 +5,17 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Chord completion is now deduplicated by member identity. When the queue
+  redelivers a member task, a repeated success, permanent failure or
+  revocation contributes at most once; in-flight retries never claim a
+  completion slot, and a report arriving after the callback was enqueued is
+  rejected by a finalize tombstone instead of rebuilding a half-empty chord
+  or enqueuing the callback again. The first accepted terminal value per
+  member wins. Atomic `chord_*` storage primitives back the memory, SQLite,
+  Redis and Postgres backends; backends lacking the required atomicity (e.g.
+  file-system storage) raise `ConfigurationError` rather than silently using
+  the unsafe counting path.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding

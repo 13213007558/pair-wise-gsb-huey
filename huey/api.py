@@ -551,23 +551,57 @@ class Huey(object):
             task = task.on_complete
 
     def _check_chord(self, cc, value):
-        chord_key = 'chord:%s' % cc.cid
+        # Chord completion is deduplicated by member identity (the member's
+        # fixed index in the chord), not by delivery count. The storage layer
+        # performs the claim/count atomically so that a redelivered member can
+        # contribute at most once and a report arriving after finalization is
+        # ignored. Backends without those atomic primitives must fail loudly
+        # rather than risk an early, under-populated callback.
+        if not getattr(self.storage, 'supports_chord_dedup', False):
+            raise ConfigurationError(
+                'storage backend %r does not support the atomic member '
+                'deduplication required to complete a chord safely under '
+                'at-least-once delivery. Use a backend that implements the '
+                'chord_* storage methods (e.g. Memory, Sqlite, Redis or '
+                'Postgres).' % type(self.storage).__name__)
+
+        finalize_key = 'chord:%s:finalize' % cc.cid
+        claim_key = 'chord:%s:claim:%s' % (cc.cid, cc.idx)
         result_key = 'chord:%s:%s' % (cc.cid, cc.idx)
-        self.put_result(result_key, value)
+        data = self.serializer.serialize(value)
+        if not self.storage.chord_member_complete(
+                claim_key, result_key, data, finalize_key):
+            # Duplicate report for this member, or a late report for a chord
+            # whose callback has already been enqueued. It must not change the
+            # count, overwrite the accepted value, or re-create the chord.
+            logger.info('Ignoring duplicate or late chord %s report for '
+                        'member %s.', cc.cid, cc.idx)
+            return
 
-        if self.storage.incr(chord_key) == cc.size:
-            self.storage.delete_counter(chord_key)
+        if self.storage.chord_count(finalize_key) != cc.size:
+            return
 
-            # Expiring storages implement pop_data as a peek.
-            results = []
-            for idx in range(cc.size):
-                key = 'chord:%s:%s' % (cc.cid, idx)
-                results.append(self.get(key, peek=True))
-                self.delete(key)
+        # All distinct members have now contributed. Only the winner of this
+        # atomic finalize step may collect the results and enqueue the
+        # callback, so concurrent last-member reports cannot fire it twice.
+        if not self.storage.chord_finalize(finalize_key):
+            return
 
-            callback = cc.callback
-            callback.extend_data((results,))
-            self.enqueue(callback)
+        result_keys = ['chord:%s:%s' % (cc.cid, idx)
+                       for idx in range(cc.size)]
+        stored = self.storage.chord_read_results(result_keys)
+        results = [self.serializer.deserialize(stored[key])
+                   for key in result_keys]
+        claim_keys = ['chord:%s:claim:%s' % (cc.cid, idx)
+                      for idx in range(cc.size)]
+        # Member values and the completion counter are removed once the
+        # callback is armed. The finalize tombstone (and, where supported, the
+        # claims) remain so late redelivered completions keep being rejected.
+        self.storage.chord_clear(claim_keys, result_keys, finalize_key)
+
+        callback = cc.callback
+        callback.extend_data((results,))
+        self.enqueue(callback)
 
     def _requeue_task(self, task, timestamp, retry_eta=None):
         task.retries -= 1

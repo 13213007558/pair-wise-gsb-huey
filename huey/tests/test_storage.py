@@ -263,7 +263,125 @@ class StorageTests(object):
             self.assertTrue(task_a.restore())
 
 
-class TestMemoryStorage(StorageTests, BaseTestCase):
+class ChordStorageTests(object):
+    # Contract tests for the atomic chord bookkeeping. They are mixed into
+    # every backend that advertises supports_chord_dedup.
+
+    chord_size = 3
+
+    def _keys(self, cid):
+        finalize = 'chord:%s:finalize' % cid
+        claims = ['chord:%s:claim:%s' % (cid, i)
+                  for i in range(self.chord_size)]
+        results = ['chord:%s:%s' % (cid, i)
+                   for i in range(self.chord_size)]
+        return finalize, claims, results
+
+    def test_chord_member_complete_dedup(self):
+        cid = 'dedup-%s' % uuid.uuid4()
+        finalize, claims, results = self._keys(cid)
+
+        for i in range(self.chord_size):
+            self.assertTrue(self.s.chord_member_complete(
+                claims[i], results[i], b'v-%d' % i, finalize))
+        self.assertEqual(self.s.chord_count(finalize), self.chord_size)
+
+        # Every member redelivered, with different values: all rejected and
+        # the original values are untouched.
+        for i in range(self.chord_size):
+            self.assertFalse(self.s.chord_member_complete(
+                claims[i], results[i], b'overwrite-%d' % i, finalize))
+        self.assertEqual(self.s.chord_count(finalize), self.chord_size)
+
+        stored = self.s.chord_read_results(results)
+        self.assertEqual([stored[k] for k in results],
+                         [b'v-0', b'v-1', b'v-2'])
+
+    def test_chord_partial_completion_does_not_finalize(self):
+        cid = 'partial-%s' % uuid.uuid4()
+        finalize, claims, results = self._keys(cid)
+
+        self.assertTrue(self.s.chord_member_complete(
+            claims[0], results[0], b'a', finalize))
+        self.assertTrue(self.s.chord_member_complete(
+            claims[1], results[1], b'b', finalize))
+        # Only two distinct members of a three-member chord.
+        self.assertEqual(self.s.chord_count(finalize), 2)
+        # A finalize attempt before all members report still wins (the api
+        # layer only calls it at size), but duplicate finalize must lose.
+        self.assertTrue(self.s.chord_finalize(finalize))
+        self.assertFalse(self.s.chord_finalize(finalize))
+        # Late reports for the never-seen member are rejected by tombstone.
+        self.assertFalse(self.s.chord_member_complete(
+            claims[2], results[2], b'c', finalize))
+
+    def test_chord_tombstone_rejects_late_reports_after_clear(self):
+        cid = 'late-%s' % uuid.uuid4()
+        finalize, claims, results = self._keys(cid)
+
+        for i in range(self.chord_size):
+            self.s.chord_member_complete(
+                claims[i], results[i], b'v-%d' % i, finalize)
+        self.assertTrue(self.s.chord_finalize(finalize))
+        self.s.chord_clear(claims, results, finalize)
+
+        # Counter and member values are gone; tombstone keeps rejecting.
+        self.assertIsNone(self.s.chord_count(finalize))
+        self.assertFalse(self.s.chord_member_complete(
+            claims[0], results[0], b'stale', finalize))
+        self.assertEqual(self.s.chord_read_results(results), {})
+
+    def test_chord_concurrent_redelivery_single_count(self):
+        cid = 'concurrent-%s' % uuid.uuid4()
+        finalize, claims, results = self._keys(cid)
+        barrier = threading.Barrier(self.chord_size * 2)
+        errors = []
+
+        def report(i):
+            try:
+                barrier.wait()
+                for _ in range(25):
+                    self.s.chord_member_complete(
+                        claims[i], results[i], b'v-%d' % i, finalize)
+            except Exception as exc:  # pragma: no cover - failure signal.
+                errors.append(exc)
+
+        threads = [threading.Thread(target=report, args=(i,))
+                   for i in range(self.chord_size) for _ in range(2)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertFalse(errors)
+        self.assertEqual(self.s.chord_count(finalize), self.chord_size)
+        stored = self.s.chord_read_results(results)
+        self.assertEqual(sorted(stored.values()), [b'v-0', b'v-1', b'v-2'])
+
+    def test_chord_finalize_failure_window_is_recoverable(self):
+        # Simulate a crash between the finalize commit and the callback
+        # enqueue: on restart the durable tombstone must still block duplicate
+        # reports rather than rebuilding a half-populated chord.
+        cid = 'crash-%s' % uuid.uuid4()
+        finalize, claims, results = self._keys(cid)
+
+        for i in range(self.chord_size):
+            self.s.chord_member_complete(
+                claims[i], results[i], b'v-%d' % i, finalize)
+        self.assertTrue(self.s.chord_finalize(finalize))
+        # "Restart": a fresh storage handle over the same backing state.
+        reopened = self.reopen_storage()
+        try:
+            self.assertFalse(reopened.chord_finalize(finalize))
+            self.assertFalse(reopened.chord_member_complete(
+                claims[0], results[0], b'after-restart', finalize))
+        finally:
+            reopened.close()
+
+    def reopen_storage(self):
+        # Default: in-memory backends share the same instance. Persistent
+        # backends override this to open a second handle on the same data.
+        return self.s
+
+
+class TestMemoryStorage(StorageTests, ChordStorageTests, BaseTestCase):
     def get_huey(self):
         return MemoryHuey(utc=False)
 
@@ -500,16 +618,25 @@ class TestRedisStorageOffline(BaseTestCase):
         self.assertEqual(calls, [(0, -1), (-3, -1)])
 
 
-class TestSqliteStorage(StorageTests, BaseTestCase):
+class TestSqliteStorage(StorageTests, ChordStorageTests, BaseTestCase):
     supports_ttl = False
 
     def tearDown(self):
         super(TestSqliteStorage, self).tearDown()
-        if os.path.exists('huey_storage.db'):
-            os.unlink('huey_storage.db')
+        # WAL mode also leaves -wal/-shm sidecar files; remove all of them.
+        for suffix in ('', '-wal', '-shm'):
+            path = 'huey_storage.db' + suffix
+            if os.path.exists(path):
+                os.unlink(path)
 
     def get_huey(self):
         return SqliteHuey(filename='huey_storage.db', timeout=3)
+
+    def reopen_storage(self):
+        second = SqliteHuey(name=self.huey.name, filename='huey_storage.db',
+                            timeout=3)
+        self.addCleanup(second.storage.close)
+        return second.storage
 
     def test_create_tables(self):
         huey = SqliteHuey(filename='huey_ct.db', create_tables=False)

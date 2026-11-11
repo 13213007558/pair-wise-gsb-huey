@@ -2,6 +2,7 @@ import asyncio
 import datetime
 import inspect
 import pickle
+import threading
 import time
 
 from huey.api import ChordResult
@@ -2450,6 +2451,240 @@ class TestChordPrimitive(BaseTestCase):
         self.assertEqual(self.execute_next(), -1)
         self.assertEqual(len(self.huey), 0)
         self.assertEqual(state, [99])
+
+    # ------------------------------------------------------------------
+    # Member-identity deduplication under at-least-once delivery.
+    # ------------------------------------------------------------------
+
+    def _redeliver(self, task):
+        # Re-serializing and de-serializing models a redelivered message:
+        # the queue hands the worker the same member identity (chord index)
+        # a second time.
+        return self.huey.deserialize_task(self.huey.serialize_task(task))
+
+    def test_chord_duplicate_success_counts_once(self):
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        r = self.huey.enqueue(chord([prod.s(1), prod.s(2)], agg.s()))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        cc = tasks[0].chord_config
+        finalize_key = 'chord:%s:finalize' % cc.cid
+
+        self.huey.execute(tasks[0])
+        # Redeliver member 0 with a *different* value: must be ignored.
+        self.huey._check_chord(self._redeliver(tasks[0]).chord_config, 999)
+        self.assertEqual(self.huey.storage.chord_count(finalize_key), 1)
+        self.assertEqual(len(self.huey), 0)  # Callback not fired early.
+
+        self.huey.execute(tasks[1])
+        self.assertEqual(len(self.huey), 1)  # Exactly one callback.
+        self.assertEqual(self.execute_next(), [2, 3])
+        self.assertEqual(r(), [2, 3])
+
+    def test_chord_duplicate_failure_and_revocation_count_once(self):
+        @self.huey.task()
+        def boom(n):
+            if n is None:
+                raise TestError('boom')
+            return n
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        r = self.huey.enqueue(
+            chord([boom.s(None), boom.s(2)], agg.s()))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        cc0, cc1 = tasks[0].chord_config, tasks[1].chord_config
+        finalize_key = 'chord:%s:finalize' % cc0.cid
+
+        # Permanent failure (no retries) contributes the Error once.
+        self.assertTrue(self.huey.execute(tasks[0]) is None)
+        self.assertEqual(self.huey.storage.chord_count(finalize_key), 1)
+        # A redelivered failure report for the same member is a no-op.
+        self.huey._check_chord(self._redeliver(tasks[0]).chord_config,
+                               SKIPPED)
+        self.assertEqual(self.huey.storage.chord_count(finalize_key), 1)
+
+        self.huey.execute(tasks[1])
+        self.assertEqual(len(self.huey), 1)
+        results = self.execute_next()
+        self.assertTrue(isinstance(results[0], Error))
+        self.assertEqual(results[1], 2)
+
+        # Late reports after finalization cannot re-create or re-enqueue.
+        self.huey._check_chord(cc0, SKIPPED)
+        self.huey._check_chord(cc1, 2)
+        self.assertEqual(len(self.huey), 0)
+        # The memory backend keeps the tombstone in its chord state table.
+        self.assertTrue(
+            self.huey.storage._chords[cc0.cid]['tombstone'] is not None)
+
+    def test_chord_retry_does_not_claim_completion_slot(self):
+        attempts = {}
+
+        @self.huey.task(retries=2)
+        def flaky(n):
+            attempts[n] = attempts.get(n, 0) + 1
+            if attempts[n] < 3:
+                raise TestError('transient')
+            return n * 10
+
+        @self.huey.task()
+        def agg(ns):
+            return sum(ns)
+
+        r = self.huey.enqueue(chord([flaky.s(1), flaky.s(2)], agg))
+        # Peek at a member without removing it to derive the chord bookkeeping
+        # key.
+        probe_data = self.huey.storage.enqueued_items(1)[0]
+        finalize_key = 'chord:%s:finalize' % (
+            self.huey.deserialize_task(probe_data).chord_config.cid)
+
+        # Two failed attempts each: nothing is claimed yet, no callback.
+        for _ in range(4):
+            self.assertTrue(self.execute_next() is None)
+        self.assertEqual(len(self.huey), 2)  # Retries still queued.
+        self.assertIn(self.huey.storage.chord_count(finalize_key), (0, None))
+
+        self.assertEqual(self.execute_next(), 10)
+        self.assertEqual(self.huey.storage.chord_count(finalize_key), 1)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), 20)
+        self.assertEqual(len(self.huey), 1)  # Callback only now.
+        self.assertEqual(self.execute_next(), 30)
+        self.assertEqual(r(), 30)
+
+    def test_chord_late_completion_after_finalize_is_ignored(self):
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        self.huey.enqueue(chord([prod.s(1), prod.s(2)], agg.s()))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        cc0, cc1 = tasks[0].chord_config, tasks[1].chord_config
+        finalize_key = 'chord:%s:finalize' % cc0.cid
+
+        self.huey.execute(tasks[0])
+        self.huey.execute(tasks[1])
+        self.assertEqual(len(self.huey), 1)
+        self.execute_next()  # Drain the legitimate callback.
+        self.assertEqual(len(self.huey), 0)
+
+        # Simulate a long-delayed redelivery of every member.
+        for cc in (cc0, cc1):
+            self.huey._check_chord(cc, 'stale')
+        self.assertEqual(len(self.huey), 0)  # No half-empty chord, no callback.
+        self.assertEqual(self.huey.storage.chord_count(finalize_key), None)
+
+    def test_chord_duplicate_pipeline_member_counts_once(self):
+        @self.huey.task()
+        def step1(n):
+            return n
+
+        @self.huey.task()
+        def step2(n):
+            return n * 2
+
+        @self.huey.task()
+        def combine(results):
+            return results
+
+        r = self.huey.enqueue(chord(
+            [step1.s(1).then(step2), step1.s(2).then(step2)],
+            combine.s()))
+        # Heads, then tails.
+        heads = [self.huey.dequeue() for _ in range(2)]
+        self.huey.execute(heads[0])
+        self.huey.execute(heads[1])
+        tails = [self.huey.dequeue() for _ in range(2)]
+        finalize_key = 'chord:%s:finalize' % tails[0].chord_config.cid
+
+        self.huey.execute(tails[0])
+        # Redeliver the pipeline tail: it carries the same member identity.
+        dup_tail = self._redeliver(tails[0])
+        self.huey._check_chord(dup_tail.chord_config, 999)
+        self.assertEqual(self.huey.storage.chord_count(finalize_key), 1)
+        self.assertEqual(len(self.huey), 0)
+
+        self.huey.execute(tails[1])
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), [2, 4])
+        self.assertEqual(r(), [2, 4])
+
+    def test_chord_first_accepted_value_wins(self):
+        # When two different terminal results are reported for one member,
+        # the first accepted report is authoritative and later ones cannot
+        # overwrite it.
+        @self.huey.task()
+        def ident(n):
+            return n
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        r = self.huey.enqueue(chord([ident.s(1), ident.s(2)], agg))
+        tasks = [self.huey.dequeue() for _ in range(2)]
+        cc0 = tasks[0].chord_config
+
+        self.huey.execute(tasks[0])  # Accepts 1.
+        self.huey._check_chord(cc0, 'overwrite-attempt')
+        self.huey.execute(tasks[1])
+        self.assertEqual(self.execute_next(), [1, 2])
+        self.assertEqual(r(), [1, 2])
+
+    def test_chord_unsupported_backend_fails_loudly(self):
+        from huey.utils import ChordConfig
+
+        # A backend without the atomic primitives must refuse to run chord
+        # completion rather than silently double-counting redeliveries.
+        self.huey.storage.supports_chord_dedup = False
+        cc = ChordConfig('unsupported-cid', 1, 0, None)
+        with self.assertRaises(ConfigurationError):
+            self.huey._check_chord(cc, 1)
+
+    def test_chord_finalize_race_single_callback(self):
+        # Hammer the last completion from many threads: exactly one caller
+        # may win finalization, so the callback is enqueued exactly once.
+        @self.huey.task()
+        def ident(n):
+            return n
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        size = 4
+        self.huey.enqueue(chord([ident.s(i) for i in range(size)], agg))
+        member_tasks = [self.huey.dequeue() for _ in range(size)]
+        errors = []
+
+        def report(task):
+            try:
+                for _ in range(25):
+                    self.huey._check_chord(task.chord_config, task.args[0])
+            except Exception as exc:  # pragma: no cover - failure signal.
+                errors.append(exc)
+
+        threads = [threading.Thread(target=report, args=(t,))
+                   for t in member_tasks for _ in range(3)]
+        for t in threads: t.start()
+        for t in threads: t.join()
+        self.assertFalse(errors)
+        self.assertEqual(len(self.huey), 1)
+        self.assertEqual(self.execute_next(), [0, 1, 2, 3])
+        self.assertEqual(len(self.huey), 0)
 
 
 class TestTaskChaining(BaseTestCase):
