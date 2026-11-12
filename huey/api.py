@@ -38,6 +38,7 @@ from huey.storage import RedisExpireStorage
 from huey.storage import RedisStorage
 from huey.storage import SqliteStorage
 from huey.utils import ChordConfig
+from huey.utils import DEADLINE_SKIPPED
 from huey.utils import Error
 from huey.utils import SKIPPED
 from huey.utils import noop_context
@@ -301,11 +302,27 @@ class Huey(object):
         message = self.serializer.deserialize(data)
         return self._registry.create_task(message)
 
-    def enqueue(self, task):
+    def enqueue(self, task, chain_deadline=None):
         if isinstance(task, group):
+            if chain_deadline is not None:
+                chain_deadline = normalize_time(eta=chain_deadline, utc=self.utc)
+                for member in task.tasks:
+                    self._propagate_deadline(member, chain_deadline)
             return ResultGroup([self.enqueue(t) for t in task.tasks])
         elif isinstance(task, chord):
+            if chain_deadline is not None:
+                chain_deadline = normalize_time(eta=chain_deadline, utc=self.utc)
+                for member in task.tasks:
+                    self._propagate_deadline(member, chain_deadline)
+                self._propagate_deadline(task.callback, chain_deadline)
             return self._enqueue_chord(task)
+
+        # An explicitly-provided chain deadline is resolved to an absolute
+        # time and stamped onto the whole graph. It is never extended by
+        # retries or downstream branches; an earlier boundary always wins.
+        if chain_deadline is not None:
+            chain_deadline = normalize_time(eta=chain_deadline, utc=self.utc)
+            task.propagate_chain_deadline(chain_deadline)
 
         # Resolve the expiration time when the task is enqueued.
         if task.expires:
@@ -323,6 +340,17 @@ class Huey(object):
 
         results = self._pipeline_results(task)
         return ResultGroup(results) if len(results) > 1 else results[0]
+
+    def _propagate_deadline(self, node, deadline):
+        # Stamp a deadline onto a task, or recursively across the members and
+        # callbacks of a nested group/chord primitive.
+        if isinstance(node, (group, chord)):
+            for member in node.tasks:
+                self._propagate_deadline(member, deadline)
+            if isinstance(node, chord):
+                self._propagate_deadline(node.callback, deadline)
+        else:
+            node.propagate_chain_deadline(deadline)
 
     def _enqueue_chord(self, chord_obj):
         cid = str(uuid.uuid4())
@@ -424,6 +452,10 @@ class Huey(object):
             logger.info('Task %s expired, not executing.', task)
             self._emit(S.SIGNAL_EXPIRED, task)
             self._abort_chord_member(task, SKIPPED)
+        elif task.chain_deadline is not None and \
+                task.chain_deadline < timestamp:
+            logger.info('Task %s past chain deadline, not executing.', task)
+            self._skip_chain_deadline(task)
         else:
             logger.info('Executing %s', task)
             self._emit(S.SIGNAL_EXECUTING, task)
@@ -548,6 +580,23 @@ class Huey(object):
         while task is not None:
             if task.chord_config is not None:
                 return self._check_chord(task.chord_config, value)
+            task = task.on_complete
+
+    def _skip_chain_deadline(self, task):
+        # The task had not started when the chain's absolute deadline elapsed.
+        # It is skipped together with every downstream success/error branch,
+        # and each receives a recognizable terminal result so that ResultGroup
+        # and chord callbacks never wait indefinitely.
+        self._emit(S.SIGNAL_DEADLINE_SKIPPED, task)
+        store = self.results and not isinstance(task, PeriodicTask)
+        reported = set()
+        while task is not None:
+            if store:
+                self.put_result(task.id, DEADLINE_SKIPPED)
+            config = task.chord_config
+            if config is not None and config.cid not in reported:
+                reported.add(config.cid)
+                self._check_chord(config, DEADLINE_SKIPPED)
             task = task.on_complete
 
     def _check_chord(self, cc, value):
@@ -803,7 +852,8 @@ class Task(object):
     def __init__(self, args=None, kwargs=None, id=None, eta=None, retries=None,
                  retry_delay=None, priority=None, expires=None,
                  on_complete=None, on_error=None, expires_resolved=None,
-                 timeout=None, chord_config=None, retry_backoff=None):
+                 timeout=None, chord_config=None, retry_backoff=None,
+                 chain_deadline=None):
         self.name = type(self).__name__
         self.args = () if args is None else args
         self.kwargs = {} if kwargs is None else kwargs
@@ -821,6 +871,7 @@ class Task(object):
         self.expires_resolved = expires_resolved
         self.timeout = timeout if timeout is not None else self.default_timeout
         self.chord_config = chord_config
+        self.chain_deadline = chain_deadline
         self._deadline = None
 
         self.on_complete = on_complete
@@ -851,6 +902,8 @@ class Task(object):
             rep += ', on error %s' % self.on_error
         if self.chord_config:
             rep += ', chord %s' % self.chord_config.cid
+        if self.chain_deadline:
+            rep += ' deadline=%s' % self.chain_deadline
         return rep
 
     def __hash__(self):
@@ -858,6 +911,48 @@ class Task(object):
 
     def create_id(self):
         return str(uuid.uuid4())
+
+    def apply_chain_deadline(self, deadline):
+        # Propagate a chain-level absolute deadline. Retries, success
+        # successors and error handlers can never extend the deadline: an
+        # existing (earlier) boundary always wins.
+        if deadline is not None and (self.chain_deadline is None or
+                                     deadline < self.chain_deadline):
+            self.chain_deadline = deadline
+        return self.chain_deadline
+
+    def iter_chain(self):
+        # Yield every task reachable from this one, including success and
+        # error branches, and any chord callback. The same partial task object
+        # can be attached more than once (shared sub-pipeline), so de-duplicate
+        # by object identity rather than task id -- distinct nodes that happen
+        # to share an id must still each be visited.
+        seen = set()
+        stack = [self]
+        while stack:
+            task = stack.pop()
+            if task is None or id(task) in seen:
+                continue
+            seen.add(id(task))
+            yield task
+            stack.append(task.on_complete)
+            stack.append(task.on_error)
+            if task.chord_config is not None:
+                stack.append(task.chord_config.callback)
+
+    def propagate_chain_deadline(self, deadline):
+        for task in self.iter_chain():
+            task.apply_chain_deadline(deadline)
+
+    @property
+    def effective_deadline(self):
+        # The chain deadline is independent of the per-task ``expires``; when
+        # both are present, the earlier boundary constrains execution.
+        if self.chain_deadline is None:
+            return self.expires_resolved
+        if self.expires_resolved is None:
+            return self.chain_deadline
+        return min(self.chain_deadline, self.expires_resolved)
 
     def resolve_expires(self, utc=True):
         if self.expires:
@@ -998,7 +1093,8 @@ class TaskWrapper(object):
 
     def schedule(self, args=None, kwargs=None, eta=None, delay=None,
                  priority=None, retries=None, retry_delay=None,
-                 retry_backoff=None, expires=None, timeout=None, id=None):
+                 retry_backoff=None, expires=None, timeout=None, id=None,
+                 chain_deadline=None):
         if eta is None and delay is None:
             if isinstance(args, (int, float)):
                 delay = args
@@ -1024,7 +1120,8 @@ class TaskWrapper(object):
             retry_backoff=retry_backoff,
             priority=priority,
             expires=expires,
-            timeout=timeout)
+            timeout=timeout,
+            chain_deadline=chain_deadline)
         return self.huey.enqueue(task)
 
     def _apply(self, it):
@@ -1057,7 +1154,8 @@ class TaskWrapper(object):
                                retry_backoff=kwargs.pop('retry_backoff', None),
                                priority=kwargs.pop('priority', None),
                                expires=kwargs.pop('expires', None),
-                               timeout=kwargs.pop('timeout', None))
+                               timeout=kwargs.pop('timeout', None),
+                               chain_deadline=kwargs.pop('chain_deadline', None))
 
 
 class TaskLock(object):
@@ -1298,7 +1396,8 @@ class Result(object):
             timeout=self.task.timeout,
             chord_config=self.task.chord_config,
             on_complete=on_complete,
-            on_error=on_error)
+            on_error=on_error,
+            chain_deadline=self.task.chain_deadline)
         return self.huey.enqueue(task)
 
     def reset(self):

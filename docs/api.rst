@@ -770,10 +770,14 @@ Huey object
         count and the task id. Override it on a :py:class:`Huey` subclass to
         record additional context. See :ref:`recipe-custom-error-metadata`.
 
-    .. py:method:: enqueue(task)
+    .. py:method:: enqueue(task, chain_deadline=None)
 
         :param task: a :py:class:`Task` instance, a :py:class:`group`, or a
             :py:class:`chord`.
+        :param datetime chain_deadline: optional absolute deadline applied to
+            the whole task graph. Every reachable task inherits it and steps
+            that have not started before this instant are skipped with a
+            ``DEADLINE_SKIPPED`` result. See :ref:`chain-level deadline`.
 
         :returns: depends on the input type (see below).
 
@@ -1187,7 +1191,7 @@ Huey object
         directly. The :py:meth:`Huey.task` and :py:meth:`Huey.periodic_task`
         decorators will create the appropriate TaskWrapper automatically.
 
-    .. py:method:: schedule(args=None, kwargs=None, eta=None, delay=None, priority=None, retries=None, retry_delay=None, retry_backoff=None, expires=None, timeout=None, id=None)
+    .. py:method:: schedule(args=None, kwargs=None, eta=None, delay=None, priority=None, retries=None, retry_delay=None, retry_backoff=None, expires=None, timeout=None, id=None, chain_deadline=None)
 
         :param tuple args: arguments for decorated function.
         :param dict kwargs: keyword arguments for decorated function.
@@ -1212,6 +1216,8 @@ Huey object
             cooperative timeout checking. See :ref:`cooperative-timeout` for
             example.
         :param id: assign the given ``id`` to the Task being scheduled.
+        :param datetime chain_deadline: optional absolute chain-level deadline,
+            see :ref:`chain-level deadline`.
         :returns: a :py:class:`Result` handle for the task.
 
         Use the ``schedule`` method to schedule the execution of the queue task
@@ -1393,7 +1399,7 @@ Huey object
 
 
 
-.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None)
+.. py:class:: Task(args=None, kwargs=None, id=None, eta=None, retries=None, retry_delay=None, priority=None, expires=None, on_complete=None, on_error=None, expires_resolved=None, timeout=None, chord_config=None, retry_backoff=None, chain_deadline=None)
 
     :param tuple args: arguments for the function call.
     :param dict kwargs: keyword arguments for the function call.
@@ -1421,6 +1427,12 @@ Huey object
     :param datetime expires_resolved: absolute expiration time, set by huey
         from ``expires`` when the task is enqueued.
     :param chord_config: set by huey on members of a :py:class:`chord`.
+    :param datetime chain_deadline: absolute chain-level deadline. When set,
+        the task (and any retries, success successors, error handlers and chord
+        callbacks) is skipped if it has not started before this instant. The
+        deadline is never extended by downstream enqueuing and, when combined
+        with ``expires``, the earlier boundary wins. Skipped tasks receive a
+        ``DEADLINE_SKIPPED`` result. See :ref:`chain-level deadline`.
 
     The ``Task`` class represents the execution of a function. Instances of the
     task are serialized and enqueued for execution by the consumer, which

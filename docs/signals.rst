@@ -54,6 +54,11 @@ handler beyond the standard ``(signal, task)`` pair.
    * - ``SIGNAL_EXPIRED``
      - Task's expiration time has passed, so it will not be executed.
      - None
+   * - ``SIGNAL_DEADLINE_SKIPPED``
+     - Task had not started when its chain-level absolute deadline elapsed,
+       so it and its downstream pipeline are skipped and given a
+       ``DEADLINE_SKIPPED`` terminal result.
+     - None
    * - ``SIGNAL_LOCKED``
      - Task could not acquire its lock (:py:meth:`Huey.lock_task`). The
        task will not be executed.

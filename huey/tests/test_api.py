@@ -24,7 +24,9 @@ from huey.exceptions import TaskException
 from huey.exceptions import TaskLockedException
 from huey.exceptions import TaskTimeout
 from huey.serializer import SignedSerializer
+from huey.signals import SIGNAL_DEADLINE_SKIPPED
 from huey.tests.base import BaseTestCase
+from huey.utils import DEADLINE_SKIPPED
 from huey.utils import Error
 from huey.utils import SKIPPED
 
@@ -2690,6 +2692,315 @@ class TestTaskChaining(BaseTestCase):
         self.assertEqual(r1(), 0)
         self.assertRaises(TaskException, r2.get)
         self.assertEqual(len(self.huey), 0)
+
+
+class TestChainDeadline(BaseTestCase):
+    def _at(self, now, seconds):
+        return now + datetime.timedelta(seconds=seconds)
+
+    def test_deadline_propagated_and_immutable(self):
+        @self.huey.task(retries=1)
+        def task_a(n):
+            return n
+
+        @self.huey.task()
+        def task_b(n):
+            return n
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+        pipe = task_a.s(1).then(task_b, 2).then(task_b, 3)
+        pipe.error(task_b, 'err')
+        results = self.huey.enqueue(pipe, chain_deadline=deadline)
+
+        root = self.huey.dequeue()
+        # Every reachable node (successors and error branch) carries the same
+        # absolute deadline, and nothing may extend it.
+        stamped = {task.chain_deadline for task in root.iter_chain()}
+        self.assertEqual(stamped, {deadline})
+        self.assertEqual(len(results), 3)
+
+        # Re-applying a later deadline must not extend the earlier boundary.
+        later = self._at(now, 60)
+        root.propagate_chain_deadline(later)
+        self.assertTrue(all(task.chain_deadline == deadline
+                            for task in root.iter_chain()))
+
+    def test_started_task_finishes_rest_skipped(self):
+        calls = []
+        signals_seen = []
+
+        @self.huey.signal(SIGNAL_DEADLINE_SKIPPED)
+        def on_skip(signal, task):
+            signals_seen.append(task.id)
+
+        @self.huey.task()
+        def task_a(n):
+            calls.append(('a', n))
+            return n + 1
+
+        @self.huey.task()
+        def task_b(n):
+            calls.append(('b', n))
+            return n + 1
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+        pipe = task_a.s(1).then(task_b).then(task_b)
+        r1, r2, r3 = self.huey.enqueue(pipe, chain_deadline=deadline)
+
+        # First step starts within the authorization window and finishes by
+        # the existing rules even though its successor runs past the deadline.
+        first = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(first, self._at(now, 1)), 2)
+        self.assertEqual(calls, [('a', 1)])
+
+        # Remaining business steps are picked up only after the cutoff.
+        second = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(second, self._at(now, 6)) is None)
+        self.assertEqual(calls, [('a', 1)])
+        self.assertEqual(len(self.huey), 0)
+
+        # Recognizable terminal state for every skipped step; nothing hangs.
+        self.assertEqual(r1(), 2)
+        self.assertTrue(r2.get_raw_result() is DEADLINE_SKIPPED)
+        self.assertTrue(r3.get_raw_result() is DEADLINE_SKIPPED)
+        self.assertEqual(signals_seen, [second.id])
+
+    def test_retry_cannot_extend_deadline(self):
+        calls = []
+
+        @self.huey.task(retries=1)
+        def flaky(n):
+            calls.append(n)
+            raise TestError('boom')
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+        result = self.huey.enqueue(flaky.s(1), chain_deadline=deadline)
+
+        # First attempt fails before the cutoff: a retry is re-enqueued and it
+        # inherits the original deadline rather than computing a fresh expiry.
+        first = self.huey.dequeue()
+        self.assertTrue(self.huey.execute(first, self._at(now, 1)) is None)
+        retry = self.huey.dequeue()
+        self.assertEqual(retry.chain_deadline, deadline)
+
+        # The retry is dequeued after the cutoff and must not run the function.
+        self.assertTrue(self.huey.execute(retry, self._at(now, 6)) is None)
+        self.assertEqual(calls, [1])
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(result.get_raw_result() is DEADLINE_SKIPPED)
+
+    def test_error_branch_cannot_extend_deadline(self):
+        calls = []
+
+        @self.huey.task(retries=1)
+        def flaky(n):
+            calls.append(('flaky', n))
+            raise TestError('boom')
+
+        @self.huey.task()
+        def handler(err):
+            calls.append(('handler', repr(err)))
+            return 'handled'
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+        pipe = flaky.s(1).error(handler)
+        self.huey.enqueue(pipe, chain_deadline=deadline)
+
+        first = self.huey.dequeue()
+        self.huey.execute(first, self._at(now, 1))
+        queued = {}
+        while len(self.huey):
+            task = self.huey.dequeue()
+            queued[task.name] = task
+            self.assertEqual(task.chain_deadline, deadline)
+
+        # The error handler runs within the window, the final attempt does not.
+        self.assertEqual(
+            self.huey.execute(queued['handler'], self._at(now, 2)),
+            'handled')
+        self.assertTrue(
+            self.huey.execute(queued['flaky'], self._at(now, 6)) is None)
+        self.assertEqual(calls, [('flaky', 1), ('handler', 'TestError(boom)')])
+        self.assertEqual(len(self.huey), 0)
+
+    def test_earlier_per_task_expires_still_wins(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 10)
+
+        # Per-task expires resolves earlier than the chain deadline.
+        task = task_a.s(1, expires=datetime.timedelta(seconds=3))
+        self.huey.enqueue(task, chain_deadline=deadline)
+        queued = self.huey.dequeue()
+        self.assertEqual(queued.effective_deadline, queued.expires_resolved)
+        self.assertTrue(queued.effective_deadline < deadline)
+        # At 5s the per-task expiration triggers first (existing behavior).
+        self.assertTrue(self.huey.execute(queued, self._at(now, 5)) is None)
+
+        # Conversely, an earlier chain deadline overrides a later per-task TTL.
+        task2 = task_a.s(2, expires=datetime.timedelta(seconds=30))
+        self.huey.enqueue(task2, chain_deadline=deadline)
+        queued2 = self.huey.dequeue()
+        self.assertEqual(queued2.effective_deadline, deadline)
+        self.assertTrue(
+            self.huey.execute(queued2, self._at(now, 12)) is None)
+
+    def test_chord_does_not_hang_when_deadline_elapses(self):
+        calls = []
+
+        @self.huey.task()
+        def prod(n):
+            calls.append(n)
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            calls.append(('agg', ns))
+            return ns
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+        c = chord([prod.s(0), prod.s(1), prod.s(2)], agg.s())
+        chord_result = self.huey.enqueue(c, chain_deadline=deadline)
+        self.assertEqual(len(self.huey), 3)
+
+        first = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(first, self._at(now, 1)), 1)
+
+        # Drain the remaining members past the cutoff; the callback fires and
+        # is itself skipped, so the chord reaches a terminal state.
+        callback = None
+        while True:
+            task = self.huey.dequeue()
+            if task is None:
+                break
+            if task.name == 'prod':
+                self.assertTrue(
+                    self.huey.execute(task, self._at(now, 6)) is None)
+            else:
+                callback = task
+                self.assertEqual(task.chain_deadline, deadline)
+                self.assertTrue(
+                    self.huey.execute(task, self._at(now, 6)) is None)
+
+        self.assertIsNotNone(callback)
+        self.assertEqual(len(self.huey), 0)
+        self.assertTrue(chord_result.callback.get_raw_result()
+                        is DEADLINE_SKIPPED)
+        member_values = [r.get_raw_result() for r in chord_result.results]
+        self.assertEqual(member_values, [1, DEADLINE_SKIPPED, DEADLINE_SKIPPED])
+        self.assertEqual(calls, [0])
+
+    def test_nested_successors_all_terminate(self):
+        state = []
+
+        @self.huey.task()
+        def task_a(n):
+            state.append(n)
+            return n
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+        pipe = (task_a.s(0).then(task_a, 1).then(task_a, 2)
+                .then(task_a, 3).then(task_a, 4))
+        results = self.huey.enqueue(pipe, chain_deadline=deadline)
+
+        first = self.huey.dequeue()
+        self.assertEqual(self.huey.execute(first, self._at(now, 1)), 0)
+        # Everything still queued is already past the deadline.
+        while len(self.huey):
+            queued = self.huey.dequeue()
+            self.assertTrue(
+                self.huey.execute(queued, self._at(now, 6)) is None)
+
+        self.assertEqual(state, [0])
+        result_handles = list(results)
+        self.assertEqual(result_handles[0](), 0)
+        for result in result_handles[1:]:
+            self.assertTrue(result.get_raw_result() is DEADLINE_SKIPPED)
+        self.assertEqual(len(self.huey), 0)
+
+    def test_nested_chord_and_group_propagate_deadline(self):
+        @self.huey.task()
+        def prod(n):
+            return n + 1
+
+        @self.huey.task()
+        def agg(ns):
+            return ns
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 5)
+
+        # A group and a chord whose member is itself a nested chord.
+        grouped = group([prod.s(1), prod.s(2)])
+        self.huey.enqueue(grouped, chain_deadline=deadline)
+        while len(self.huey):
+            self.assertEqual(self.huey.dequeue().chain_deadline, deadline)
+
+        nested = chord([prod.s(3), prod.s(4)], agg.s())
+        outer = chord([nested, prod.s(5)], agg.s())
+        self.huey.enqueue(outer, chain_deadline=deadline)
+        stamped = set()
+        while len(self.huey):
+            queued = self.huey.dequeue()
+            for node in queued.iter_chain():
+                stamped.add(node.chain_deadline)
+        self.assertEqual(stamped, {deadline})
+
+    def test_serialization_roundtrip_preserves_deadline(self):
+        @self.huey.task()
+        def task_a(n):
+            return n
+
+        now = datetime.datetime.now()
+        deadline = self._at(now, 7)
+        pipe = task_a.s(1).then(task_a, 2).then(task_a, 3)
+        self.huey.enqueue(pipe, chain_deadline=deadline)
+
+        task = self.huey.dequeue()
+        restored = self.huey.deserialize_task(
+            self.huey.serialize_task(task))
+        self.assertEqual(restored.chain_deadline, deadline)
+        self.assertEqual(restored.on_complete.chain_deadline, deadline)
+        self.assertEqual(
+            restored.on_complete.on_complete.chain_deadline, deadline)
+
+        # Per-invocation deadline via s() also survives a round-trip.
+        other = task_a.s(4, chain_deadline=deadline)
+        restored_other = self.huey.deserialize_task(
+            self.huey.serialize_task(other))
+        self.assertEqual(restored_other.chain_deadline, deadline)
+
+    def test_legacy_messages_without_deadline_keep_behavior(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        now = datetime.datetime.now()
+        # An old serialized message has no chain_deadline attribute at all.
+        full_name = self.huey._registry.task_to_string(task_a.task_class)
+        from huey.registry import Message
+        legacy = Message('legacy-id', full_name, None, 0, 0, None, (1,), {},
+                         None, None, None, None, None, None, None)
+        task = self.huey._registry.create_task(legacy)
+        self.assertIsNone(task.chain_deadline)
+        self.assertEqual(self.huey.execute(task, self._at(now, 100)), 2)
+        self.assertEqual(self.huey.result('legacy-id'), 2)
+
+        # New tasks created without the option behave exactly as before.
+        result = task_a(5)
+        queued = self.huey.dequeue()
+        self.assertIsNone(queued.chain_deadline)
+        self.assertEqual(self.huey.execute(queued), 6)
+        self.assertEqual(result(), 6)
 
 
 class TestTaskLocking(BaseTestCase):

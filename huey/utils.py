@@ -33,6 +33,15 @@ class _Skipped(object):
 
 SKIPPED = _Skipped()
 
+
+class _DeadlineSkipped(object):
+    def __repr__(self):
+        return 'DEADLINE_SKIPPED'
+    def __reduce__(self):
+        return 'DEADLINE_SKIPPED'
+
+DEADLINE_SKIPPED = _DeadlineSkipped()
+
 ChordConfig = namedtuple('ChordConfig', ('cid', 'size', 'idx', 'callback'))
 
 

@@ -170,6 +170,27 @@ class TestSignals(BaseTestCase):
         self.assertTrue(self.execute_next(), 4)
         self.assertSignals([SIGNAL_EXECUTING, SIGNAL_COMPLETE])
 
+    def test_signal_chain_deadline_skipped(self):
+        @self.huey.task()
+        def task_a(n):
+            return n + 1
+
+        now = datetime.datetime.now()
+        deadline = now + datetime.timedelta(seconds=5)
+        pipe = task_a.s(1).then(task_a)
+        self.huey.enqueue(pipe, chain_deadline=deadline)
+        self.assertSignals([SIGNAL_ENQUEUED])
+
+        # The first step runs within the window.
+        self.assertEqual(self.execute_next(now + datetime.timedelta(seconds=1)),
+                         2)
+        self.assertSignals([SIGNAL_EXECUTING, SIGNAL_COMPLETE,
+                            SIGNAL_ENQUEUED])
+        # The successor is dequeued after the cutoff and is skipped.
+        self.assertTrue(
+            self.execute_next(now + datetime.timedelta(seconds=6)) is None)
+        self.assertSignals([SIGNAL_DEADLINE_SKIPPED])
+
     def test_signal_timeout(self):
         @self.huey.task(timeout=0.001, context=True)
         def timeout(task=None):

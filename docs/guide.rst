@@ -772,6 +772,47 @@ Expiration times can also be specified when scheduling tasks:
         eta=one_hr,
         expires=one_hr + timedelta(seconds=60))
 
+Chain-level deadline
+--------------------
+
+.. _chain-level deadline:
+
+Per-task ``expires`` is resolved *when each task is enqueued*. In a pipeline
+(or chord), every successor is enqueued separately -- a retried task or a
+successor therefore computes its own expiration and can run well after the
+authorization window under which the whole chain was started.
+
+A chain-level absolute deadline is independent of ``expires`` and applies to
+the entire graph. Pass an absolute ``datetime`` when enqueuing and it is
+stamped onto every task, including retries, success successors, error handlers
+and chord callbacks:
+
+.. code-block:: python
+
+    # Every step of this pipeline must *start* before the authorization ends.
+    deadline = datetime.now() + timedelta(minutes=5)
+    results = huey.enqueue(
+        check_one.s().then(check_two).then(check_three),
+        chain_deadline=deadline)
+
+    # It can also be attached to a single invocation, or when scheduling.
+    check_one(report, chain_deadline=deadline)
+    check_one.schedule(args=(report,), delay=60, chain_deadline=deadline)
+
+The rules are:
+
+* The deadline is **absolute and never extended**. Retries, success
+  successors and error-handler branches inherit the original deadline; applying
+  a later deadline has no effect when an earlier one is already present.
+* When both ``expires`` and a chain deadline apply, the **earlier** boundary
+  wins (a task that expires sooner is still constrained by its own expiry).
+* A task that has already started is allowed to finish under the normal rules.
+* A business step that has not started when the deadline elapses is skipped
+  together with its downstream steps. Each receives a recognizable
+  ``DEADLINE_SKIPPED`` result (and emits ``SIGNAL_DEADLINE_SKIPPED``), so a
+  :py:class:`ResultGroup` or chord callback always reaches a terminal state
+  instead of waiting indefinitely.
+
 .. _task-timeouts:
 
 Task timeouts

@@ -5,6 +5,16 @@ Changelog
 
 [View commits](https://github.com/coleifer/huey/compare/3.5.4...master)
 
+* Add an optional chain-level absolute deadline (`chain_deadline`),
+  independent of the per-task `expires`. The deadline is propagated to every
+  task in a pipeline/chord (including retries, success successors and error
+  handlers) and is never extended; the earlier of `expires` and the chain
+  deadline always constrains execution. Steps that have not started when the
+  deadline elapses are skipped with a recognizable `DEADLINE_SKIPPED` terminal
+  result and emit `SIGNAL_DEADLINE_SKIPPED`, so ResultGroup and chord consumers
+  never wait indefinitely. Serialized messages gain a trailing `chain_deadline`
+  field with a `None` default, so older tasks and messages keep their behavior.
+
 ## 3.5.4
 
 * Fix possible hang if worker holding the stop flag was killed while holding
